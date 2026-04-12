@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.0.1] - 2026-04-12
+
+### Fixed
+
+- `QdrantStorage.upsert_batch` and all four `HybridSearcher.search` code
+  paths wrapped their `asyncio.timeout()` blocks with no `except TimeoutError`
+  handler, so bare `TimeoutError()` (empty `__str__`) propagated out of the
+  library. Downstream MCP servers using FastMCP surfaced this as
+  `"Error executing tool X: "` at the client with no type, message, or
+  traceback. Timeouts now raise with an operation-specific message
+  (operation name, timeout value, collection, and caller scope) while
+  preserving the original chain via `raise ... from e`. (#1, #2)
+
 ## [1.0.0] - 2026-03-20
 
 Initial public release.
