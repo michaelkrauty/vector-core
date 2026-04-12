@@ -373,8 +373,23 @@ class QdrantStorage:
                     raise last_error
 
         # Run all batches concurrently (limited by semaphore)
-        async with asyncio.timeout(settings.qdrant_operation_timeout):
-            await asyncio.gather(*(upsert_with_retry(batch) for batch in batches))
+        try:
+            async with asyncio.timeout(settings.qdrant_operation_timeout):
+                await asyncio.gather(
+                    *(upsert_with_retry(batch) for batch in batches)
+                )
+        except TimeoutError as e:
+            # Bare TimeoutError has empty __str__, so the MCP tool layer
+            # surfaces a useless "Error executing tool X: " at the client.
+            # Raise with an operation-specific message and preserve the chain.
+            msg = (
+                f"Qdrant upsert_batch timed out after "
+                f"{settings.qdrant_operation_timeout}s "
+                f"(collection={collection!r}, {len(batches)} batches, "
+                f"{len(points)} points)"
+            )
+            logger.error(msg)
+            raise TimeoutError(msg) from e
 
     async def delete_by_filter(
         self,
