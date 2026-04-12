@@ -1,5 +1,6 @@
 """Tests for hybrid search with RRF fusion."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -280,6 +281,85 @@ class TestHybridSearch:
         assert len(results) == 2
         # query_points called twice for separate dense/sparse searches
         assert mock_client.query_points.call_count == 2
+
+
+class TestHybridSearchTimeoutMessages:
+    """Every asyncio.timeout() path in HybridSearcher.search must produce an
+    informative TimeoutError. A bare TimeoutError() has empty __str__ and
+    propagates to the MCP tool layer as a useless "Error executing tool X: "
+    at the client.
+    """
+
+    async def _run_and_catch(self, searcher, dense_weight, sparse_weight):
+        mock_client = AsyncMock()
+
+        async def slow_query(*args, **kwargs):
+            await asyncio.sleep(5)
+
+        mock_client.query_points = slow_query
+        searcher.storage._get_client.return_value = mock_client
+
+        sparse_vec = SparseVector(indices=[0, 1], values=[0.5, 0.3])
+
+        with patch("vector_core.storage.hybrid.settings") as mock_settings:
+            mock_settings.search_timeout = 0.01
+            mock_settings.rrf_prefetch_limit = 50
+            with pytest.raises(TimeoutError) as exc_info:
+                await searcher.search(
+                    collection="test_collection",
+                    dense_query=[0.1] * 100,
+                    sparse_query=sparse_vec,
+                    limit=10,
+                    dense_weight=dense_weight,
+                    sparse_weight=sparse_weight,
+                )
+        return exc_info.value
+
+    def _make_searcher(self, dense_weight=0.5, sparse_weight=0.5):
+        mock_storage = MagicMock()
+        mock_storage._get_client = AsyncMock()
+        return HybridSearcher(
+            mock_storage,
+            dense_weight=dense_weight,
+            sparse_weight=sparse_weight,
+            rrf_k=60,
+        )
+
+    async def test_sparse_only_timeout_message(self):
+        """dense_weight=0 triggers the sparse-only path."""
+        searcher = self._make_searcher()
+        err = await self._run_and_catch(searcher, dense_weight=0.0, sparse_weight=1.0)
+        msg = str(err)
+        assert msg, "TimeoutError must not have an empty message"
+        assert "Sparse-only" in msg
+        assert "test_collection" in msg
+
+    async def test_dense_only_timeout_message(self):
+        """sparse_weight=0 triggers the dense-only path."""
+        searcher = self._make_searcher()
+        err = await self._run_and_catch(searcher, dense_weight=1.0, sparse_weight=0.0)
+        msg = str(err)
+        assert msg
+        assert "Dense-only" in msg
+        assert "test_collection" in msg
+
+    async def test_hybrid_rrf_timeout_message(self):
+        """Equal weights trigger the Qdrant built-in RRF fusion path."""
+        searcher = self._make_searcher()
+        err = await self._run_and_catch(searcher, dense_weight=0.5, sparse_weight=0.5)
+        msg = str(err)
+        assert msg
+        assert "Hybrid RRF" in msg
+        assert "test_collection" in msg
+
+    async def test_weighted_fusion_timeout_message(self):
+        """Unequal non-zero weights trigger the weighted-fusion path."""
+        searcher = self._make_searcher()
+        err = await self._run_and_catch(searcher, dense_weight=0.7, sparse_weight=0.3)
+        msg = str(err)
+        assert msg
+        assert "Weighted hybrid" in msg
+        assert "test_collection" in msg
 
 
 class TestFuseResults:

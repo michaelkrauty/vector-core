@@ -1,5 +1,6 @@
 """Tests for QdrantStorage."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -315,6 +316,47 @@ class TestPointOperations:
             with patch('asyncio.sleep', new_callable=AsyncMock):
                 with pytest.raises(Exception, match="Persistent error"):
                     await storage.upsert_batch("test", points, max_retries=3)
+
+    @pytest.mark.asyncio
+    async def test_upsert_batch_timeout_has_informative_message(self):
+        """A bare TimeoutError from asyncio.timeout() must be re-raised with
+        an operation-specific message, otherwise it propagates to the MCP tool
+        layer as an empty "Error executing tool X: " at the client.
+        """
+        storage = QdrantStorage()
+
+        points = [
+            PointStruct(
+                id=i,
+                vector={"dense": [0.1] * 3, "sparse": {"indices": [], "values": []}},
+                payload={"idx": i},
+            )
+            for i in range(3)
+        ]
+
+        async def slow_upsert(*args, **kwargs):
+            # Sleep well past the patched timeout so asyncio.timeout fires
+            await asyncio.sleep(5)
+
+        with patch.object(storage, '_get_client') as mock_get_client:
+            mock_client = AsyncMock()
+            mock_client.upsert = slow_upsert
+            mock_get_client.return_value = mock_client
+
+            with patch("vector_core.storage.qdrant.settings") as mock_settings:
+                mock_settings.qdrant_operation_timeout = 0.01
+                with pytest.raises(TimeoutError) as exc_info:
+                    await storage.upsert_batch(
+                        "test_collection", points, max_retries=1
+                    )
+
+        msg = str(exc_info.value)
+        assert msg, "TimeoutError must not have an empty message"
+        assert "upsert_batch" in msg
+        assert "test_collection" in msg
+        assert "3 points" in msg
+        # Chain preserved for debuggers
+        assert isinstance(exc_info.value.__cause__, TimeoutError)
 
     @pytest.mark.asyncio
     async def test_delete_by_filter(self):

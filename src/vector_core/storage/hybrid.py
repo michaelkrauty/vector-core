@@ -159,17 +159,23 @@ class HybridSearcher:
         # Fast path: If one weight is 0, skip that search entirely
         if dense_weight <= 0 and sparse_weight > 0:
             # Sparse-only search
-            async with asyncio.timeout(settings.search_timeout):
-                response = await client.query_points(
-                    collection,
-                    query=QdrantSparseVector(
-                        indices=sparse_query.indices,
-                        values=sparse_query.values,
-                    ),
-                    using="sparse",
-                    limit=limit,
-                    query_filter=query_filter,
-                )
+            try:
+                async with asyncio.timeout(settings.search_timeout):
+                    response = await client.query_points(
+                        collection,
+                        query=QdrantSparseVector(
+                            indices=sparse_query.indices,
+                            values=sparse_query.values,
+                        ),
+                        using="sparse",
+                        limit=limit,
+                        query_filter=query_filter,
+                    )
+            except TimeoutError as e:
+                raise TimeoutError(
+                    f"Sparse-only search timed out after {settings.search_timeout}s "
+                    f"(collection={collection!r}, limit={limit})"
+                ) from e
             return [
                 SearchResult(
                     id=cast(int | str, p.id),
@@ -181,14 +187,20 @@ class HybridSearcher:
 
         if sparse_weight <= 0 and dense_weight > 0:
             # Dense-only search
-            async with asyncio.timeout(settings.search_timeout):
-                response = await client.query_points(
-                    collection,
-                    query=dense_query,
-                    using="dense",
-                    limit=limit,
-                    query_filter=query_filter,
-                )
+            try:
+                async with asyncio.timeout(settings.search_timeout):
+                    response = await client.query_points(
+                        collection,
+                        query=dense_query,
+                        using="dense",
+                        limit=limit,
+                        query_filter=query_filter,
+                    )
+            except TimeoutError as e:
+                raise TimeoutError(
+                    f"Dense-only search timed out after {settings.search_timeout}s "
+                    f"(collection={collection!r}, limit={limit})"
+                ) from e
             return [
                 SearchResult(
                     id=cast(int | str, p.id),
@@ -200,52 +212,66 @@ class HybridSearcher:
 
         # If equal weights, use fast Qdrant built-in RRF fusion
         if abs(dense_weight - sparse_weight) < WEIGHT_EQUALITY_THRESHOLD:
-            async with asyncio.timeout(settings.search_timeout):
-                points = await client.query_points(
-                    collection,
-                    prefetch=[
-                        Prefetch(
+            try:
+                async with asyncio.timeout(settings.search_timeout):
+                    points = await client.query_points(
+                        collection,
+                        prefetch=[
+                            Prefetch(
+                                query=QdrantSparseVector(
+                                    indices=sparse_query.indices,
+                                    values=sparse_query.values,
+                                ),
+                                using="sparse",
+                                limit=prefetch_limit,
+                                filter=query_filter,
+                            ),
+                            Prefetch(
+                                query=dense_query,
+                                using="dense",
+                                limit=prefetch_limit,
+                                filter=query_filter,
+                            ),
+                        ],
+                        query=FusionQuery(fusion=Fusion.RRF),
+                        limit=limit,
+                    )
+            except TimeoutError as e:
+                raise TimeoutError(
+                    f"Hybrid RRF search timed out after {settings.search_timeout}s "
+                    f"(collection={collection!r}, limit={limit}, "
+                    f"prefetch_limit={prefetch_limit})"
+                ) from e
+            scored_points = [(p, p.score or 0.0) for p in points.points]
+        else:
+            # Run separate searches for weighted fusion
+            try:
+                async with asyncio.timeout(settings.search_timeout):
+                    dense_response, sparse_response = await asyncio.gather(
+                        client.query_points(
+                            collection,
+                            query=dense_query,
+                            using="dense",
+                            limit=prefetch_limit,
+                            query_filter=query_filter,
+                        ),
+                        client.query_points(
+                            collection,
                             query=QdrantSparseVector(
                                 indices=sparse_query.indices,
                                 values=sparse_query.values,
                             ),
                             using="sparse",
                             limit=prefetch_limit,
-                            filter=query_filter,
+                            query_filter=query_filter,
                         ),
-                        Prefetch(
-                            query=dense_query,
-                            using="dense",
-                            limit=prefetch_limit,
-                            filter=query_filter,
-                        ),
-                    ],
-                    query=FusionQuery(fusion=Fusion.RRF),
-                    limit=limit,
-                )
-            scored_points = [(p, p.score or 0.0) for p in points.points]
-        else:
-            # Run separate searches for weighted fusion
-            async with asyncio.timeout(settings.search_timeout):
-                dense_response, sparse_response = await asyncio.gather(
-                    client.query_points(
-                        collection,
-                        query=dense_query,
-                        using="dense",
-                        limit=prefetch_limit,
-                        query_filter=query_filter,
-                    ),
-                    client.query_points(
-                        collection,
-                        query=QdrantSparseVector(
-                            indices=sparse_query.indices,
-                            values=sparse_query.values,
-                        ),
-                        using="sparse",
-                        limit=prefetch_limit,
-                        query_filter=query_filter,
-                    ),
-                )
+                    )
+            except TimeoutError as e:
+                raise TimeoutError(
+                    f"Weighted hybrid search timed out after {settings.search_timeout}s "
+                    f"(collection={collection!r}, limit={limit}, "
+                    f"dense_weight={dense_weight}, sparse_weight={sparse_weight})"
+                ) from e
 
             # Apply weighted RRF
             scored_points = self._weighted_rrf(
