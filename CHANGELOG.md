@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.0.2] - 2026-05-21
+
+### Fixed
+
+- Restored Python 3.11 compatibility by replacing Python 3.12-only generic
+  function syntax in `vector_core.utils.sentinel` with a standard `TypeVar`.
+- Lowered package metadata, Ruff target, and mypy target from Python 3.12 to
+  Python 3.11 after validating the test suite on both Python versions.
+
 ## [1.0.1] - 2026-04-12
 
 ### Fixed

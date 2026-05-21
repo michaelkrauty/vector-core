@@ -21,7 +21,9 @@ Example:
     update()                  # Does not update name at all
 """
 
-from typing import Final, TypeGuard
+from typing import Final, TypeGuard, TypeVar
+
+T = TypeVar("T")
 
 
 class UnsetType:
@@ -55,7 +57,7 @@ class UnsetType:
 UNSET: Final[UnsetType] = UnsetType()
 
 
-def is_set[T](value: T | UnsetType) -> TypeGuard[T]:
+def is_set(value: T | UnsetType) -> TypeGuard[T]:
     """Check if a value was explicitly provided (is not UNSET).
 
     This is a type guard that narrows the type from `T | UnsetType` to `T`.
