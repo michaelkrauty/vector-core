@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.0.3] - 2026-05-21
+
+### Added
+
+- Added `SyncEmbeddingClient`, a synchronous facade over `EmbeddingClient` that
+  keeps a persistent background event loop and closes the async HTTP client on
+  that same loop. This gives synchronous consumers a safe alternative to
+  calling `asyncio.run()` around every embedding request.
+
 ## [1.0.2] - 2026-05-21
 
 ### Fixed

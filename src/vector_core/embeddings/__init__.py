@@ -1,7 +1,11 @@
 """Embedding generation and caching."""
 
 from vector_core.embeddings.cache import EmbeddingCache
-from vector_core.embeddings.client import EmbeddingClient, EmbeddingServiceError
+from vector_core.embeddings.client import (
+    EmbeddingClient,
+    EmbeddingServiceError,
+    SyncEmbeddingClient,
+)
 from vector_core.embeddings.global_vocab import GlobalVocabulary
 from vector_core.embeddings.sparse import SparseVector, SparseVectorizer
 from vector_core.embeddings.tokenization import (
@@ -13,6 +17,7 @@ from vector_core.embeddings.tokenization import (
 
 __all__ = [
     "EmbeddingClient",
+    "SyncEmbeddingClient",
     "EmbeddingServiceError",
     "EmbeddingCache",
     "SparseVectorizer",
