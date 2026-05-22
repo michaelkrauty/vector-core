@@ -65,12 +65,16 @@ def reciprocal_rank_fusion(
         weight = normalized_weights[list_index]
         if weight == 0:
             continue
+        seen_in_list: set[K] = set()
         for rank, item in enumerate(ranked, start=1):
             item_key = key(item)
+            if item_key in seen_in_list:
+                continue
+            seen_in_list.add(item_key)
             scores[item_key] = scores.get(item_key, 0.0) + weight / (rrf_k + rank)
             representatives.setdefault(item_key, item)
             best_ranks[item_key] = min(best_ranks.get(item_key, rank), rank)
-            ranks_by_list.setdefault(item_key, {})[list_index] = rank
+            ranks_by_list.setdefault(item_key, {}).setdefault(list_index, rank)
 
     def sort_key(item_key: K) -> tuple[float, int, str]:
         return (-scores[item_key], best_ranks[item_key], str(item_key))

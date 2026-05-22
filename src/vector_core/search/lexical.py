@@ -74,16 +74,21 @@ def rank_lexical_items(
 
     for item in items:
         weighted_parts: list[str] = []
-        if title is not None:
+        title_count = max(0, int(title_weight))
+        path_count = max(0, int(path_weight))
+        tag_count = max(0, int(tag_weight))
+        text_count = max(0, int(text_weight))
+        if title is not None and title_count > 0:
             item_title = str(title(item) or "")
-            weighted_parts.extend([item_title] * max(0, int(title_weight)))
-        if path is not None:
+            weighted_parts.extend([item_title] * title_count)
+        if path is not None and path_count > 0:
             item_path = str(path(item) or "")
-            weighted_parts.extend([item_path] * max(0, int(path_weight)))
-        if tags is not None:
+            weighted_parts.extend([item_path] * path_count)
+        if tags is not None and tag_count > 0:
             item_tags = " ".join(_coerce_tags(tags(item)))
-            weighted_parts.extend([item_tags] * max(0, int(tag_weight)))
-        weighted_parts.extend([str(text(item) or "")] * max(0, int(text_weight)))
+            weighted_parts.extend([item_tags] * tag_count)
+        if text_count > 0:
+            weighted_parts.extend([str(text(item) or "")] * text_count)
 
         doc_terms = Counter(tokenize_literal_query(" ".join(weighted_parts)))
         score = 0.0

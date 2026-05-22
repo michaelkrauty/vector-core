@@ -71,3 +71,18 @@ def test_rrf_rejects_weight_count_mismatch() -> None:
         assert "weights length" in str(exc)
     else:  # pragma: no cover - makes failure message clearer than pytest.raises import
         raise AssertionError("expected ValueError")
+
+
+def test_rrf_deduplicates_keys_within_each_ranked_list() -> None:
+    """A source list contributes only the first rank for each key."""
+    ranked = [
+        Hit("duplicate", "first occurrence"),
+        Hit("duplicate", "second occurrence"),
+        Hit("unique", "unique hit"),
+    ]
+
+    fused = reciprocal_rank_fusion([ranked], key=lambda hit: hit.key, k=60, limit=2)
+
+    assert [result.key for result in fused] == ["duplicate", "unique"]
+    assert fused[0].ranks == {0: 1}
+    assert fused[0].score == 1 / 61

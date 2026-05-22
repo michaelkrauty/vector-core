@@ -98,3 +98,27 @@ def test_rank_lexical_items_clamps_repeated_term_counts() -> None:
 
     assert ranked[0].key == "spammy"
     assert ranked[0].score == 5.0
+
+
+def test_rank_lexical_items_does_not_call_zero_weight_extractors() -> None:
+    """Disabled fields should not be extracted or required on items."""
+
+    def fail_extractor(_item: dict[str, str]) -> str:
+        raise AssertionError("zero-weight extractor should not be called")
+
+    ranked = rank_lexical_items(
+        "codex",
+        [{"id": "hit", "text": "codex"}],
+        text=lambda item: item["text"],
+        title=fail_extractor,
+        path=fail_extractor,
+        tags=lambda _item: (_ for _ in ()).throw(
+            AssertionError("zero-weight tags extractor should not be called")
+        ),
+        key=lambda item: item["id"],
+        title_weight=0,
+        path_weight=0,
+        tag_weight=0,
+    )
+
+    assert [result.key for result in ranked] == ["hit"]
