@@ -18,6 +18,7 @@ from qdrant_client.models import (
 )
 
 from vector_core.embeddings.sparse import SparseVector
+from vector_core.search.rank_fusion import reciprocal_rank_fusion
 from vector_core.settings import settings
 from vector_core.storage.qdrant import QdrantStorage
 
@@ -90,36 +91,14 @@ class HybridSearcher:
         Returns:
             List of (point, rrf_score) tuples sorted by score descending
         """
-        # Build rank maps (1-indexed ranks)
-        # Cast point.id to int | str (we never use UUID in our code)
-        dense_ranks: dict[int | str, int] = {}
-        for rank, point in enumerate(dense_results, start=1):
-            dense_ranks[cast(int | str, point.id)] = rank
-
-        sparse_ranks: dict[int | str, int] = {}
-        for rank, point in enumerate(sparse_results, start=1):
-            sparse_ranks[cast(int | str, point.id)] = rank
-
-        # Combine all unique points
-        all_points: dict[int | str, ScoredPoint] = {}
-        for point in dense_results + sparse_results:
-            pid = cast(int | str, point.id)
-            if pid not in all_points:
-                all_points[pid] = point
-
-        # Compute weighted RRF scores
-        rrf_scores: list[tuple[ScoredPoint, float]] = []
-        for point_id, point in all_points.items():
-            score = 0.0
-            if point_id in dense_ranks:
-                score += dense_weight / (k + dense_ranks[point_id])
-            if point_id in sparse_ranks:
-                score += sparse_weight / (k + sparse_ranks[point_id])
-            rrf_scores.append((point, score))
-
-        # Sort by score descending
-        rrf_scores.sort(key=lambda x: x[1], reverse=True)
-        return rrf_scores
+        fused = reciprocal_rank_fusion(
+            [dense_results, sparse_results],
+            key=lambda point: cast(int | str, point.id),
+            weights=[dense_weight, sparse_weight],
+            k=k,
+            limit=len(dense_results) + len(sparse_results),
+        )
+        return [(result.item, result.score) for result in fused]
 
     async def search(
         self,
@@ -285,11 +264,13 @@ class HybridSearcher:
         # Convert to SearchResult
         results = []
         for point, score in scored_points:
-            results.append(SearchResult(
-                id=cast(int | str, point.id),
-                score=score,
-                payload=dict(point.payload) if point.payload else {},
-            ))
+            results.append(
+                SearchResult(
+                    id=cast(int | str, point.id),
+                    score=score,
+                    payload=dict(point.payload) if point.payload else {},
+                )
+            )
 
         return results
 
