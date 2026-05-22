@@ -5,7 +5,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from vector_core.embeddings.client import EmbeddingClient, EmbeddingServiceError
+from vector_core.embeddings.client import (
+    EmbeddingClient,
+    EmbeddingServiceError,
+    SyncEmbeddingClient,
+)
 
 
 class TestEmbeddingClientInit:
@@ -39,6 +43,44 @@ class TestEmbeddingClientInit:
         """Trailing slash is stripped from base_url."""
         client = EmbeddingClient(base_url="http://example.com/")
         assert client.base_url == "http://example.com"
+
+
+class TestSyncEmbeddingClient:
+    """Tests for the sync wrapper used by non-async consumers."""
+
+    def test_sync_embed_batch_uses_persistent_bridge(self):
+        client = SyncEmbeddingClient(base_url="http://example.com", model="test", dim=2)
+        calls = []
+
+        async def fake_embed_batch(texts):
+            calls.append(list(texts))
+            return [[float(len(text)), 1.0] for text in texts]
+
+        client._client.embed_batch = fake_embed_batch
+
+        assert client.embed_batch(["a", "bbb"]) == [[1.0, 1.0], [3.0, 1.0]]
+        assert client.embed_single("zz") == [2.0, 1.0]
+        assert calls == [["a", "bbb"], ["zz"]]
+        assert client._bridge._closed is False
+        client.close()
+        assert client._bridge._closed is True
+
+    def test_sync_context_manager_closes_bridge(self):
+        with SyncEmbeddingClient(base_url="http://example.com", model="test", dim=2) as client:
+            assert client._bridge._closed is False
+        assert client._bridge._closed is True
+
+    def test_sync_close_calls_async_client_close_on_bridge_loop(self):
+        client = SyncEmbeddingClient(base_url="http://example.com", model="test", dim=2)
+        closed = {"value": False}
+
+        async def fake_close():
+            closed["value"] = True
+
+        client._client.close = fake_close
+        client.close()
+
+        assert closed["value"] is True
 
 
 class TestEmbedBatch:

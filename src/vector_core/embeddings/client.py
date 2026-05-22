@@ -429,3 +429,101 @@ class EmbeddingClient:
             progress_cb(len(embeddings), total)
 
         return embeddings
+
+
+class _SyncAsyncBridge:
+    """Run async embedding coroutines from synchronous code on one persistent loop."""
+
+    def __init__(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=self._run_loop,
+            name="vector-core-sync-embedding",
+            daemon=True,
+        )
+        self._closed = False
+        self._thread.start()
+
+    def _run_loop(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+
+    def run(self, coro):
+        if self._closed:
+            raise RuntimeError("sync embedding bridge is closed")
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=5.0)
+        self._loop.close()
+
+
+class SyncEmbeddingClient:
+    """Synchronous facade for :class:`EmbeddingClient`.
+
+    `EmbeddingClient` owns an `httpx.AsyncClient`, so repeatedly wrapping calls
+    with `asyncio.run()` can bind internal async resources to short-lived event
+    loops. This facade keeps a single background event loop for the lifetime of
+    the client and closes the async client on that same loop.
+    """
+
+    def __init__(
+        self,
+        base_url: str | None = None,
+        model: str | None = None,
+        batch_size: int | None = None,
+        timeout: float | None = None,
+        concurrency: int | None = None,
+        dim: int | None = None,
+    ) -> None:
+        self._client = EmbeddingClient(
+            base_url=base_url,
+            model=model,
+            batch_size=batch_size,
+            timeout=timeout,
+            concurrency=concurrency,
+            dim=dim,
+        )
+        self._bridge = _SyncAsyncBridge()
+
+    @property
+    def base_url(self) -> str:
+        return self._client.base_url
+
+    @property
+    def model(self) -> str:
+        return self._client.model
+
+    @property
+    def dim(self) -> int:
+        return self._client.dim
+
+    def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        return self._bridge.run(self._client.embed_batch(texts))
+
+    def embed_single(self, text: str) -> list[float]:
+        return self._bridge.run(self._client.embed_single(text))
+
+    def embed_all(
+        self,
+        texts: list[str],
+        progress_cb: Callable[[int, int], None] | None = None,
+    ) -> list[list[float]]:
+        return self._bridge.run(self._client.embed_all(texts, progress_cb=progress_cb))
+
+    def close(self) -> None:
+        if self._bridge._closed:
+            return
+        self._bridge.run(self._client.close())
+        self._bridge.close()
+
+    def __enter__(self) -> "SyncEmbeddingClient":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
