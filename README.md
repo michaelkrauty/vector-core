@@ -19,7 +19,7 @@ Shared vector search infrastructure for MCP servers. Provides dense and sparse e
 
 ## Prerequisites
 
-- **Python 3.12+**
+- **Python 3.11+**
 - **Linux or macOS** (uses POSIX `fcntl` for file locking; not compatible with Windows)
 - **Qdrant** running on `localhost:6333` (or configured via `VECTOR_QDRANT_URL`)
 - **An OpenAI-compatible embedding API** (e.g., llama.cpp `/v1/embeddings`, vLLM, Ollama, OpenAI)

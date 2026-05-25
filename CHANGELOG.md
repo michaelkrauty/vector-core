@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.4] - 2026-05-25
+
+### Fixed
+
+- Corrected the README prerequisite from Python 3.12+ to Python 3.11+ so the
+  published long description matches package metadata and tested compatibility.
+
 ## [1.0.3] - 2026-05-21
 
 ### Added
