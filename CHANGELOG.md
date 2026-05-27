@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.5] - 2026-05-27
+
+### Fixed
+
+- Aligned the runtime `vector_core.__version__` constant with package metadata.
+
 ## [1.0.4] - 2026-05-25
 
 ### Fixed
