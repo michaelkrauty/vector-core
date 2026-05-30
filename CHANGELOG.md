@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.1.0] - 2026-05-30
+
+### Added
+
+- `FileDiscovery` now honors **nested ignore files** at every directory level with git's "deeper overrides shallower" precedence (including `!` re-include negations), plus `.git/info/exclude`, instead of only the repository-root `.gitignore`. The user's global `core.excludesFile` is intentionally not consulted, keeping discovery reproducible across machines.
+- `FileDiscovery(ignore_filenames=...)` lets callers honor additional gitignore-syntax ignore files (e.g. a project-specific `.myignore`) at every directory level. Defaults to `(".gitignore",)`.
+
+### Changed
+
+- `FileDiscovery.discover()` and `scan_metadata()` now share a single internal walk so they cannot drift apart. Ignore rules (nested ignore files and `exclude_patterns` alike) are applied at file level, preserving the prior behavior where a `!dir/keep` pattern can still re-include a file under an otherwise-ignored directory.
+
 ## [1.0.5] - 2026-05-27
 
 ### Fixed

@@ -9,7 +9,7 @@ Shared vector search infrastructure for MCP servers. Provides dense and sparse e
 - **Hybrid search** combining dense + sparse results with RRF (Reciprocal Rank Fusion)
 - **Qdrant vector storage** with health checks and automatic reconnection
 - **Persistent SQLite-backed embedding cache** to avoid redundant API calls
-- **File discovery and change detection** with `.gitignore`-aware path filtering
+- **File discovery and change detection** with nested `.gitignore` / `.git/info/exclude`-aware path filtering (plus configurable extra ignore files)
 - **Glossary subsystem** -- shared term definitions stored in SQLite and indexed in Qdrant
 - **Facts subsystem** -- knowledge graph storage with subject-predicate-object triples and source integrity tracking
 - **Circuit breaker** on the embedding client to fail fast when the upstream API is down
