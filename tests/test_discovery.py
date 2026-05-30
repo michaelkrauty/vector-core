@@ -573,3 +573,179 @@ class TestScanMetadataEdgeCases:
         paths = [r[0] for r in results]
         assert "small.txt" in paths
         assert "large.txt" not in paths
+
+
+class TestNestedGitignore:
+    """Tests for nested .gitignore support (rules accumulate down the tree)."""
+
+    def test_subdir_gitignore_excludes_its_files(self, tmp_path):
+        """A .gitignore in a subdirectory excludes matching files there."""
+        (tmp_path / "keep.py").write_text("keep")
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / ".gitignore").write_text("*.generated\n")
+        (sub / "real.py").write_text("real")
+        (sub / "thing.generated").write_text("gen")
+
+        paths = {f.relative_path for f in FileDiscovery().discover(tmp_path)}
+
+        assert "keep.py" in paths
+        assert "sub/real.py" in paths
+        assert "sub/thing.generated" not in paths
+
+    def test_subdir_gitignore_scoped_to_its_subtree(self, tmp_path):
+        """A subdir .gitignore must not affect siblings with the same filename."""
+        a = tmp_path / "a"
+        a.mkdir()
+        b = tmp_path / "b"
+        b.mkdir()
+        (a / ".gitignore").write_text("secret\n")
+        (a / "secret").write_text("x")
+        (b / "secret").write_text("y")
+
+        paths = {f.relative_path for f in FileDiscovery().discover(tmp_path)}
+
+        assert "a/secret" not in paths
+        assert "b/secret" in paths
+
+    def test_nested_gitignore_prunes_directory(self, tmp_path):
+        """A directory-only pattern in a nested .gitignore prunes that directory."""
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / ".gitignore").write_text("generated/\n")
+        gen = sub / "generated"
+        gen.mkdir()
+        (gen / "out.py").write_text("x")
+        (sub / "keep.py").write_text("y")
+
+        paths = {f.relative_path for f in FileDiscovery().discover(tmp_path)}
+
+        assert "sub/keep.py" in paths
+        assert not any("generated" in p for p in paths)
+
+    def test_respect_gitignore_false_disables_nested(self, tmp_path):
+        """respect_gitignore=False ignores every ignore file, nested included."""
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / ".gitignore").write_text("*.gen\n")
+        (sub / "a.gen").write_text("a")
+
+        disc = FileDiscovery(respect_gitignore=False)
+        paths = {f.relative_path for f in disc.discover(tmp_path)}
+
+        assert "sub/a.gen" in paths
+
+
+class TestGitInfoExclude:
+    """Tests for repo-local .git/info/exclude support."""
+
+    def test_git_info_exclude_respected(self, tmp_path):
+        """Patterns in .git/info/exclude are honored (repo-local, uncommitted)."""
+        info = tmp_path / ".git" / "info"
+        info.mkdir(parents=True)
+        (info / "exclude").write_text("ignored\n")
+        (tmp_path / "ignored").write_text("x")
+        (tmp_path / "kept.py").write_text("y")
+
+        paths = {f.relative_path for f in FileDiscovery().discover(tmp_path)}
+
+        assert "ignored" not in paths
+        assert "kept.py" in paths
+
+
+class TestIgnorePrecedence:
+    """Tests for ignore precedence: negation and deeper-overrides-shallower."""
+
+    def test_negation_reincludes(self, tmp_path):
+        """A '!' pattern re-includes a file excluded by an earlier pattern."""
+        (tmp_path / ".gitignore").write_text("gen_*\n!gen_keep\n")
+        (tmp_path / "gen_a").write_text("x")
+        (tmp_path / "gen_keep").write_text("y")
+
+        paths = {f.relative_path for f in FileDiscovery().discover(tmp_path)}
+
+        assert "gen_a" not in paths
+        assert "gen_keep" in paths
+
+    def test_deeper_negation_overrides_parent(self, tmp_path):
+        """A child .gitignore '!' re-includes a file ignored by a parent pattern."""
+        (tmp_path / ".gitignore").write_text("*.tmp\n")
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / ".gitignore").write_text("!important.tmp\n")
+        (sub / "important.tmp").write_text("keep")
+        (sub / "other.tmp").write_text("drop")
+        (tmp_path / "root.tmp").write_text("drop")
+
+        paths = {f.relative_path for f in FileDiscovery().discover(tmp_path)}
+
+        assert "root.tmp" not in paths
+        assert "sub/other.tmp" not in paths
+        assert "sub/important.tmp" in paths
+
+    def test_exclude_patterns_stay_file_level(self, tmp_path):
+        """exclude_patterns match at file level only (backwards compatible)."""
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / "keep.py").write_text("k")
+        (sub / "drop.py").write_text("d")
+
+        disc = FileDiscovery(exclude_patterns=["sub/", "!sub/keep.py"])
+        paths = {f.relative_path for f in disc.discover(tmp_path)}
+
+        assert "sub/keep.py" in paths
+        assert "sub/drop.py" not in paths
+
+
+class TestConfigurableIgnoreFilenames:
+    """Tests for the generic ignore_filenames parameter."""
+
+    def test_extra_ignore_file_honored_when_configured(self, tmp_path):
+        """A configured extra ignore file is honored; by default it is not."""
+        (tmp_path / ".myignore").write_text("vendored.py\n")
+        (tmp_path / "vendored.py").write_text("x")
+        (tmp_path / "main.py").write_text("y")
+
+        default_paths = {f.relative_path for f in FileDiscovery().discover(tmp_path)}
+        extra = FileDiscovery(ignore_filenames=(".gitignore", ".myignore"))
+        extra_paths = {f.relative_path for f in extra.discover(tmp_path)}
+
+        assert "vendored.py" in default_paths
+        assert "vendored.py" not in extra_paths
+        assert "main.py" in extra_paths
+
+    def test_extra_ignore_file_honored_when_nested(self, tmp_path):
+        """Extra ignore files are honored at every directory level."""
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / ".myignore").write_text("*.big\n")
+        (sub / "data.big").write_text("x")
+        (sub / "code.py").write_text("y")
+
+        disc = FileDiscovery(ignore_filenames=(".gitignore", ".myignore"))
+        paths = {f.relative_path for f in disc.discover(tmp_path)}
+
+        assert "sub/data.big" not in paths
+        assert "sub/code.py" in paths
+
+
+class TestNestedScanConsistency:
+    """discover() and scan_metadata() must agree under nested ignore rules."""
+
+    def test_scan_matches_discover_with_nested_ignores(self, tmp_path):
+        """The full walk and the fast metadata scan select identical files."""
+        (tmp_path / ".gitignore").write_text("*.log\n")
+        (tmp_path / "main.py").write_text("m")
+        (tmp_path / "skip.log").write_text("l")
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / ".gitignore").write_text("vendor_*\n")
+        (pkg / "vendor_lib.py").write_text("v")
+        (pkg / "app.py").write_text("a")
+
+        disc = FileDiscovery()
+        discovered = {f.relative_path for f in disc.discover(tmp_path)}
+        scanned = {r[0] for r in disc.scan_metadata(tmp_path)}
+
+        assert discovered == scanned
+        assert discovered == {"main.py", "pkg/app.py"}
