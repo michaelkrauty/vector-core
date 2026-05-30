@@ -608,8 +608,8 @@ class TestNestedGitignore:
         assert "a/secret" not in paths
         assert "b/secret" in paths
 
-    def test_nested_gitignore_prunes_directory(self, tmp_path):
-        """A directory-only pattern in a nested .gitignore prunes that directory."""
+    def test_nested_gitignore_excludes_directory_contents(self, tmp_path):
+        """A directory-only pattern in a nested .gitignore excludes its contents."""
         sub = tmp_path / "sub"
         sub.mkdir()
         (sub / ".gitignore").write_text("generated/\n")
@@ -696,6 +696,23 @@ class TestIgnorePrecedence:
         assert "sub/keep.py" in paths
         assert "sub/drop.py" not in paths
 
+    def test_dir_pattern_reinclude_is_file_level(self, tmp_path):
+        """'!dir/child' re-includes a file under an ignored dir (file-level match).
+
+        Matching is file level (not directory pruning), so this preserves the
+        historical behavior rather than git's stricter non-recursion.
+        """
+        (tmp_path / ".gitignore").write_text("logs/\n!logs/keep.log\n")
+        logs = tmp_path / "logs"
+        logs.mkdir()
+        (logs / "keep.log").write_text("keep")
+        (logs / "drop.log").write_text("drop")
+
+        paths = {f.relative_path for f in FileDiscovery().discover(tmp_path)}
+
+        assert "logs/keep.log" in paths
+        assert "logs/drop.log" not in paths
+
 
 class TestConfigurableIgnoreFilenames:
     """Tests for the generic ignore_filenames parameter."""
@@ -727,6 +744,19 @@ class TestConfigurableIgnoreFilenames:
 
         assert "sub/data.big" not in paths
         assert "sub/code.py" in paths
+
+    def test_ignore_filenames_accepts_bare_string(self, tmp_path):
+        """A bare string is treated as one filename, not split into characters."""
+        (tmp_path / ".myignore").write_text("skip.py\n")
+        (tmp_path / "skip.py").write_text("x")
+        (tmp_path / "keep.py").write_text("y")
+
+        disc = FileDiscovery(ignore_filenames=".myignore")
+
+        assert disc.ignore_filenames == (".myignore",)
+        paths = {f.relative_path for f in disc.discover(tmp_path)}
+        assert "skip.py" not in paths
+        assert "keep.py" in paths
 
 
 class TestNestedScanConsistency:

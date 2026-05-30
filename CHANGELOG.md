@@ -9,7 +9,7 @@
 
 ### Changed
 
-- `FileDiscovery.discover()` and `scan_metadata()` now share a single internal walk so they cannot drift apart. `exclude_patterns` continues to match at file level only; directories are pruned by ignore files, matching git's non-recursion into excluded subtrees.
+- `FileDiscovery.discover()` and `scan_metadata()` now share a single internal walk so they cannot drift apart. Ignore rules (nested ignore files and `exclude_patterns` alike) are applied at file level, preserving the prior behavior where a `!dir/keep` pattern can still re-include a file under an otherwise-ignored directory.
 
 ## [1.0.5] - 2026-05-27
 

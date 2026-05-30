@@ -2,7 +2,7 @@
 
 import logging
 import os
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -54,19 +54,16 @@ def _is_ignored(
     rel_to_root: str,
     specs: list[tuple[Path, pathspec.GitIgnoreSpec]],
     exclude_spec: pathspec.GitIgnoreSpec | None,
-    *,
-    is_dir: bool,
 ) -> bool:
-    """Decide whether a path is excluded by the accumulated ignore specs.
+    """Decide whether a file is excluded by the accumulated ignore specs.
 
-    Mirrors git precedence: the programmatic ``exclude_spec`` wins outright, then the
-    deepest matching ignore file decides (``!`` negations re-include the path),
-    falling back to shallower files and finally ``.git/info/exclude``. Each spec is
-    matched relative to its own base directory; a trailing slash is appended for
-    directories so that directory-only patterns such as ``build/`` match.
+    Matching happens at file level (preserving historical behavior): the programmatic
+    ``exclude_spec`` wins outright, then the deepest matching ignore file decides
+    (``!`` negations re-include the file), falling back to shallower files and finally
+    ``.git/info/exclude``. Each spec is matched relative to its own base directory, so
+    a directory pattern such as ``build/`` still matches files nested beneath it.
     """
-    suffix = "/" if is_dir else ""
-    if exclude_spec is not None and exclude_spec.match_file(rel_to_root + suffix):
+    if exclude_spec is not None and exclude_spec.match_file(rel_to_root):
         return True
     # Deepest spec first: the most specific ignore file takes precedence.
     for base, spec in reversed(specs):
@@ -74,7 +71,7 @@ def _is_ignored(
             rel = str(abs_path.relative_to(base))
         except ValueError:
             continue
-        result = spec.check_file(rel + suffix)
+        result = spec.check_file(rel)
         if result.include is not None:
             # include=True -> matched an ignore pattern; include=False -> negation.
             return result.include
@@ -105,7 +102,7 @@ class FileDiscovery:
         max_size_kb: int | None = None,
         respect_gitignore: bool = True,
         exclude_patterns: list[str] | None = None,
-        ignore_filenames: tuple[str, ...] = (".gitignore",),
+        ignore_filenames: str | Iterable[str] = (".gitignore",),
     ):
         """
         Initialize file discovery.
@@ -118,14 +115,17 @@ class FileDiscovery:
                 True, ``ignore_filenames`` (at every directory level) and
                 ``.git/info/exclude`` are honored; when False, none are read.
             exclude_patterns: Additional gitignore-style patterns to exclude.
-            ignore_filenames: Names of gitignore-syntax ignore files honored at every
-                directory level. Defaults to ``(".gitignore",)``; consumers may add
-                their own, e.g. ``(".gitignore", ".myignore")``.
+            ignore_filenames: Name(s) of gitignore-syntax ignore files honored at every
+                directory level. Accepts a single string or an iterable of names.
+                Defaults to ``(".gitignore",)``; consumers may add their own, e.g.
+                ``(".gitignore", ".myignore")``.
         """
         self.extensions = extensions
         self.max_size_bytes = (max_size_kb or settings.max_file_size_kb) * 1024
         self.respect_gitignore = respect_gitignore
         self.exclude_patterns = exclude_patterns
+        if isinstance(ignore_filenames, str):
+            ignore_filenames = (ignore_filenames,)
         self.ignore_filenames = tuple(ignore_filenames)
 
     def _dir_ignore_specs(
@@ -164,9 +164,10 @@ class FileDiscovery:
         """Walk ``root`` yielding ``(abs_path, rel_path, stat)`` for indexable files.
 
         Shared by :meth:`discover` and :meth:`scan_metadata` so the two cannot drift
-        apart. Handles directory pruning (always-excluded dirs, dot directories,
-        symlinks, ignored directories), nested ignore-file accumulation with git's
-        "deeper overrides shallower" precedence, symlink and hidden-file skipping,
+        apart. Directories are pruned only by name (always-excluded dirs, dot
+        directories, symlinks); ignore files are matched at file level using specs
+        accumulated from the root down to each file, with git's "deeper overrides
+        shallower" precedence. Also handles hidden-file and symlink skipping,
         extension filtering, and size limits.
         """
         exclude_spec = (
@@ -191,22 +192,17 @@ class FileDiscovery:
                 current_specs = parent_specs + local if local else parent_specs
             specs_by_dir[current_path] = current_specs
 
-            # Prune directories: always-excluded, dot dirs, symlinks, and ignored dirs
-            # (git does not descend into ignored directories). exclude_patterns is NOT
-            # applied here -- historically it matched at file level only.
-            kept = []
-            for d in dirs:
-                if d in self.ALWAYS_EXCLUDE or d.startswith("."):
-                    continue
-                dir_path = current_path / d
-                if dir_path.is_symlink():
-                    continue
-                if _is_ignored(
-                    dir_path, str(rel_root / d), current_specs, None, is_dir=True
-                ):
-                    continue
-                kept.append(d)
-            dirs[:] = kept
+            # Prune directories by name only (always-excluded, dot dirs, symlinks).
+            # Ignore files are NOT used to prune directories: matching happens at file
+            # level, preserving historical behavior (a deeper "!dir/keep" can still
+            # re-include a file under an otherwise-ignored directory).
+            dirs[:] = [
+                d
+                for d in dirs
+                if d not in self.ALWAYS_EXCLUDE
+                and not d.startswith(".")
+                and not (current_path / d).is_symlink()
+            ]
 
             for filename in files:
                 if filename.startswith("."):
@@ -217,9 +213,7 @@ class FileDiscovery:
                 if self.extensions and file_path.suffix.lower() not in self.extensions:
                     continue
                 rel_path = str(rel_root / filename)
-                if _is_ignored(
-                    file_path, rel_path, current_specs, exclude_spec, is_dir=False
-                ):
+                if _is_ignored(file_path, rel_path, current_specs, exclude_spec):
                     continue
                 try:
                     stat = file_path.stat()
