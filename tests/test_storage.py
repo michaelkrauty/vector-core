@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 from qdrant_client.models import (
+    PointIdsList,
     PointStruct,
     ScoredPoint,
 )
@@ -371,6 +372,35 @@ class TestPointOperations:
             await storage.delete_by_filter("test", "file_path", "/path/to/file.py")
 
             mock_client.delete.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_delete_points(self):
+        """delete_points deletes the given IDs via a PointIdsList selector."""
+        storage = QdrantStorage()
+
+        with patch.object(storage, '_get_client') as mock_get_client:
+            mock_client = AsyncMock()
+            mock_client.delete = AsyncMock()
+            mock_get_client.return_value = mock_client
+
+            await storage.delete_points("test", ["id-1", "id-2", 3])
+
+            mock_client.delete.assert_called_once()
+            args, kwargs = mock_client.delete.call_args
+            assert args[0] == "test"
+            selector = kwargs["points_selector"]
+            assert isinstance(selector, PointIdsList)
+            assert selector.points == ["id-1", "id-2", 3]
+
+    @pytest.mark.asyncio
+    async def test_delete_points_empty_is_noop(self):
+        """delete_points with no IDs is a no-op and never touches the client."""
+        storage = QdrantStorage()
+
+        with patch.object(storage, '_get_client') as mock_get_client:
+            await storage.delete_points("test", [])
+
+            mock_get_client.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_scroll_points(self):

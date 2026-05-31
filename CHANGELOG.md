@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.2.0] - 2026-05-30
+
+### Added
+
+- `QdrantStorage.delete_points(collection, point_ids)` deletes points by their IDs, completing the documented point-operations API (which previously offered only `delete_by_filter` and `delete_collection`). Passing an empty sequence is a no-op and sends no request to Qdrant. This is the operation a consumer needs to remove a known set of points — e.g. pruning the now-orphaned chunks of a re-indexed document whose chunk count shrank.
+
 ## [1.1.0] - 2026-05-30
 
 ### Added
