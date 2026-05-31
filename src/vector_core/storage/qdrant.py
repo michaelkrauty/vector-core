@@ -17,6 +17,7 @@ from qdrant_client.models import (
     Filter,
     MatchValue,
     PayloadSchemaType,
+    PointIdsList,
     PointStruct,
     ScoredPoint,
     SparseVectorParams,
@@ -414,6 +415,29 @@ class QdrantStorage:
                     FieldCondition(key=field, match=MatchValue(value=value)),
                 ],
             ),
+        )
+
+    async def delete_points(
+        self,
+        collection: str,
+        point_ids: Sequence[str | int],
+    ) -> None:
+        """
+        Delete points by their IDs.
+
+        Args:
+            collection: Collection name
+            point_ids: IDs of the points to delete. If empty, this is a no-op
+                and no request is sent to Qdrant.
+        """
+        if not point_ids:
+            return
+
+        client = await self._get_client()
+
+        await client.delete(
+            collection,
+            points_selector=PointIdsList(points=list(point_ids)),
         )
 
     async def update_payload(
