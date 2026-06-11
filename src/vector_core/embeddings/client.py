@@ -389,7 +389,11 @@ class EmbeddingClient:
 
         Args:
             texts: List of texts to embed
-            progress_cb: Optional callback(completed, total) for progress reporting
+            progress_cb: Optional callback(completed, total) invoked after each
+                batch finishes embedding, with the running count of embedded
+                texts. Batches complete in arbitrary order, so `completed`
+                counts texts done so far, not a prefix of the input. The final
+                invocation is always (total, total).
 
         Returns:
             List of embedding vectors in same order as input texts
@@ -398,6 +402,19 @@ class EmbeddingClient:
             return []
 
         total = len(texts)
+        completed = 0
+
+        async def embed_with_progress(
+            batch_idx: int,
+            batch: list[str],
+            semaphore: asyncio.Semaphore,
+        ) -> tuple[int, list[list[float]]]:
+            nonlocal completed
+            result = await self._embed_batch_with_semaphore(batch_idx, batch, semaphore)
+            completed += len(batch)
+            if progress_cb:
+                progress_cb(completed, total)
+            return result
 
         # Create batches with their indices
         batches: list[tuple[int, list[str]]] = []
@@ -410,7 +427,7 @@ class EmbeddingClient:
 
         # Process batches concurrently with semaphore limiting
         tasks = [
-            self._embed_batch_with_semaphore(batch_idx, batch, semaphore)
+            embed_with_progress(batch_idx, batch, semaphore)
             for batch_idx, batch in batches
         ]
 
@@ -424,9 +441,6 @@ class EmbeddingClient:
         embeddings: list[list[float]] = []
         for _, batch_embeddings in sorted_results:
             embeddings.extend(batch_embeddings)
-
-        if progress_cb:
-            progress_cb(len(embeddings), total)
 
         return embeddings
 

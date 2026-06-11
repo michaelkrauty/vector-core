@@ -392,3 +392,121 @@ class TestGlossaryToolHelperWithoutIndexer:
 
         assert len(result) == 1
         assert "error_code" in result[0]
+
+
+class TestGlossaryToolHelperInputValidation:
+    """Blank/whitespace-only inputs must fail fast with INVALID_INPUT."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("term", "expansion", "definition", "field"),
+        [
+            ("", "Expansion", "Definition", "term"),
+            ("   ", "Expansion", "Definition", "term"),
+            ("TERM", "", "Definition", "expansion"),
+            ("TERM", "Expansion", "\t\n", "definition"),
+        ],
+    )
+    async def test_add_entry_blank_required_field(
+        self, helper, store, term, expansion, definition, field
+    ):
+        result = await helper.add_entry(term, expansion, definition)
+
+        assert result["error_code"] == "invalid_input"
+        assert field in result["message"]
+        assert store.count() == 0
+
+    @pytest.mark.asyncio
+    async def test_add_entry_blank_domain(self, helper, store):
+        result = await helper.add_entry("TERM", "Expansion", "Definition", domain="  ")
+
+        assert result["error_code"] == "invalid_input"
+        assert store.count() == 0
+
+    @pytest.mark.asyncio
+    async def test_add_entry_blank_alias(self, helper, store):
+        result = await helper.add_entry(
+            "TERM", "Expansion", "Definition", aliases=["ok", "  "]
+        )
+
+        assert result["error_code"] == "invalid_input"
+        assert store.count() == 0
+
+    @pytest.mark.asyncio
+    async def test_add_entry_strips_whitespace(self, helper, store):
+        result = await helper.add_entry(
+            "  USAF  ", "  United States Air Force ", " Air branch. ",
+            domain=" military ", aliases=[" Air Force "],
+        )
+
+        assert "error_code" not in result
+        entry = store.lookup("USAF")
+        assert entry is not None
+        assert entry.term == "USAF"
+        assert entry.expansion == "United States Air Force"
+        assert entry.definition == "Air branch."
+        assert entry.domain == "military"
+        assert entry.aliases == ["Air Force"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kwargs", [
+        {"term": " "},
+        {"expansion": ""},
+        {"definition": "\n"},
+        {"domain": "   "},
+        {"aliases": ["valid", ""]},
+    ])
+    async def test_update_entry_blank_field(self, helper, store, kwargs):
+        store.create(term="API", expansion="Expansion", definition="Definition")
+
+        result = await helper.update_entry("API", **kwargs)
+
+        assert result["error_code"] == "invalid_input"
+        # Entry unchanged
+        entry = store.lookup("API")
+        assert entry.expansion == "Expansion"
+
+    @pytest.mark.asyncio
+    async def test_update_entry_none_domain_still_clears(self, helper, store):
+        """None remains the documented way to clear domain."""
+        store.create(term="API", expansion="Exp", definition="Def", domain="tech")
+
+        result = await helper.update_entry("API", domain=None)
+
+        assert "error_code" not in result
+        assert store.lookup("API").domain is None
+
+    @pytest.mark.asyncio
+    async def test_update_entry_strips_whitespace(self, helper, store):
+        store.create(term="API", expansion="Exp", definition="Def")
+
+        result = await helper.update_entry("API", expansion="  New Expansion  ")
+
+        assert "error_code" not in result
+        assert store.lookup("API").expansion == "New Expansion"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("aliases", [
+        ["api", " api "],
+        ["API", "api"],
+        ["dup", "other", "dup"],
+    ])
+    async def test_add_entry_duplicate_aliases_rejected(self, helper, store, aliases):
+        """Aliases that collide after strip + case-fold fail fast."""
+        result = await helper.add_entry("TERM", "Expansion", "Definition", aliases=aliases)
+
+        assert result["error_code"] == "invalid_input"
+        assert "duplicate alias" in result["message"]
+        assert store.count() == 0
+
+    @pytest.mark.asyncio
+    async def test_update_entry_duplicate_aliases_leave_entry_intact(self, helper, store):
+        """A duplicate-alias update is rejected before any mutation."""
+        store.create(
+            term="API", expansion="Exp", definition="Def", aliases=["interface"]
+        )
+
+        result = await helper.update_entry("API", aliases=["new", " New "])
+
+        assert result["error_code"] == "invalid_input"
+        assert store.lookup("API").aliases == ["interface"]

@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.2.1] - 2026-06-11
+
+### Fixed
+
+- `FactStore` batch reads (`query()`, `get_entity_facts()`, `get_facts_by_source()`, `get_facts_by_source_status()`) now return facts in the order their IDs were selected. The internal batch read used SQL `IN (...)`, which returns rows in arbitrary order, so the `ORDER BY modified DESC` those callers request was silently lost.
+- `GlossaryStore.update()` now computes `entry_hash` after alias changes are applied. Previously the hash was computed first, so an alias-only update left a stale hash stored even though aliases are part of the hashed content — defeating hash-based change detection for alias edits.
+- `EmbeddingClient.embed_all()` invokes `progress_cb` after each batch completes, with a running count of embedded texts, as the parameter's documentation always implied. Previously the callback fired exactly once, at the very end, making it useless for progress reporting. The final invocation is still `(total, total)`.
+- `GlossaryToolHelper.add_entry()` and `update_entry()` reject blank or whitespace-only `term`, `expansion`, `definition`, `domain`, and alias entries with an `INVALID_INPUT` error response instead of storing them, and strip surrounding whitespace from accepted values. Passing `domain=None` to `update_entry()` still clears the domain.
+
 ## [1.2.0] - 2026-05-30
 
 ### Added

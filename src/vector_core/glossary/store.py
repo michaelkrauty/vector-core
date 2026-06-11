@@ -299,22 +299,8 @@ class GlossaryStore(ThreadSafeSQLiteStore):
             params.append(domain)
             entry.domain = domain
 
-        # Always update modified timestamp and hash
-        entry.modified = now
-        entry_hash = _compute_entry_hash(entry)
-        updates.append("modified = ?")
-        updates.append("entry_hash = ?")
-        params.extend([now.isoformat(), entry_hash])
-
-        params.append(str(entry_id))
-
-        if updates:
-            conn.execute(
-                f"UPDATE glossary_entries SET {', '.join(updates)} WHERE id = ?",
-                params,
-            )
-
-        # Handle aliases
+        # Handle aliases before computing the content hash, so the stored
+        # entry_hash reflects alias changes (the hash covers aliases).
         if is_set(aliases):  # Explicitly provided
             # Delete existing aliases
             conn.execute(
@@ -334,6 +320,20 @@ class GlossaryStore(ThreadSafeSQLiteStore):
                     (alias.lower(), str(entry_id), alias),
                 )
             entry.aliases = new_aliases
+
+        # Always update modified timestamp and hash
+        entry.modified = now
+        entry_hash = _compute_entry_hash(entry)
+        updates.append("modified = ?")
+        updates.append("entry_hash = ?")
+        params.extend([now.isoformat(), entry_hash])
+
+        params.append(str(entry_id))
+
+        conn.execute(
+            f"UPDATE glossary_entries SET {', '.join(updates)} WHERE id = ?",
+            params,
+        )
 
         conn.commit()
         return entry

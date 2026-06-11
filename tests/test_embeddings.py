@@ -348,6 +348,42 @@ class TestEmbedAll:
         assert len(progress_calls) > 0
         assert progress_calls[-1] == (3, 3)
 
+    @pytest.mark.asyncio
+    async def test_progress_callback_fires_per_batch(self):
+        """Progress reports once per completed batch with a running count."""
+        client = EmbeddingClient(batch_size=2, dim=4)
+        progress_calls = []
+
+        async def mock_embed_batch(texts):
+            return [[0.0] * 4 for _ in texts]
+
+        with patch.object(client, 'embed_batch', side_effect=mock_embed_batch):
+            await client.embed_all(
+                ["a", "b", "c", "d", "e"],
+                progress_cb=lambda completed, total: progress_calls.append((completed, total)),
+            )
+
+        # 5 texts at batch_size=2 -> 3 batches -> 3 progress reports
+        assert len(progress_calls) == 3
+        # Running count is strictly increasing and ends at (total, total)
+        completed_values = [c for c, _ in progress_calls]
+        assert completed_values == sorted(completed_values)
+        assert progress_calls[-1] == (5, 5)
+        assert all(total == 5 for _, total in progress_calls)
+
+    @pytest.mark.asyncio
+    async def test_no_progress_callback_is_fine(self):
+        """embed_all works without a progress callback."""
+        client = EmbeddingClient(batch_size=2, dim=4)
+
+        async def mock_embed_batch(texts):
+            return [[0.0] * 4 for _ in texts]
+
+        with patch.object(client, 'embed_batch', side_effect=mock_embed_batch):
+            result = await client.embed_all(["a", "b", "c"])
+
+        assert len(result) == 3
+
 
 class TestClientLifecycle:
     """Tests for client lifecycle management."""
