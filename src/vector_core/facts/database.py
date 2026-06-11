@@ -430,7 +430,9 @@ class FactStore(ThreadSafeSQLiteStore):
             fact_ids: List of fact UUIDs to read
 
         Returns:
-            List of Facts (order not guaranteed to match input)
+            List of Facts in the same order as fact_ids (IDs not found
+            in the database are skipped). Callers select IDs with their
+            own ORDER BY and rely on that order surviving the batch read.
         """
         if not fact_ids:
             return []
@@ -496,7 +498,9 @@ class FactStore(ThreadSafeSQLiteStore):
                 )
                 facts_by_id[fact_id_str].sources.append(source)
 
-        return list(facts_by_id.values())
+        # SQL `IN (...)` returns rows in arbitrary order; restore the
+        # caller's order (typically from an ORDER BY in the ID query).
+        return [facts_by_id[id_str] for id_str in id_strs if id_str in facts_by_id]
 
     def update(
         self,

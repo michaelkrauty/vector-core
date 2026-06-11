@@ -12,7 +12,7 @@ from vector_core.glossary.models import (
     GlossaryNotFoundError,
     TermExistsError,
 )
-from vector_core.glossary.store import GlossaryStore
+from vector_core.glossary.store import GlossaryStore, _compute_entry_hash
 
 
 @pytest.fixture
@@ -556,3 +556,52 @@ class TestGlossaryStoreContextManager:
         entry = store2.lookup("API")
         assert entry is not None
         store2.close()
+
+
+class TestGlossaryStoreEntryHash:
+    """Tests for entry_hash maintenance on update."""
+
+    def test_alias_update_refreshes_entry_hash(self, store):
+        """entry_hash must reflect alias changes (hash covers aliases)."""
+        entry = store.create(
+            term="USAF",
+            expansion="United States Air Force",
+            definition="The air service branch.",
+            aliases=["Air Force"],
+        )
+        hash_before = store.get_entry_hash(entry.id)
+
+        store.update(entry.id, aliases=["Air Force", "US Air Force"])
+
+        hash_after = store.get_entry_hash(entry.id)
+        assert hash_after != hash_before
+
+    def test_entry_hash_matches_stored_content_after_alias_update(self, store):
+        """Stored hash equals a fresh hash of the re-read entry."""
+        entry = store.create(
+            term="API",
+            expansion="Application Programming Interface",
+            definition="A set of protocols.",
+            aliases=["interface"],
+        )
+        store.update(entry.id, aliases=["interface", "endpoint"])
+
+        reread = store.read(entry.id)
+        assert store.get_entry_hash(entry.id) == _compute_entry_hash(reread)
+
+    def test_alias_only_update_changes_nothing_else(self, store):
+        """Alias-only update leaves other fields intact and applies aliases."""
+        entry = store.create(
+            term="SLA",
+            expansion="Service Level Agreement",
+            definition="A service commitment.",
+            domain="business",
+            aliases=["agreement"],
+        )
+        updated = store.update(entry.id, aliases=["uptime promise"])
+
+        assert updated.term == "SLA"
+        assert updated.domain == "business"
+        assert updated.aliases == ["uptime promise"]
+        reread = store.read(entry.id)
+        assert set(reread.aliases) == {"uptime promise"}

@@ -6,13 +6,60 @@ All methods are async to match indexing/embedding operations.
 
 
 from vector_core.errors import ErrorCode, error_response
-from vector_core.utils.sentinel import UNSET, UnsetType
+from vector_core.utils.sentinel import UNSET, UnsetType, is_set
 from vector_core.glossary.indexer import GlossaryIndexer
 from vector_core.glossary.models import (
     GlossaryEntry,
     TermExistsError,
 )
 from vector_core.glossary.store import GlossaryStore
+
+
+def _require_text(value: str, field: str) -> dict | None:
+    """Return an INVALID_INPUT error dict if a text field is blank, else None."""
+    if not isinstance(value, str) or not value.strip():
+        return error_response(
+            ErrorCode.INVALID_INPUT, f"{field} must be a non-empty string"
+        )
+    return None
+
+
+def _require_alias_texts(aliases: list[str]) -> dict | None:
+    """Return an INVALID_INPUT error dict if any alias is blank, else None."""
+    for alias in aliases:
+        if not isinstance(alias, str) or not alias.strip():
+            return error_response(
+                ErrorCode.INVALID_INPUT, "aliases must not contain empty strings"
+            )
+    return None
+
+
+def _validate_update_inputs(
+    term: str | None,
+    expansion: str | None,
+    definition: str | None,
+    domain: str | None | UnsetType,
+    aliases: list[str] | None | UnsetType,
+) -> dict | None:
+    """Validate update_entry inputs; return an error dict or None.
+
+    None means "leave unchanged" for term/expansion/definition, so only
+    explicit values are checked; domain/aliases use UNSET for "unchanged"
+    and None for "clear", both of which are valid and stay untouched.
+    """
+    fields = ((term, "term"), (expansion, "expansion"), (definition, "definition"))
+    for value, field in fields:
+        if value is not None:
+            err = _require_text(value, field)
+            if err:
+                return err
+    if is_set(domain) and domain is not None:
+        err = _require_text(domain, "domain")
+        if err:
+            return err
+    if is_set(aliases) and aliases is not None:
+        return _require_alias_texts(aliases)
+    return None
 
 
 class GlossaryToolHelper:
@@ -69,8 +116,27 @@ class GlossaryToolHelper:
             aliases: Optional alternative terms
 
         Returns:
-            Created entry as dict
+            Created entry as dict, or error dict for blank/invalid input
         """
+        for value, field in ((term, "term"), (expansion, "expansion"), (definition, "definition")):
+            err = _require_text(value, field)
+            if err:
+                return err
+        if domain is not None:
+            err = _require_text(domain, "domain")
+            if err:
+                return err
+        if aliases is not None:
+            err = _require_alias_texts(aliases)
+            if err:
+                return err
+
+        term = term.strip()
+        expansion = expansion.strip()
+        definition = definition.strip()
+        domain = domain.strip() if domain is not None else None
+        aliases = [a.strip() for a in aliases] if aliases is not None else None
+
         try:
             entry = self.store.create(term, expansion, definition, domain, aliases)
             if self.indexer is not None:
@@ -158,6 +224,18 @@ class GlossaryToolHelper:
         Returns:
             Updated entry as dict, or error dict
         """
+        # Validate provided fields before touching the store.
+        err = _validate_update_inputs(term, expansion, definition, domain, aliases)
+        if err:
+            return err
+        term = term.strip() if term is not None else None
+        expansion = expansion.strip() if expansion is not None else None
+        definition = definition.strip() if definition is not None else None
+        if is_set(domain) and domain is not None:
+            domain = domain.strip()
+        if is_set(aliases) and aliases is not None:
+            aliases = [a.strip() for a in aliases]
+
         # Find the entry
         entry = self.store.find_by_term_or_id(term_or_id)
         if entry is None:
