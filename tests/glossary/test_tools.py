@@ -484,3 +484,29 @@ class TestGlossaryToolHelperInputValidation:
 
         assert "error_code" not in result
         assert store.lookup("API").expansion == "New Expansion"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("aliases", [
+        ["api", " api "],
+        ["API", "api"],
+        ["dup", "other", "dup"],
+    ])
+    async def test_add_entry_duplicate_aliases_rejected(self, helper, store, aliases):
+        """Aliases that collide after strip + case-fold fail fast."""
+        result = await helper.add_entry("TERM", "Expansion", "Definition", aliases=aliases)
+
+        assert result["error_code"] == "invalid_input"
+        assert "duplicate alias" in result["message"]
+        assert store.count() == 0
+
+    @pytest.mark.asyncio
+    async def test_update_entry_duplicate_aliases_leave_entry_intact(self, helper, store):
+        """A duplicate-alias update is rejected before any mutation."""
+        store.create(
+            term="API", expansion="Exp", definition="Def", aliases=["interface"]
+        )
+
+        result = await helper.update_entry("API", aliases=["new", " New "])
+
+        assert result["error_code"] == "invalid_input"
+        assert store.lookup("API").aliases == ["interface"]

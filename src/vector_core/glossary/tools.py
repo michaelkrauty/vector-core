@@ -25,12 +25,25 @@ def _require_text(value: str, field: str) -> dict | None:
 
 
 def _require_alias_texts(aliases: list[str]) -> dict | None:
-    """Return an INVALID_INPUT error dict if any alias is blank, else None."""
+    """Return an INVALID_INPUT error dict if any alias is blank or a
+    duplicate after normalization (strip + case-fold), else None.
+
+    Duplicates must be caught here: by the time the store inserts
+    aliases it has already deleted the old ones, so a UNIQUE-constraint
+    failure there would leave the entry partially mutated.
+    """
+    seen: set[str] = set()
     for alias in aliases:
         if not isinstance(alias, str) or not alias.strip():
             return error_response(
                 ErrorCode.INVALID_INPUT, "aliases must not contain empty strings"
             )
+        normalized = alias.strip().lower()
+        if normalized in seen:
+            return error_response(
+                ErrorCode.INVALID_INPUT, f"duplicate alias: {alias.strip()}"
+            )
+        seen.add(normalized)
     return None
 
 
