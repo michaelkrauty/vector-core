@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.2] - 2026-06-12
+
+### Fixed
+
+- `GlossaryStore.update()` and `create()` are now atomic: a `TermExistsError` is raised before any row is written, so a failed mutation leaves the store fully unchanged. Previously, `update()` deleted the entry's existing aliases *before* validating the replacements against other entries, and `create()` inserted the entry row before alias insertion could fail — both on a long-lived connection whose pending partial state the next successful operation would silently commit. As a backstop, any unexpected error during the write phase now rolls back the transaction instead of leaving it pending.
+- Case-normalized duplicate aliases within a single `create()`/`update()` call (e.g. `["kit", "KIT"]`) now raise `TermExistsError` instead of escaping as a raw `sqlite3.IntegrityError` mid-mutation.
+
 ## [1.2.1] - 2026-06-11
 
 ### Fixed
