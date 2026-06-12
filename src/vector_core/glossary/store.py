@@ -267,8 +267,8 @@ class GlossaryStore(ThreadSafeSQLiteStore):
 
         Raises:
             GlossaryNotFoundError: If entry not found
-            TermExistsError: If the new term already exists, an alias
-                collides with another entry, or the alias list contains
+            TermExistsError: If the new term belongs to another entry, an
+                alias collides with another entry, or the alias list contains
                 case-normalized duplicates. Raised before any row is
                 written: the entry is left fully unchanged.
         """
@@ -283,8 +283,10 @@ class GlossaryStore(ThreadSafeSQLiteStore):
         params: list[str | None] = []
 
         if term is not None and term != entry.term:
-            # Check if new term exists
-            if self.exists_term(term):
+            # Check against OTHER entries only: a case-only rename
+            # ("USAF" -> "Usaf") and a rename to one of the entry's own
+            # aliases must not collide with the entry's own rows.
+            if self._exists_for_other_entry(term, entry_id):
                 raise TermExistsError(term)
             updates.append("term = ?")
             updates.append("term_normalized = ?")
@@ -374,24 +376,24 @@ class GlossaryStore(ThreadSafeSQLiteStore):
         seen: set[str] = set()
         for alias in aliases:
             normalized = alias.lower()
-            if normalized in seen or self._alias_exists_for_other(alias, entry_id):
+            if normalized in seen or self._exists_for_other_entry(alias, entry_id):
                 raise TermExistsError(alias)
             seen.add(normalized)
 
-    def _alias_exists_for_other(self, alias: str, exclude_entry_id: UUID) -> bool:
-        """Check if alias exists for a different entry."""
+    def _exists_for_other_entry(self, text: str, exclude_entry_id: UUID) -> bool:
+        """Check if text exists as the term or an alias of a DIFFERENT entry."""
         conn = self._get_conn()
         # Check as term
         cursor = conn.execute(
             "SELECT id FROM glossary_entries WHERE term_normalized = ? AND id != ?",
-            (alias.lower(), str(exclude_entry_id)),
+            (text.lower(), str(exclude_entry_id)),
         )
         if cursor.fetchone():
             return True
         # Check as alias
         cursor = conn.execute(
             "SELECT entry_id FROM glossary_aliases WHERE alias_normalized = ? AND entry_id != ?",
-            (alias.lower(), str(exclude_entry_id)),
+            (text.lower(), str(exclude_entry_id)),
         )
         return cursor.fetchone() is not None
 

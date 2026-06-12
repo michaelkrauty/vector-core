@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.2.3] - 2026-06-12
+
+### Fixed
+
+- `GlossaryStore.update()` no longer rejects term renames that only collide with the entry's own rows. The uniqueness check for a new term excluded nothing, so a case-only rename (`"USAF"` → `"Usaf"`) matched the entry's own `term_normalized` and raised `TermExistsError`, as did renaming a term to one of the entry's own current aliases. The check now excludes the entry being updated (mirroring how replacement aliases are validated); collisions with *other* entries' terms and aliases are still rejected.
+
 ## [1.2.2] - 2026-06-12
 
 ### Fixed

@@ -712,3 +712,50 @@ class TestGlossaryStoreAtomicity:
         assert store.lookup("Foo") is None
         assert store.lookup("bar") is None
         assert store.count() == 1
+
+
+class TestGlossaryStoreSelfRename:
+    """Term renames that only collide with the entry's OWN rows must work."""
+
+    def test_update_term_case_only_rename(self, store):
+        """Changing only the casing of a term is a legitimate rename."""
+        entry = store.create(term="USAF", expansion="E", definition="D")
+
+        updated = store.update(entry.id, term="Usaf")
+
+        assert updated.term == "Usaf"
+        reread = store.read(entry.id)
+        assert reread.term == "Usaf"
+        assert store.lookup("usaf").id == entry.id
+
+    def test_update_term_to_own_alias(self, store):
+        """Renaming a term to one of the entry's own aliases is allowed."""
+        entry = store.create(
+            term="USAF",
+            expansion="United States Air Force",
+            definition="D",
+            aliases=["Air Force"],
+        )
+
+        updated = store.update(entry.id, term="Air Force")
+
+        assert updated.term == "Air Force"
+        found = store.lookup("air force")
+        assert found is not None and found.id == entry.id
+
+    def test_update_term_still_rejects_other_entrys_alias(self, store):
+        """Cross-entry semantics unchanged: another entry's alias conflicts."""
+        store.create(term="USAF", expansion="E", definition="D", aliases=["Air Force"])
+        entry = store.create(term="SDK", expansion="E", definition="D")
+
+        with pytest.raises(TermExistsError):
+            store.update(entry.id, term="air force")
+
+    def test_case_only_rename_updates_entry_hash(self, store):
+        """The stored hash must reflect the re-cased term."""
+        entry = store.create(term="USAF", expansion="E", definition="D")
+
+        store.update(entry.id, term="Usaf")
+
+        reread = store.read(entry.id)
+        assert store.get_entry_hash(entry.id) == _compute_entry_hash(reread)
