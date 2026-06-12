@@ -29,6 +29,25 @@ logger = logging.getLogger(__name__)
 MAX_BFS_VISITED = 10000  # Maximum nodes visited during graph traversal
 
 
+def _require_non_blank(value: str, field: str) -> None:
+    """Raise ValueError if a required text field is not a non-blank string.
+
+    The store validates but does not normalize: values are stored exactly
+    as given. Blank fields would corrupt spo_hash-based deduplication and
+    entity adjacency, which are built from these strings.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-empty string")
+
+
+def _require_confidence_in_range(confidence: float) -> None:
+    """Raise ValueError if confidence is outside the documented 0.0-1.0 range."""
+    if not isinstance(confidence, (int, float)) or not 0.0 <= confidence <= 1.0:
+        raise ValueError(
+            f"confidence must be between 0.0 and 1.0, got {confidence!r}"
+        )
+
+
 class FactStore(ThreadSafeSQLiteStore):
     """
     SQLite-based fact storage with thread-safe operations.
@@ -209,7 +228,19 @@ class FactStore(ThreadSafeSQLiteStore):
 
         Raises:
             DuplicateFactError: If fact with same SPO already exists
+            ValueError: If any SPO/type field is blank or confidence is
+                outside 0.0-1.0. Raised before any database access.
         """
+        for field, value in (
+            ("subject", subject),
+            ("predicate", predicate),
+            ("object_value", object_value),
+            ("subject_type", subject_type),
+            ("object_type", object_type),
+        ):
+            _require_non_blank(value, field)
+        _require_confidence_in_range(confidence)
+
         conn = self._get_conn()
         now = datetime.now(UTC)
         fact_id = uuid4()
@@ -528,7 +559,12 @@ class FactStore(ThreadSafeSQLiteStore):
 
         Raises:
             FactNotFoundError: If fact not found
+            ValueError: If confidence is outside 0.0-1.0. Raised before
+                any row is written.
         """
+        if confidence is not None:
+            _require_confidence_in_range(confidence)
+
         conn = self._get_conn()
 
         # Load fact for update (raises FactNotFoundError if not found)

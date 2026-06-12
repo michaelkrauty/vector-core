@@ -58,3 +58,66 @@ class TestReadBatchOrdering:
 
         expected = [f.id for f in reversed(facts)]  # newest first
         assert [f.id for f in results] == expected
+
+
+class TestInputValidation:
+    """create()/update() reject garbage before any database access.
+
+    Blank SPO/type fields would corrupt spo_hash deduplication and
+    entity adjacency; confidence is documented as 0.0-1.0.
+    """
+
+    @pytest.mark.parametrize(
+        "field",
+        ["subject", "predicate", "object_value", "subject_type", "object_type"],
+    )
+    @pytest.mark.parametrize("blank", ["", "   ", "\t\n"])
+    def test_create_rejects_blank_string_fields(self, store, field, blank):
+        """Each required string field rejects empty/whitespace-only values."""
+        kwargs = {
+            "subject": "John",
+            "predicate": "works_at",
+            "object_value": "Acme",
+            "subject_type": "person",
+            "object_type": "organization",
+            field: blank,
+        }
+        with pytest.raises(ValueError, match=field):
+            store.create(**kwargs)
+        assert store.count() == 0
+
+    @pytest.mark.parametrize("bad", [-0.1, 1.1, float("nan"), float("inf")])
+    def test_create_rejects_out_of_range_confidence(self, store, bad):
+        """Confidence outside [0.0, 1.0] raises before any row is written."""
+        with pytest.raises(ValueError, match="confidence"):
+            store.create("John", "works_at", "Acme", confidence=bad)
+        assert store.count() == 0
+
+    @pytest.mark.parametrize("ok", [0.0, 0.5, 1.0])
+    def test_create_accepts_boundary_confidence(self, store, ok):
+        """0.0 and 1.0 are inclusive bounds."""
+        fact = store.create("John", "works_at", f"Acme-{ok}", confidence=ok)
+        assert fact.confidence == ok
+
+    @pytest.mark.parametrize("bad", [-0.1, 1.1, float("nan")])
+    def test_update_rejects_out_of_range_confidence(self, store, bad):
+        """update() validates confidence and leaves the fact unchanged."""
+        fact = store.create("John", "works_at", "Acme", confidence=0.8)
+
+        with pytest.raises(ValueError, match="confidence"):
+            store.update(fact.id, confidence=bad)
+
+        assert store.read(fact.id).confidence == 0.8
+
+    def test_update_accepts_valid_confidence(self, store):
+        """In-range confidence still updates normally."""
+        fact = store.create("John", "works_at", "Acme", confidence=0.8)
+
+        store.update(fact.id, confidence=1.0)
+
+        assert store.read(fact.id).confidence == 1.0
+
+    def test_create_does_not_normalize_accepted_values(self, store):
+        """The store validates but stores values exactly as given."""
+        fact = store.create("  John  ", "works_at", "Acme")
+        assert store.read(fact.id).subject == "  John  "

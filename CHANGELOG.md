@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.4] - 2026-06-12
+
+### Fixed
+
+- `FactStore.create()` now rejects blank or whitespace-only `subject`, `predicate`, `object_value`, `subject_type`, and `object_type` with a `ValueError` raised before any database access, instead of silently storing them. All five fields feed `spo_hash`-based duplicate detection and the entity adjacency graph, so blank values corrupted both. The store validates but does not normalize — accepted values are stored exactly as given.
+- `FactStore.create()` and `update()` now reject `confidence` outside the documented 0.0–1.0 range (including NaN) with a `ValueError`; both bounds remain inclusive.
+
 ## [1.2.3] - 2026-06-12
 
 ### Fixed
