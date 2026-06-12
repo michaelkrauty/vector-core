@@ -605,3 +605,110 @@ class TestGlossaryStoreEntryHash:
         assert updated.aliases == ["uptime promise"]
         reread = store.read(entry.id)
         assert set(reread.aliases) == {"uptime promise"}
+
+
+class TestGlossaryStoreAtomicity:
+    """Failed mutations must leave the store fully unchanged.
+
+    The store uses long-lived per-thread connections, so a write that
+    raises mid-mutation leaves partial state pending in the implicit
+    transaction — and the next successful operation on the same
+    connection would commit it. Each test therefore performs a
+    subsequent successful (committing) operation before asserting.
+    """
+
+    def test_update_alias_collision_with_term_leaves_entry_unchanged(self, store):
+        """Alias colliding with another entry's term must not clear aliases."""
+        store.create(term="API", expansion="E", definition="D")
+        entry = store.create(
+            term="SDK",
+            expansion="Software Development Kit",
+            definition="D",
+            aliases=["devkit", "kit"],
+        )
+
+        with pytest.raises(TermExistsError):
+            store.update(entry.id, aliases=["toolkit", "API"])
+
+        # Commit anything pending on the shared connection.
+        store.create(term="CLI", expansion="E", definition="D")
+
+        reread = store.read(entry.id)
+        assert set(reread.aliases) == {"devkit", "kit"}
+
+    def test_update_alias_collision_with_alias_leaves_entry_unchanged(self, store):
+        """Alias colliding with another entry's alias must not clear aliases."""
+        store.create(term="API", expansion="E", definition="D", aliases=["interface"])
+        entry = store.create(
+            term="SDK",
+            expansion="Software Development Kit",
+            definition="D",
+            aliases=["devkit"],
+        )
+
+        with pytest.raises(TermExistsError):
+            store.update(entry.id, aliases=["interface"])
+
+        store.create(term="CLI", expansion="E", definition="D")
+
+        reread = store.read(entry.id)
+        assert set(reread.aliases) == {"devkit"}
+
+    def test_update_duplicate_aliases_raise_term_exists_and_leave_entry_unchanged(
+        self, store
+    ):
+        """Case-normalized duplicates in the list raise TermExistsError, not
+        a raw IntegrityError after the old aliases are already deleted."""
+        entry = store.create(
+            term="SDK",
+            expansion="Software Development Kit",
+            definition="D",
+            aliases=["devkit"],
+        )
+
+        with pytest.raises(TermExistsError):
+            store.update(entry.id, aliases=["kit", "KIT"])
+
+        store.create(term="CLI", expansion="E", definition="D")
+
+        reread = store.read(entry.id)
+        assert set(reread.aliases) == {"devkit"}
+
+    def test_failed_update_leaves_hash_and_modified_consistent(self, store):
+        """After a failed update, stored hash still matches stored content."""
+        entry = store.create(
+            term="SDK",
+            expansion="Software Development Kit",
+            definition="D",
+            aliases=["devkit"],
+        )
+        store.create(term="API", expansion="E", definition="D")
+
+        with pytest.raises(TermExistsError):
+            store.update(entry.id, expansion="changed", aliases=["API"])
+
+        store.create(term="CLI", expansion="E", definition="D")
+
+        reread = store.read(entry.id)
+        assert reread.expansion == "Software Development Kit"
+        assert reread.modified == entry.modified
+        assert store.get_entry_hash(entry.id) == _compute_entry_hash(reread)
+
+    def test_create_duplicate_aliases_raise_term_exists_and_leave_no_entry(
+        self, store
+    ):
+        """Duplicate aliases in create() raise TermExistsError before the
+        entry row is written — no dangling entry survives a later commit."""
+        with pytest.raises(TermExistsError):
+            store.create(
+                term="Foo",
+                expansion="E",
+                definition="D",
+                aliases=["bar", "BAR"],
+            )
+
+        store.create(term="CLI", expansion="E", definition="D")
+
+        assert store.lookup("Foo") is None
+        assert store.lookup("bar") is None
+        assert store.count() == 1

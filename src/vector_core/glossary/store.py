@@ -131,21 +131,19 @@ class GlossaryStore(ThreadSafeSQLiteStore):
             Created GlossaryEntry
 
         Raises:
-            TermExistsError: If term or any alias already exists
+            TermExistsError: If term or any alias already exists, or if the
+                alias list contains case-normalized duplicates
         """
         conn = self._get_conn()
         now = datetime.now(UTC)
         entry_id = uuid4()
         aliases = aliases or []
 
-        # Check if term exists
+        # Validate everything before writing any row, so a failure cannot
+        # leave a partially-created entry pending on the connection.
         if self.exists_term(term):
             raise TermExistsError(term)
-
-        # Check if any alias exists
-        for alias in aliases:
-            if self.exists_term(alias):
-                raise TermExistsError(alias)
+        self._ensure_aliases_insertable(aliases, entry_id)
 
         entry = GlossaryEntry(
             id=entry_id,
@@ -159,37 +157,43 @@ class GlossaryStore(ThreadSafeSQLiteStore):
         )
         entry_hash = _compute_entry_hash(entry)
 
-        conn.execute(
-            """
-            INSERT INTO glossary_entries
-            (id, term, term_normalized, expansion, definition,
-             domain, created, modified, entry_hash)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                str(entry_id),
-                term,
-                term.lower(),
-                expansion,
-                definition,
-                domain,
-                now.isoformat(),
-                now.isoformat(),
-                entry_hash,
-            ),
-        )
-
-        # Insert aliases
-        for alias in aliases:
+        try:
             conn.execute(
                 """
-                INSERT INTO glossary_aliases (alias_normalized, entry_id, alias_original)
-                VALUES (?, ?, ?)
+                INSERT INTO glossary_entries
+                (id, term, term_normalized, expansion, definition,
+                 domain, created, modified, entry_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (alias.lower(), str(entry_id), alias),
+                (
+                    str(entry_id),
+                    term,
+                    term.lower(),
+                    expansion,
+                    definition,
+                    domain,
+                    now.isoformat(),
+                    now.isoformat(),
+                    entry_hash,
+                ),
             )
 
-        conn.commit()
+            # Insert aliases
+            for alias in aliases:
+                conn.execute(
+                    """
+                    INSERT INTO glossary_aliases (alias_normalized, entry_id, alias_original)
+                    VALUES (?, ?, ?)
+                    """,
+                    (alias.lower(), str(entry_id), alias),
+                )
+
+            conn.commit()
+        except Exception:
+            # The connection is long-lived; without a rollback, partial
+            # writes would linger and be committed by a later operation.
+            conn.rollback()
+            raise
         return entry
 
     def read(self, entry_id: UUID) -> GlossaryEntry:
@@ -263,7 +267,10 @@ class GlossaryStore(ThreadSafeSQLiteStore):
 
         Raises:
             GlossaryNotFoundError: If entry not found
-            TermExistsError: If new term already exists
+            TermExistsError: If the new term already exists, an alias
+                collides with another entry, or the alias list contains
+                case-normalized duplicates. Raised before any row is
+                written: the entry is left fully unchanged.
         """
         conn = self._get_conn()
 
@@ -299,26 +306,17 @@ class GlossaryStore(ThreadSafeSQLiteStore):
             params.append(domain)
             entry.domain = domain
 
-        # Handle aliases before computing the content hash, so the stored
-        # entry_hash reflects alias changes (the hash covers aliases).
+        # Validate replacement aliases BEFORE deleting the existing ones,
+        # so a collision leaves the entry fully unchanged (the old code
+        # raised mid-replacement, leaving the aliases cleared in the
+        # pending transaction for a later commit to persist).
+        # Apply them to the entry before computing the content hash, so
+        # the stored entry_hash reflects alias changes (the hash covers
+        # aliases).
+        new_aliases: list[str] | None = None
         if is_set(aliases):  # Explicitly provided
-            # Delete existing aliases
-            conn.execute(
-                "DELETE FROM glossary_aliases WHERE entry_id = ?",
-                (str(entry_id),),
-            )
-            # Insert new aliases
             new_aliases = aliases or []
-            for alias in new_aliases:
-                if self._alias_exists_for_other(alias, entry_id):
-                    raise TermExistsError(alias)
-                conn.execute(
-                    """
-                    INSERT INTO glossary_aliases (alias_normalized, entry_id, alias_original)
-                    VALUES (?, ?, ?)
-                    """,
-                    (alias.lower(), str(entry_id), alias),
-                )
+            self._ensure_aliases_insertable(new_aliases, entry_id)
             entry.aliases = new_aliases
 
         # Always update modified timestamp and hash
@@ -330,13 +328,55 @@ class GlossaryStore(ThreadSafeSQLiteStore):
 
         params.append(str(entry_id))
 
-        conn.execute(
-            f"UPDATE glossary_entries SET {', '.join(updates)} WHERE id = ?",
-            params,
-        )
+        try:
+            if new_aliases is not None:
+                # Replace aliases: delete existing, insert validated new ones
+                conn.execute(
+                    "DELETE FROM glossary_aliases WHERE entry_id = ?",
+                    (str(entry_id),),
+                )
+                for alias in new_aliases:
+                    conn.execute(
+                        """
+                        INSERT INTO glossary_aliases (alias_normalized, entry_id, alias_original)
+                        VALUES (?, ?, ?)
+                        """,
+                        (alias.lower(), str(entry_id), alias),
+                    )
 
-        conn.commit()
+            conn.execute(
+                f"UPDATE glossary_entries SET {', '.join(updates)} WHERE id = ?",
+                params,
+            )
+
+            conn.commit()
+        except Exception:
+            # The connection is long-lived; without a rollback, partial
+            # writes would linger and be committed by a later operation.
+            conn.rollback()
+            raise
         return entry
+
+    def _ensure_aliases_insertable(self, aliases: list[str], entry_id: UUID) -> None:
+        """
+        Validate that every alias in the list can be inserted for entry_id.
+
+        Checks each alias against other entries' terms and aliases, and
+        against the rest of the list itself (case-normalized). Runs before
+        any row is written so callers can mutate afterwards without a
+        mid-mutation failure leaving partial state pending on the
+        connection.
+
+        Raises:
+            TermExistsError: If an alias collides with another entry or
+                duplicates an earlier alias in the same list
+        """
+        seen: set[str] = set()
+        for alias in aliases:
+            normalized = alias.lower()
+            if normalized in seen or self._alias_exists_for_other(alias, entry_id):
+                raise TermExistsError(alias)
+            seen.add(normalized)
 
     def _alias_exists_for_other(self, alias: str, exclude_entry_id: UUID) -> bool:
         """Check if alias exists for a different entry."""
