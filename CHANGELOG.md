@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.5] - 2026-06-12
+
+### Fixed
+
+- `FactStore.find_connections()` type filters (`source_type`, `target_type`) are now case-insensitive, matching how the entity adjacency table stores types (lowercased at write time). Previously, passing a type exactly as facts display it (e.g. `"Person"`) silently returned no paths; `get_entity_facts()` and `get_neighbors()` already normalized their type filters. (#18)
+- `QdrantStorage.get_metadata()` no longer JSON-deserializes string values that parse as non-dict JSON. `store_metadata()` only serializes dict values, so a stored string like `"123"` or `"true"` round-tripped asymmetrically as `int`/`bool`. Only dict-shaped strings are deserialized now; all other strings come back unchanged.
+
 ## [1.2.4] - 2026-06-12
 
 ### Fixed

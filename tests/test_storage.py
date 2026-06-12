@@ -525,6 +525,37 @@ class TestMetadataStorage:
         assert isinstance(result["vocab_data"], dict)
         assert result["vocab_data"]["hello"] == 1
 
+    @pytest.mark.asyncio
+    async def test_string_values_round_trip_unchanged(self):
+        """Strings that look like non-dict JSON stay strings.
+
+        store_metadata only JSON-serializes dict values, so get_metadata
+        must only deserialize dict-shaped strings — a stored "123" or
+        "true" coming back as int/bool would be an asymmetric round-trip.
+        """
+        storage = QdrantStorage()
+
+        mock_point = MagicMock()
+        mock_point.payload = {
+            "type": "__metadata__",
+            "numeric_name": "123",
+            "boolish": "true",
+            "listish": "[1, 2]",
+            "plain": "hello",
+        }
+
+        with patch.object(storage, '_get_client') as mock_get_client:
+            mock_client = AsyncMock()
+            mock_client.retrieve = AsyncMock(return_value=[mock_point])
+            mock_get_client.return_value = mock_client
+
+            result = await storage.get_metadata("test")
+
+        assert result["numeric_name"] == "123"
+        assert result["boolish"] == "true"
+        assert result["listish"] == "[1, 2]"
+        assert result["plain"] == "hello"
+
 
 class TestQueryOperations:
     """Tests for query operations."""

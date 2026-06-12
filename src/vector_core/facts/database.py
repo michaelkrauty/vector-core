@@ -1026,9 +1026,13 @@ class FactStore(ThreadSafeSQLiteStore):
         max_depth = min(max(1, max_depth), 10)
         conn = self._get_conn()
 
-        # Normalize entity names
+        # Normalize entity names and type filters the same way adjacency
+        # writes do (_update_adjacency stores both lowercased), so callers can
+        # pass types in any case.
         source_entity = source_entity.lower()
         target_lower = target_entity.lower() if target_entity else None
+        source_type = source_type.lower() if source_type else None
+        target_type = target_type.lower() if target_type else None
 
         # BFS state
         # Each queue item: (current_entity, current_type, path_so_far)

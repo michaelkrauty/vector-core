@@ -121,3 +121,52 @@ class TestInputValidation:
         """The store validates but stores values exactly as given."""
         fact = store.create("  John  ", "works_at", "Acme")
         assert store.read(fact.id).subject == "  John  "
+
+
+class TestFindConnectionsTypeFilterCase:
+    """find_connections type filters must match case-insensitively.
+
+    The entity_adjacency table stores entity names AND types lowercased
+    (_update_adjacency), so filters compared against those rows have to be
+    normalized the same way. Passing a type exactly as facts display it
+    (e.g. "Person") must not silently yield zero paths.
+    """
+
+    @pytest.fixture
+    def peopled_store(self, store):
+        store.create(
+            "Alice", "works_at", "Acme",
+            subject_type="Person", object_type="Company",
+        )
+        store.create(
+            "Bob", "works_at", "Acme",
+            subject_type="Person", object_type="Company",
+        )
+        return store
+
+    def test_source_type_filter_is_case_insensitive(self, peopled_store):
+        paths = peopled_store.find_connections(
+            "alice", "bob", source_type="Person"
+        )
+        assert len(paths) == 1
+
+    def test_target_type_filter_is_case_insensitive(self, peopled_store):
+        paths = peopled_store.find_connections(
+            "alice", "bob", target_type="Person"
+        )
+        assert len(paths) == 1
+
+    def test_lowercase_filters_still_match(self, peopled_store):
+        paths = peopled_store.find_connections(
+            "alice", "bob", source_type="person", target_type="person"
+        )
+        assert len(paths) == 1
+
+    def test_wrong_type_still_excludes(self, peopled_store):
+        """Normalization must not loosen the filter into a no-op."""
+        assert peopled_store.find_connections(
+            "alice", "bob", source_type="Company"
+        ) == []
+        assert peopled_store.find_connections(
+            "alice", "bob", target_type="Robot"
+        ) == []

@@ -561,7 +561,11 @@ class QdrantStorage:
             collection: Collection name
 
         Returns:
-            Metadata dict or None if not found
+            Metadata dict or None if not found.
+            String values round-trip unchanged: only dict values are
+            JSON-serialized by store_metadata, so only strings that parse
+            back to a dict are deserialized here. A string value that merely
+            looks like other JSON (e.g. "123", "true") stays a string.
         """
         client = await self._get_client()
 
@@ -576,13 +580,15 @@ class QdrantStorage:
 
         payload = dict(points[0].payload) if points[0].payload else {}
 
-        # Deserialize JSON values
+        # Deserialize values store_metadata serialized (dicts only)
         for key in list(payload.keys()):
             if isinstance(payload[key], str):
                 try:
-                    payload[key] = json.loads(payload[key])
+                    parsed = json.loads(payload[key])
                 except (json.JSONDecodeError, TypeError):
-                    pass  # Keep as string
+                    continue  # Keep as string
+                if isinstance(parsed, dict):
+                    payload[key] = parsed
 
         return payload
 
