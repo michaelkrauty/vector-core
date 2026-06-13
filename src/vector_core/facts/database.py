@@ -1231,9 +1231,15 @@ class FactStore(ThreadSafeSQLiteStore):
                 # Deleted between the id snapshot and this read; skip it.
                 logger.debug("Fact %s vanished during iter_all, skipping", row[0])
                 continue
-            except Exception:
-                # A single unreadable/malformed row must not abort iteration
-                # over every other fact.
+            except sqlite3.Error:
+                # Systemic DB failure (e.g. database is locked). Must NOT be
+                # swallowed as a single bad row: that would yield an empty or
+                # partial corpus and let a force reindex delete every point.
+                # Fail loud.
+                raise
+            except (ValueError, KeyError, TypeError):
+                # Malformed stored row (bad date/enum/uuid) — skip just this
+                # fact rather than aborting iteration over the rest.
                 logger.warning(
                     "Skipping unreadable fact %s during iter_all", row[0], exc_info=True
                 )

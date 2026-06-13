@@ -1,5 +1,6 @@
 """Tests for facts/database module."""
 
+import sqlite3
 import tempfile
 import time
 from pathlib import Path
@@ -196,6 +197,20 @@ class TestIterAllResilience:
         facts = list(store.iter_all())
 
         assert [f.id for f in facts] == [f2.id]
+
+    def test_propagates_systemic_db_error(self, store, monkeypatch):
+        """A systemic DB failure (e.g. locked) must propagate, not be swallowed
+        as a single bad row — otherwise a force reindex sees an empty corpus and
+        deletes every point."""
+        store.create("alpha", "relates_to", "one")
+
+        def locked_read(fact_id):
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(store, "read", locked_read)
+
+        with pytest.raises(sqlite3.OperationalError):
+            list(store.iter_all())
 
     def test_skips_fact_that_fails_to_load(self, store, monkeypatch):
         """A malformed row (non-FactNotFoundError read failure) is skipped, not fatal."""
