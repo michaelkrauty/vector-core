@@ -23,7 +23,7 @@ from qdrant_client.models import (
 from vector_core.embeddings.client import EmbeddingClient, EmbeddingServiceError
 from vector_core.embeddings.global_vocab import GlobalVocabulary
 from vector_core.facts.database import FactStore
-from vector_core.facts.models import Fact, FactNotFoundError, SourceStatus
+from vector_core.facts.models import Fact, SourceStatus
 from vector_core.storage.qdrant import (
     QdrantConnectionError,
     QdrantStorage,
@@ -209,18 +209,7 @@ class FactIndexer:
         await self._ensure_global_vocab()
         await self.ensure_collection()
 
-        # Get all facts
-        all_facts = self.fact_store.list_summaries()
-
-        if not all_facts:
-            logger.info("No facts to index")
-            return {
-                "total": 0,
-                "indexed": 0,
-                "last_indexed": datetime.now(UTC).isoformat(),
-            }
-
-        # Get existing indexed facts
+        # Get existing indexed facts (force mode wipes and reindexes everything)
         if not force:
             indexed_ids = await self._get_indexed_fact_ids()
         else:
@@ -228,42 +217,47 @@ class FactIndexer:
             # Delete all fact points
             await self._delete_all_fact_points()
 
-        # Filter to new facts only
-        facts_to_index = []
-        for summary in all_facts:
-            if force or str(summary.id) not in indexed_ids:
-                # Load full fact
-                try:
-                    fact = self.fact_store.read(summary.id)
-                    facts_to_index.append(fact)
-                except FactNotFoundError:
-                    # Fact was deleted between list and read - skip silently
-                    logger.debug(f"Fact {summary.id} not found, skipping")
-                    continue
-                except Exception as e:
-                    # Unexpected error - log with details and continue
-                    logger.warning(
-                        f"Unexpected error reading fact {summary.id}: {e}",
-                        exc_info=True,
-                    )
-                    continue
+        # Single pass over the COMPLETE fact corpus, collecting both the facts
+        # that need upserting and the tokens for GlobalVocabulary. Two things
+        # must span every fact, not just the ones being upserted:
+        #   * iter_all() — the previous list_summaries() call defaulted to
+        #     limit=50, so "index all facts" silently indexed only the 50
+        #     most-recently-modified facts and left every older fact
+        #     unsearchable by semantic fact search.
+        #   * tokens_per_doc — register_codebase() replaces the "facts"
+        #     codebase's entire vocabulary contribution, so it needs every
+        #     fact's tokens for correct IDF statistics. Collecting tokens from
+        #     only the incremental batch corrupted the vocabulary, dropping the
+        #     codebase document count to the size of that batch.
+        # This mirrors NoteIndexer.index_all's two-pass pattern.
+        facts_to_index: list[Fact] = []
+        tokens_per_doc: list[set[str]] = []
+        total_facts = 0
 
-        if not facts_to_index:
-            logger.info("No new facts to index")
+        for fact in self.fact_store.iter_all():
+            total_facts += 1
+            if force or str(fact.id) not in indexed_ids:
+                facts_to_index.append(fact)
+            tokens_per_doc.append(set(self.global_vocab.tokenize(generate_fact_text(fact))))
+
+        if total_facts == 0:
+            logger.info("No facts to index")
             return {
-                "total": len(all_facts),
+                "total": 0,
                 "indexed": 0,
                 "last_indexed": datetime.now(UTC).isoformat(),
             }
 
-        # Pass 1: Collect tokens for GlobalVocabulary registration
-        tokens_per_doc: list[set[str]] = []
-        for fact in facts_to_index:
-            text = generate_fact_text(fact)
-            tokens_per_doc.append(set(self.global_vocab.tokenize(text)))
-
-        # Register facts vocabulary
+        # Register facts vocabulary from the complete corpus
         self.global_vocab.register_codebase(FACTS_CODEBASE_ID, tokens_per_doc)
+
+        if not facts_to_index:
+            logger.info("No new facts to index")
+            return {
+                "total": total_facts,
+                "indexed": 0,
+                "last_indexed": datetime.now(UTC).isoformat(),
+            }
 
         # Pass 2: Index facts with embeddings and sparse vectors
         indexed_count = 0
@@ -288,7 +282,7 @@ class FactIndexer:
         logger.info(f"Indexed {indexed_count}/{len(facts_to_index)} facts")
 
         return {
-            "total": len(all_facts),
+            "total": total_facts,
             "indexed": indexed_count,
             "last_indexed": datetime.now(UTC).isoformat(),
         }
@@ -436,26 +430,16 @@ class FactIndexer:
             return set()
 
     async def _train_vocabulary(self) -> None:
-        """Train GlobalVocabulary on all facts for sparse vector generation."""
-        tokens_per_doc: list[set[str]] = []
+        """Train GlobalVocabulary on the complete fact corpus for sparse vectors.
 
-        all_facts = self.fact_store.list_summaries()
-        for summary in all_facts:
-            try:
-                fact = self.fact_store.read(summary.id)
-                text = generate_fact_text(fact)
-                tokens_per_doc.append(set(self.global_vocab.tokenize(text)))
-            except FactNotFoundError:
-                # Fact was deleted between list and read - skip silently
-                logger.debug(f"Fact {summary.id} not found during vocabulary training")
-                continue
-            except Exception as e:
-                # Unexpected error - log with details and continue
-                logger.warning(
-                    f"Failed to tokenize fact {summary.id} for vocabulary: {e}",
-                    exc_info=True,
-                )
-                continue
+        Iterates every fact (iter_all) rather than the 50-capped
+        list_summaries(); the vocabulary's IDF statistics are only correct
+        when trained on the full corpus.
+        """
+        tokens_per_doc: list[set[str]] = [
+            set(self.global_vocab.tokenize(generate_fact_text(fact)))
+            for fact in self.fact_store.iter_all()
+        ]
 
         # Register vocabulary
         self.global_vocab.register_codebase(FACTS_CODEBASE_ID, tokens_per_doc)

@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.6] - 2026-06-13
+
+### Fixed
+
+- `FactIndexer.index_all()` and `_train_vocabulary()` now index the complete fact corpus instead of only the 50 most-recently-modified facts. Both called `FactStore.list_summaries()`, whose `limit` defaults to 50, so on a store with more than 50 facts "index all facts" silently left every older fact out of Qdrant — invisible to semantic fact search — and trained the sparse vocabulary on only those 50. They now iterate `FactStore.iter_all()`.
+- Incremental `FactIndexer.index_all(force=False)` no longer corrupts the facts sparse-search vocabulary. It registered the `GlobalVocabulary` contribution from only the newly-indexed facts, but `register_codebase()` replaces the codebase's entire contribution, so each incremental run dropped the facts document count to the size of that run and skewed every IDF weight. Vocabulary tokens are now collected from all facts (only the new ones are still upserted), matching `NoteIndexer.index_all`. A reindex (`force=True`) fully heals a vocabulary already corrupted by prior incremental runs.
+
 ## [1.2.5] - 2026-06-12
 
 ### Fixed
