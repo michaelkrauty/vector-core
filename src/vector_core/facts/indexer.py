@@ -6,6 +6,7 @@ provided at construction time to allow integration with existing collections.
 """
 
 import logging
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
@@ -193,6 +194,24 @@ class FactIndexer:
             ],
         )
 
+    def _iter_fact_tokens(self) -> Iterator[tuple[Fact, set[str]]]:
+        """Yield ``(fact, token_set)`` for every readable fact in the store.
+
+        ``FactStore.iter_all()`` already skips facts that fail to load (deleted
+        or malformed rows); this additionally skips a fact whose text fails to
+        tokenize, so a single bad fact cannot abort indexing of the rest. A
+        failure of the underlying fact query itself still propagates.
+        """
+        for fact in self.fact_store.iter_all():
+            try:
+                tokens = set(self.global_vocab.tokenize(generate_fact_text(fact)))
+            except Exception:
+                logger.warning(
+                    "Skipping fact %s: tokenization failed", fact.id, exc_info=True
+                )
+                continue
+            yield fact, tokens
+
     async def index_all(self, force: bool = False) -> dict:
         """
         Index all facts using two-pass GlobalVocabulary pattern.
@@ -209,17 +228,12 @@ class FactIndexer:
         await self._ensure_global_vocab()
         await self.ensure_collection()
 
-        # Get existing indexed facts (force mode wipes and reindexes everything)
-        if not force:
-            indexed_ids = await self._get_indexed_fact_ids()
-        else:
-            indexed_ids = set()
-            # Delete all fact points
-            await self._delete_all_fact_points()
+        # Incremental mode needs the set of already-indexed facts; force mode
+        # reindexes every fact.
+        indexed_ids = set() if force else await self._get_indexed_fact_ids()
 
-        # Single pass over the COMPLETE fact corpus, collecting both the facts
-        # that need upserting and the tokens for GlobalVocabulary. Two things
-        # must span every fact, not just the ones being upserted:
+        # Read and tokenize the COMPLETE fact corpus BEFORE any destructive
+        # delete. Two things must span every fact, not just the ones upserted:
         #   * iter_all() — the previous list_summaries() call defaulted to
         #     limit=50, so "index all facts" silently indexed only the 50
         #     most-recently-modified facts and left every older fact
@@ -229,16 +243,18 @@ class FactIndexer:
         #     fact's tokens for correct IDF statistics. Collecting tokens from
         #     only the incremental batch corrupted the vocabulary, dropping the
         #     codebase document count to the size of that batch.
-        # This mirrors NoteIndexer.index_all's two-pass pattern.
+        # Reading before deleting means a corpus read failure leaves the
+        # existing index intact instead of emptying it. Mirrors
+        # NoteIndexer.index_all's two-pass pattern.
         facts_to_index: list[Fact] = []
         tokens_per_doc: list[set[str]] = []
         total_facts = 0
 
-        for fact in self.fact_store.iter_all():
+        for fact, tokens in self._iter_fact_tokens():
             total_facts += 1
             if force or str(fact.id) not in indexed_ids:
                 facts_to_index.append(fact)
-            tokens_per_doc.append(set(self.global_vocab.tokenize(generate_fact_text(fact))))
+            tokens_per_doc.append(tokens)
 
         if total_facts == 0:
             logger.info("No facts to index")
@@ -247,6 +263,10 @@ class FactIndexer:
                 "indexed": 0,
                 "last_indexed": datetime.now(UTC).isoformat(),
             }
+
+        # The corpus read succeeded; only now is it safe to clear stale points.
+        if force:
+            await self._delete_all_fact_points()
 
         # Register facts vocabulary from the complete corpus
         self.global_vocab.register_codebase(FACTS_CODEBASE_ID, tokens_per_doc)
@@ -434,12 +454,10 @@ class FactIndexer:
 
         Iterates every fact (iter_all) rather than the 50-capped
         list_summaries(); the vocabulary's IDF statistics are only correct
-        when trained on the full corpus.
+        when trained on the full corpus. Facts that fail to read or tokenize
+        are skipped (see _iter_fact_tokens) rather than aborting training.
         """
-        tokens_per_doc: list[set[str]] = [
-            set(self.global_vocab.tokenize(generate_fact_text(fact)))
-            for fact in self.fact_store.iter_all()
-        ]
+        tokens_per_doc: list[set[str]] = [tokens for _fact, tokens in self._iter_fact_tokens()]
 
         # Register vocabulary
         self.global_vocab.register_codebase(FACTS_CODEBASE_ID, tokens_per_doc)

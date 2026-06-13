@@ -157,3 +157,48 @@ class TestTrainVocabularyCompleteCorpus:
         await indexer._train_vocabulary()
 
         assert vocab.get_codebase_doc_count(FACTS_CODEBASE_ID) == 55
+
+
+class TestIndexAllRobustness:
+    """index_all must tolerate individual bad facts and never delete before
+    the corpus has been read."""
+
+    @pytest.mark.asyncio
+    async def test_skips_fact_whose_tokenization_fails(
+        self, indexer, store, vocab, mock_storage, monkeypatch
+    ):
+        store.create("poison", "relates_to", "value")
+        store.create("good", "relates_to", "value2")
+
+        real_tokenize = vocab.tokenize
+
+        def flaky_tokenize(text):
+            if "poison" in text:
+                raise RuntimeError("tokenizer blew up")
+            return real_tokenize(text)
+
+        monkeypatch.setattr(vocab, "tokenize", flaky_tokenize)
+
+        result = await indexer.index_all(force=True)
+
+        # The poison fact is skipped; only the good fact is counted and upserted.
+        assert result["total"] == 1
+        assert result["indexed"] == 1
+        assert mock_storage.upsert_batch.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_force_does_not_delete_when_corpus_read_fails(
+        self, indexer, store, mock_storage, monkeypatch
+    ):
+        """A force reindex must read the corpus before clearing points, so a
+        read failure leaves the existing index intact."""
+        def boom():
+            raise RuntimeError("db locked")
+            yield  # pragma: no cover  (make boom a generator)
+
+        monkeypatch.setattr(store, "iter_all", boom)
+
+        with pytest.raises(RuntimeError, match="db locked"):
+            await indexer.index_all(force=True)
+
+        mock_storage.delete_by_filter.assert_not_awaited()

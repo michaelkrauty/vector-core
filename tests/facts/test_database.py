@@ -196,3 +196,22 @@ class TestIterAllResilience:
         facts = list(store.iter_all())
 
         assert [f.id for f in facts] == [f2.id]
+
+    def test_skips_fact_that_fails_to_load(self, store, monkeypatch):
+        """A malformed row (non-FactNotFoundError read failure) is skipped, not fatal."""
+        f1 = store.create("alpha", "relates_to", "one")
+        _pause()
+        f2 = store.create("beta", "relates_to", "two")
+
+        real_read = store.read
+
+        def flaky_read(fact_id):
+            if fact_id == f1.id:
+                raise ValueError("malformed stored row")
+            return real_read(fact_id)
+
+        monkeypatch.setattr(store, "read", flaky_read)
+
+        facts = list(store.iter_all())
+
+        assert [f.id for f in facts] == [f2.id]
