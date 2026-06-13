@@ -263,6 +263,12 @@ class FactIndexer:
         if force:
             await self._delete_all_fact_points()
 
+        # Register the facts vocabulary from the complete corpus. This runs even
+        # for an empty corpus, so deleting the last fact clears the stale facts
+        # contribution — otherwise GlobalVocabulary keeps a nonzero doc count and
+        # skewed IDF, and index_fact() would skip retraining on the next add.
+        self.global_vocab.register_codebase(FACTS_CODEBASE_ID, tokens_per_doc)
+
         if total_facts == 0:
             logger.info("No facts to index")
             return {
@@ -270,9 +276,6 @@ class FactIndexer:
                 "indexed": 0,
                 "last_indexed": datetime.now(UTC).isoformat(),
             }
-
-        # Register facts vocabulary from the complete corpus
-        self.global_vocab.register_codebase(FACTS_CODEBASE_ID, tokens_per_doc)
 
         if not facts_to_index:
             logger.info("No new facts to index")

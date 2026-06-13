@@ -98,16 +98,19 @@ class TestIndexAllCompleteCorpus:
         assert vocab.get_codebase_doc_count(FACTS_CODEBASE_ID) == 60
 
     @pytest.mark.asyncio
-    async def test_empty_store_does_not_register_vocabulary(self, indexer, vocab):
-        """An empty store returns zeros and must not wipe the vocabulary by
-        registering an empty corpus."""
+    async def test_emptying_store_clears_fact_vocabulary(self, indexer, store, vocab):
+        """Deleting the last fact and reindexing clears the facts vocabulary
+        contribution; otherwise the doc count and IDF stay skewed and
+        index_fact() skips retraining on the next add."""
+        facts = _make_facts(store, 3)
+        await indexer.index_all(force=True)
+        assert vocab.get_codebase_doc_count(FACTS_CODEBASE_ID) == 3
+
+        for f in facts:
+            store.delete(f.id)
         result = await indexer.index_all(force=True)
 
-        assert result == {
-            "total": 0,
-            "indexed": 0,
-            "last_indexed": result["last_indexed"],
-        }
+        assert result["total"] == 0
         assert vocab.get_codebase_doc_count(FACTS_CODEBASE_ID) == 0
 
 
