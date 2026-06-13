@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from vector_core.facts.database import FactStore
+from vector_core.facts.models import FactNotFoundError
 
 
 def _pause() -> None:
@@ -170,3 +171,28 @@ class TestFindConnectionsTypeFilterCase:
         assert peopled_store.find_connections(
             "alice", "bob", target_type="Robot"
         ) == []
+
+
+class TestIterAllResilience:
+    """iter_all snapshots ids then reads lazily; a fact deleted in between
+    must be skipped, not raise (a force reindex deletes points up front and
+    would otherwise abort with the index emptied)."""
+
+    def test_skips_fact_deleted_during_iteration(self, store, monkeypatch):
+        f1 = store.create("alpha", "relates_to", "one")
+        _pause()
+        f2 = store.create("beta", "relates_to", "two")
+
+        real_read = store.read
+
+        def flaky_read(fact_id):
+            # Simulate f1 vanishing between the id snapshot and its read.
+            if fact_id == f1.id:
+                raise FactNotFoundError(str(fact_id))
+            return real_read(fact_id)
+
+        monkeypatch.setattr(store, "read", flaky_read)
+
+        facts = list(store.iter_all())
+
+        assert [f.id for f in facts] == [f2.id]

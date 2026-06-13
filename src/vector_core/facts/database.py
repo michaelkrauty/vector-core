@@ -1212,13 +1212,22 @@ class FactStore(ThreadSafeSQLiteStore):
         """
         Iterate over all facts.
 
+        The id list is snapshotted up front and each fact is read lazily, so a
+        fact deleted by another writer between the snapshot and its read is
+        skipped rather than raising ``FactNotFoundError`` mid-iteration.
+
         Yields:
             Fact for each fact
         """
         conn = self._get_conn()
         cursor = conn.execute("SELECT id FROM facts ORDER BY modified DESC")
         for row in cursor.fetchall():
-            yield self.read(UUID(row[0]))
+            try:
+                yield self.read(UUID(row[0]))
+            except FactNotFoundError:
+                # Deleted between the id snapshot and this read; skip it.
+                logger.debug("Fact %s vanished during iter_all, skipping", row[0])
+                continue
 
     def get_facts_by_source_status(
         self,
