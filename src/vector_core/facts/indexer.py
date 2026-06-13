@@ -256,6 +256,13 @@ class FactIndexer:
                 facts_to_index.append(fact)
             tokens_per_doc.append(tokens)
 
+        # The corpus read succeeded; in force mode clear stale points now. This
+        # runs even when the scan yielded nothing (the store may have been fully
+        # emptied) so a force rebuild never leaves deleted facts searchable, but
+        # only after the read so a read failure can't empty the index.
+        if force:
+            await self._delete_all_fact_points()
+
         if total_facts == 0:
             logger.info("No facts to index")
             return {
@@ -263,10 +270,6 @@ class FactIndexer:
                 "indexed": 0,
                 "last_indexed": datetime.now(UTC).isoformat(),
             }
-
-        # The corpus read succeeded; only now is it safe to clear stale points.
-        if force:
-            await self._delete_all_fact_points()
 
         # Register facts vocabulary from the complete corpus
         self.global_vocab.register_codebase(FACTS_CODEBASE_ID, tokens_per_doc)

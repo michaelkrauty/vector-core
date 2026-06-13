@@ -202,3 +202,12 @@ class TestIndexAllRobustness:
             await indexer.index_all(force=True)
 
         mock_storage.delete_by_filter.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_force_empty_store_clears_stale_points(self, indexer, mock_storage):
+        """force=True with no readable facts still clears stale fact points, so a
+        force rebuild never leaves deleted facts searchable."""
+        result = await indexer.index_all(force=True)
+
+        assert result["total"] == 0
+        mock_storage.delete_by_filter.assert_awaited()
