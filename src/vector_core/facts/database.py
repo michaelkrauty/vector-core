@@ -48,6 +48,20 @@ def _require_confidence_in_range(confidence: float) -> None:
         )
 
 
+def _require_valid_date_range(valid_from: date | None, valid_to: date | None) -> None:
+    """Raise ValueError if both bounds are set and valid_from is after valid_to.
+
+    An inverted validity interval is never meaningful and silently makes the
+    fact unmatchable by any ``valid_at`` query, since no date can satisfy both
+    ``valid_from <= d`` and ``d <= valid_to``.
+    """
+    if valid_from is not None and valid_to is not None and valid_from > valid_to:
+        raise ValueError(
+            f"valid_from ({valid_from.isoformat()}) must not be after "
+            f"valid_to ({valid_to.isoformat()})"
+        )
+
+
 class FactStore(ThreadSafeSQLiteStore):
     """
     SQLite-based fact storage with thread-safe operations.
@@ -228,8 +242,9 @@ class FactStore(ThreadSafeSQLiteStore):
 
         Raises:
             DuplicateFactError: If fact with same SPO already exists
-            ValueError: If any SPO/type field is blank or confidence is
-                outside 0.0-1.0. Raised before any database access.
+            ValueError: If any SPO/type field is blank, confidence is outside
+                0.0-1.0, or valid_from is after valid_to. Raised before any
+                database access.
         """
         for field, value in (
             ("subject", subject),
@@ -240,6 +255,7 @@ class FactStore(ThreadSafeSQLiteStore):
         ):
             _require_non_blank(value, field)
         _require_confidence_in_range(confidence)
+        _require_valid_date_range(valid_from, valid_to)
 
         conn = self._get_conn()
         now = datetime.now(UTC)
@@ -559,8 +575,10 @@ class FactStore(ThreadSafeSQLiteStore):
 
         Raises:
             FactNotFoundError: If fact not found
-            ValueError: If confidence is outside 0.0-1.0. Raised before
-                any row is written.
+            ValueError: If confidence is outside 0.0-1.0, or the resulting
+                valid_from/valid_to range is inverted (new value where
+                provided, otherwise the existing one). Raised before any row
+                is written.
         """
         if confidence is not None:
             _require_confidence_in_range(confidence)
@@ -569,6 +587,13 @@ class FactStore(ThreadSafeSQLiteStore):
 
         # Load fact for update (raises FactNotFoundError if not found)
         fact = self.read(fact_id)
+
+        # Validate the effective validity range (new value where provided,
+        # otherwise the fact's existing value) before writing anything.
+        effective_from = valid_from if is_set(valid_from) else fact.valid_from
+        effective_to = valid_to if is_set(valid_to) else fact.valid_to
+        _require_valid_date_range(effective_from, effective_to)
+
         now = datetime.now(UTC)
 
         # Build updates
@@ -753,11 +778,11 @@ class FactStore(ThreadSafeSQLiteStore):
             params.append(object_value)
 
         if subject_type:
-            query += " AND subject_type = ?"
+            query += " AND LOWER(subject_type) = LOWER(?)"
             params.append(subject_type)
 
         if object_type:
-            query += " AND object_type = ?"
+            query += " AND LOWER(object_type) = LOWER(?)"
             params.append(object_type)
 
         if min_confidence is not None:
@@ -848,11 +873,11 @@ class FactStore(ThreadSafeSQLiteStore):
         params: list[Any] = []
 
         if subject_type:
-            query += " AND f.subject_type = ?"
+            query += " AND LOWER(f.subject_type) = LOWER(?)"
             params.append(subject_type)
 
         if object_type:
-            query += " AND f.object_type = ?"
+            query += " AND LOWER(f.object_type) = LOWER(?)"
             params.append(object_type)
 
         if predicate:
