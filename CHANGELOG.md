@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.7] - 2026-06-14
+
+### Fixed
+
+- `FactStore.query()` and `list_summaries()` now match the `subject_type`/`object_type` filters case-insensitively, consistent with their own subject/predicate/object filters (already `LOWER()`-compared) and with the graph methods (`get_entity_facts`/`find_connections`, normalized via the lowercased adjacency table). The facts table stores types case-preserving, so a fact created with `subject_type="Person"` was findable via `get_entity_facts(entity_type="person")` but not `query(subject_type="person")` — user-reachable since the consumer tools pass types through unmodified. This completes the type-filter case-insensitivity begun in v1.2.5 (#18, which fixed `find_connections`).
+- `FactStore.create()` and `update()` now reject an inverted validity interval (`valid_from` after `valid_to`) with a `ValueError`, raised before any row is written. An inverted range is never meaningful and silently made the fact unmatchable by any `valid_at` query (no date satisfies both bounds). `update()` validates the effective range — the new value where provided, otherwise the fact's existing one — so partially updating one bound into an inverted state is also rejected.
+
 ## [1.2.6] - 2026-06-13
 
 ### Fixed

@@ -3,6 +3,7 @@
 import sqlite3
 import tempfile
 import time
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -230,3 +231,98 @@ class TestIterAllResilience:
         facts = list(store.iter_all())
 
         assert [f.id for f in facts] == [f2.id]
+
+
+class TestQueryTypeFilterCase:
+    """query() and list_summaries() type filters must be case-insensitive.
+
+    The facts table stores subject_type/object_type case-preserving, but every
+    other filter in these methods (subject/predicate/object) and the graph
+    methods (get_entity_facts/find_connections, normalized via adjacency) match
+    case-insensitively. A fact stored with type "Person" must still be found by
+    subject_type="person".
+    """
+
+    @pytest.fixture
+    def typed_store(self, store):
+        store.create(
+            "Alice", "works_at", "Acme",
+            subject_type="Person", object_type="Company",
+        )
+        store.create(
+            "Bob", "founded", "Beta",
+            subject_type="person", object_type="company",
+        )
+        return store
+
+    def test_query_subject_type_case_insensitive(self, typed_store):
+        assert len(typed_store.query(subject_type="person")) == 2
+        assert len(typed_store.query(subject_type="PERSON")) == 2
+
+    def test_query_object_type_case_insensitive(self, typed_store):
+        assert len(typed_store.query(object_type="company")) == 2
+
+    def test_query_wrong_type_still_excludes(self, typed_store):
+        assert typed_store.query(subject_type="robot") == []
+
+    def test_list_summaries_subject_type_case_insensitive(self, typed_store):
+        assert len(typed_store.list_summaries(subject_type="person")) == 2
+
+    def test_list_summaries_object_type_case_insensitive(self, typed_store):
+        assert len(typed_store.list_summaries(object_type="COMPANY")) == 2
+
+
+class TestTemporalRangeValidation:
+    """create()/update() reject an inverted valid_from > valid_to interval."""
+
+    def test_create_rejects_inverted_range(self, store):
+        with pytest.raises(ValueError, match="valid_from"):
+            store.create(
+                "A", "r", "B",
+                valid_from=date(2025, 1, 1), valid_to=date(2024, 1, 1),
+            )
+        assert store.count() == 0
+
+    def test_create_accepts_equal_bounds(self, store):
+        fact = store.create(
+            "A", "r", "B",
+            valid_from=date(2024, 1, 1), valid_to=date(2024, 1, 1),
+        )
+        assert fact.valid_from == fact.valid_to
+
+    def test_create_accepts_ordered_range(self, store):
+        fact = store.create(
+            "A", "r", "B",
+            valid_from=date(2024, 1, 1), valid_to=date(2025, 1, 1),
+        )
+        assert fact.valid_from < fact.valid_to
+
+    def test_create_accepts_one_sided_bounds(self, store):
+        assert store.create("A", "r", "B", valid_from=date(2024, 1, 1)).valid_to is None
+        assert store.create("C", "r", "D", valid_to=date(2024, 1, 1)).valid_from is None
+
+    def test_update_rejects_inverting_via_valid_from(self, store):
+        fact = store.create("A", "r", "B", valid_to=date(2024, 1, 1))
+        with pytest.raises(ValueError, match="valid_from"):
+            store.update(fact.id, valid_from=date(2025, 1, 1))
+        # nothing was written
+        assert store.read(fact.id).valid_from is None
+
+    def test_update_rejects_inverting_via_valid_to(self, store):
+        fact = store.create("A", "r", "B", valid_from=date(2025, 1, 1))
+        with pytest.raises(ValueError, match="valid_from"):
+            store.update(fact.id, valid_to=date(2024, 1, 1))
+        assert store.read(fact.id).valid_to is None
+
+    def test_update_allows_ordered_change(self, store):
+        fact = store.create("A", "r", "B", valid_from=date(2024, 1, 1))
+        store.update(fact.id, valid_to=date(2025, 1, 1))
+        assert store.read(fact.id).valid_to == date(2025, 1, 1)
+
+    def test_update_clearing_a_bound_avoids_inversion(self, store):
+        fact = store.create(
+            "A", "r", "B",
+            valid_from=date(2024, 1, 1), valid_to=date(2025, 1, 1),
+        )
+        store.update(fact.id, valid_to=None)
+        assert store.read(fact.id).valid_to is None
