@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.2.10] - 2026-06-20
+
+### Fixed
+
+- **`find_connections(target_entity=None)` no longer duplicates an entity reachable through several facts at the maximum depth.** In all-reachable mode the BFS only marked an entity visited when it was below the maximum depth (so it could be queued for further traversal). An entity reached at exactly the maximum depth was therefore never marked, so when two or more distinct facts connected to it, it was emitted once per connecting fact, duplicating it and crowding out other distinct reachable entities once the result limit was hit. Reachable entities are now deduplicated through a separate set so each is returned once regardless of depth, without suppressing the below-max-depth traversal that the visited set still governs.
+
 ## [1.2.9] - 2026-06-20
 
 ### Fixed

@@ -358,3 +358,39 @@ class TestUpdateSourceStatusRefusesAllNone:
         )
         assert n == 1
         assert store.get_source_statistics()["by_status"].get("active") == 1
+
+
+class TestFindConnectionsFrontierDedup:
+    """In all-reachable mode (target_entity=None), an entity reached at exactly
+    max_depth must be reported once even when several distinct facts connect to
+    it, and must not crowd out other distinct reachable entities at the limit.
+    Entities are only marked visited below max_depth, so without a separate
+    collected set the frontier entity is appended once per connecting fact."""
+
+    @pytest.fixture
+    def frontier_store(self, store):
+        # Bob is reachable from Alice via TWO distinct facts at depth 1; Carol
+        # via one. Insertion order puts both Bob facts before the Carol fact.
+        store.create("Alice", "likes", "Bob")
+        store.create("Alice", "knows", "Bob")
+        store.create("Alice", "likes", "Carol")
+        return store
+
+    def test_frontier_entity_not_duplicated_and_distinct_kept(self, frontier_store):
+        paths = frontier_store.find_connections(
+            "Alice", target_entity=None, max_depth=1, limit=2
+        )
+        reached = [p[-1].object_value for p in paths]
+        # Bob appears once; Carol (a distinct reachable entity) is not crowded out.
+        assert reached.count("Bob") == 1, reached
+        assert "Carol" in reached, reached
+        assert len(paths) == 2
+
+    def test_all_distinct_reachable_when_limit_high(self, frontier_store):
+        paths = frontier_store.find_connections(
+            "Alice", target_entity=None, max_depth=1, limit=10
+        )
+        reached = sorted({p[-1].object_value for p in paths})
+        assert reached == ["Bob", "Carol"]
+        # One path per distinct reachable entity, no duplicate Bob.
+        assert len(paths) == 2
