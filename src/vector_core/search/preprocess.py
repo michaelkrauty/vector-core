@@ -133,15 +133,20 @@ class QueryPreprocessor:
         fields: dict[str, str] = {}
         remaining = query
 
-        for prefix in self.field_prefixes:
-            # Match prefix:value (value is non-whitespace)
-            pattern = rf'\b{re.escape(prefix)}(\S+)'
+        # Match longer prefixes first so a negated prefix like "-path:" is not
+        # shadowed by its positive counterpart "path:". Anchor each prefix on a
+        # start-of-string or whitespace boundary rather than ``\b``; ``\b`` can
+        # never match before a leading "-", so a "-path:" prefix would otherwise
+        # be mis-parsed as an inclusion with a stray dash left behind.
+        for prefix in sorted(self.field_prefixes, key=len, reverse=True):
+            # Match (start|space) prefix:value (value is non-whitespace).
+            pattern = rf'(^|\s){re.escape(prefix)}(\S+)'
             for match in re.finditer(pattern, remaining, re.I):
                 field_name = prefix.rstrip(":")
-                fields[field_name] = match.group(1)
+                fields[field_name] = match.group(2)
 
-            # Remove matched patterns
-            remaining = re.sub(pattern, '', remaining, flags=re.I)
+            # Remove matched patterns, keeping the leading boundary character.
+            remaining = re.sub(pattern, r'\1', remaining, flags=re.I)
 
         return remaining.strip(), fields
 

@@ -524,3 +524,16 @@ class TestSparseEdgeCases:
         # "world" should be skipped because index 0 was already added by "hello"
         assert len(result.indices) == 2
         assert set(result.indices) == {0, 1}
+
+
+class TestFuzzyMatchCandidateOrdering:
+    """_find_fuzzy_match must score every length-window token so the closest
+    match is not crowded out by unrelated same-length tokens."""
+
+    def test_insertion_typo_not_crowded_out_by_same_length_tokens(self):
+        vectorizer = SparseVectorizer()
+        vectorizer._vocab = {f"qqq{i:03d}": i for i in range(600)}
+        vectorizer._vocab["hello"] = 600
+        match, sim = vectorizer._find_fuzzy_match("helllo", 0.7)
+        assert match == "hello"
+        assert sim >= 0.7

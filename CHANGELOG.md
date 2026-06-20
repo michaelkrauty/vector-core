@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.2.9] - 2026-06-20
+
+### Fixed
+
+- **Fuzzy query-token matching no longer drops the genuinely closest vocabulary term on a large vocabulary.** `_find_fuzzy_match` (used by `vectorize_query`, which has fuzzy matching on by default, so this is on the live query path) filtered the vocabulary to tokens within two characters of the query token's length, then kept the first `max_candidates` of them in arbitrary dictionary order before scoring. On a large vocabulary the closest match could sit past that cut and never be scored, so an unknown query token (a typo, or a rare or new identifier) could match a worse term or none at all. The candidates are now ordered by how close their length is to the target before the cap, since the length difference is a lower bound on edit distance, so the best Levenshtein candidates are the ones scored.
+- **`FactStore.update_source_status` (and `SourceIntegrityManager.revalidate_sources`) no longer rewrites the status of every source when called with no selector.** With `source_type`, `source_id`, and `content_hash` all `None`, the method issued a `WHERE`-less `UPDATE fact_sources SET status = ...`, resetting every source in the table. It now returns 0 and makes no change for an unscoped call; a caller must pass at least one selector. The exposed mcp-notes tool already guards this, so this is library-level defense in depth.
+- **The query field-prefix parser now handles a negated prefix such as `-path:` instead of mis-parsing it.** `extract_fields` anchored each prefix with `\b`, which can never match before a leading `-`, and tried prefixes in declaration order, so `-path:tests` was captured as the positive field `path` with a stray `-` left in the query. Prefixes are now matched longest-first and anchored on a start-of-string or whitespace boundary, so `-path:` is extracted correctly and is not shadowed by `path:`. This parser is not currently read by the bundled consumers, so the fix is latent there, but the parser is now correct.
+
 ## [1.2.8] - 2026-06-19
 
 ### Fixed

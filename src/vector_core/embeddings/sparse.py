@@ -257,7 +257,6 @@ class SparseVectorizer:
         self,
         token: str,
         threshold: float = 0.75,
-        max_candidates: int = 500,
     ) -> tuple[str | None, float]:
         """
         Find closest vocabulary token using Levenshtein similarity.
@@ -265,7 +264,6 @@ class SparseVectorizer:
         Args:
             token: Token to match
             threshold: Minimum similarity threshold (0-1)
-            max_candidates: Max vocabulary terms to check
 
         Returns:
             Tuple of (best_match, similarity) or (None, 0.0) if no match
@@ -277,13 +275,15 @@ class SparseVectorizer:
         best_match = None
         best_score = 0.0
 
-        # Only check tokens of similar length for performance
-        candidates = [
-            t for t in self._vocab
-            if abs(len(t) - target_len) <= 2
-        ][:max_candidates]
-
-        for candidate in candidates:
+        # Score every token within a small length window. |len(a) - len(b)| is a
+        # lower bound on edit distance, so tokens far apart in length cannot be
+        # close matches; this window prunes most of the vocabulary cheaply. The
+        # survivors are NOT capped: any fixed cap can drop the genuinely closest
+        # match, e.g. an insertion/deletion typo whose length differs by one
+        # could be crowded out by unrelated same-length tokens.
+        for candidate in self._vocab:
+            if abs(len(candidate) - target_len) > 2:
+                continue
             score = levenshtein_similarity(token, candidate)
             if score > best_score and score >= threshold:
                 best_score = score

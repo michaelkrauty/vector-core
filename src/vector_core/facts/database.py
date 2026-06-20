@@ -986,6 +986,12 @@ class FactStore(ThreadSafeSQLiteStore):
         Returns:
             Number of sources updated
         """
+        if source_type is None and source_id is None and content_hash is None:
+            # Refuse an unscoped update: with no selector this would rewrite the
+            # status of every source in the table. A caller that wants to change
+            # a specific source must pass at least one selector.
+            return 0
+
         conn = self._get_conn()
         now = datetime.now(UTC)
 
