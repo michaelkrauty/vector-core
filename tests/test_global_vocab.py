@@ -941,3 +941,18 @@ class TestFuzzyMatching:
         assert match is not None
         assert score > 0.6
         vocab.close()
+
+
+class TestFuzzyMatchCandidateOrdering:
+    """_find_fuzzy_match must consider the most length-similar tokens, not an
+    arbitrary slice of the vocabulary, or the genuinely closest match can be
+    dropped before scoring on a large vocabulary."""
+
+    def test_closest_match_not_dropped_by_candidate_cap(self, tmp_path):
+        vocab_obj = GlobalVocabulary(db_path=tmp_path / "fz.db")
+        # A length-2-off decoy is inserted first; the true closest match
+        # ("hallo", one edit, same length) is inserted last. With a candidate
+        # cap of 1 and arbitrary insertion order, the close match is dropped.
+        vocab = {"helloxx": 0, "hallo": 1}
+        match, _sim = vocab_obj._find_fuzzy_match("hello", vocab, 0.7, 1)
+        assert match == "hallo"

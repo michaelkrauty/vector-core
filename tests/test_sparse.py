@@ -524,3 +524,14 @@ class TestSparseEdgeCases:
         # "world" should be skipped because index 0 was already added by "hello"
         assert len(result.indices) == 2
         assert set(result.indices) == {0, 1}
+
+
+class TestFuzzyMatchCandidateOrdering:
+    """_find_fuzzy_match must score the most length-similar tokens, not an
+    arbitrary slice, so the closest match is not dropped on a large vocab."""
+
+    def test_closest_match_not_dropped_by_candidate_cap(self):
+        vectorizer = SparseVectorizer()
+        vectorizer._vocab = {"helloxx": 0, "hallo": 1}
+        match, _sim = vectorizer._find_fuzzy_match("hello", 0.7, 1)
+        assert match == "hallo"

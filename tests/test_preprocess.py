@@ -336,3 +336,23 @@ class TestSynonymExpansionEdgeCases:
 
         assert text == "12345 67890"
         assert terms == []
+
+
+class TestNegatedFieldPrefix:
+    """A prefix that starts with '-' (e.g. '-path:') must be extractable, and
+    must not be mis-parsed as its positive counterpart with a stray '-'."""
+
+    def test_negated_prefix_extracted_not_as_inclusion(self):
+        preprocessor = QueryPreprocessor(field_prefixes=["path:", "-path:"])
+        remaining, fields = preprocessor.extract_fields("-path:tests find error")
+        assert fields.get("-path") == "tests"
+        assert "path" not in fields  # not mis-captured as an inclusion
+        assert "-" not in remaining  # no stray dash left behind
+        assert remaining == "find error"
+
+    def test_positive_prefix_still_extracted(self):
+        preprocessor = QueryPreprocessor(field_prefixes=["path:", "-path:"])
+        remaining, fields = preprocessor.extract_fields("path:src find error")
+        assert fields.get("path") == "src"
+        assert "-path" not in fields
+        assert remaining == "find error"

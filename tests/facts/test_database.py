@@ -9,7 +9,12 @@ from pathlib import Path
 import pytest
 
 from vector_core.facts.database import FactStore
-from vector_core.facts.models import FactNotFoundError
+from vector_core.facts.models import (
+    FactNotFoundError,
+    FactSource,
+    SourceStatus,
+    SourceType,
+)
 
 
 def _pause() -> None:
@@ -326,3 +331,30 @@ class TestTemporalRangeValidation:
         )
         store.update(fact.id, valid_to=None)
         assert store.read(fact.id).valid_to is None
+
+
+class TestUpdateSourceStatusRefusesAllNone:
+    """update_source_status with no selector must not rewrite the status of
+    every source in the table; an unscoped call is a no-op."""
+
+    def test_all_none_is_a_no_op(self, store):
+        store.create(
+            "alice", "knows", "bob",
+            source=FactSource(source_type=SourceType.NOTE, status=SourceStatus.DELETED),
+        )
+        n = store.update_source_status(new_status=SourceStatus.ACTIVE)
+        assert n == 0
+        # The deleted source must be untouched.
+        assert store.get_source_statistics()["by_status"].get("deleted") == 1
+        assert "active" not in store.get_source_statistics()["by_status"]
+
+    def test_scoped_update_still_works(self, store):
+        store.create(
+            "alice", "knows", "bob",
+            source=FactSource(source_type=SourceType.NOTE, status=SourceStatus.DELETED),
+        )
+        n = store.update_source_status(
+            source_type=SourceType.NOTE, new_status=SourceStatus.ACTIVE
+        )
+        assert n == 1
+        assert store.get_source_statistics()["by_status"].get("active") == 1

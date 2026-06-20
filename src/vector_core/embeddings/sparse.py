@@ -277,11 +277,16 @@ class SparseVectorizer:
         best_match = None
         best_score = 0.0
 
-        # Only check tokens of similar length for performance
-        candidates = [
-            t for t in self._vocab
-            if abs(len(t) - target_len) <= 2
-        ][:max_candidates]
+        # Only check tokens of similar length for performance, ordered by how
+        # close their length is to the target before capping: |len(a) - len(b)|
+        # is a lower bound on edit distance, so the most length-similar tokens
+        # are the best Levenshtein candidates. Slicing the vocabulary in
+        # arbitrary order could drop the genuinely closest match on a large
+        # vocabulary.
+        candidates = sorted(
+            (t for t in self._vocab if abs(len(t) - target_len) <= 2),
+            key=lambda t: abs(len(t) - target_len),
+        )[:max_candidates]
 
         for candidate in candidates:
             score = levenshtein_similarity(token, candidate)
