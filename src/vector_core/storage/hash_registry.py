@@ -245,7 +245,7 @@ class HashRegistry(ThreadSafeSQLiteStore):
             FROM hash_registry WHERE status = ?
         """
         params: list = [status]
-        if limit:
+        if limit is not None:
             query += " LIMIT ?"
             params.append(limit)
 

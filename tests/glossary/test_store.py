@@ -477,6 +477,15 @@ class TestGlossaryStoreListAll:
         entries = store.list_all(limit=5)
         assert len(entries) == 5
 
+    def test_list_all_limit_zero_returns_no_entries(self, store):
+        """limit=0 means zero rows (SQLite LIMIT 0 semantics), not unlimited."""
+        for i in range(3):
+            store.create(term=f"Term{i}", expansion=f"Exp{i}", definition=f"Def{i}")
+
+        assert store.list_all(limit=0) == []
+        # None still means no limit.
+        assert len(store.list_all(limit=None)) == 3
+
     def test_list_all_sorted_by_term(self, store):
         """Should return entries sorted by term."""
         store.create(term="Zebra", expansion="Zebra exp", definition="Zebra def")

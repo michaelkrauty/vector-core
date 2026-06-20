@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.2.8] - 2026-06-19
+
+### Fixed
+
+- **`SparseVectorizer.extend_vocab` now recomputes IDF for the whole vocabulary, not just the tokens in the new batch.** Each `extend_vocab` call grows the corpus size, which changes the IDF of every term, but the recompute loop only touched terms that appeared in the new documents. Existing terms absent from the batch kept an IDF computed against the smaller corpus, so they were progressively under-weighted relative to the freshly added terms, and the skew compounded with each incremental call. The recompute now covers the full vocabulary, matching `fit()`, so the method behaves as its docstring states.
+- **`GlossaryStore.list_all` and `HashRegistry.list_by_status` now treat `limit=0` as "return nothing" rather than "return everything".** Both gated the SQL `LIMIT` clause on a truthiness check (`if limit:`), so `limit=0` dropped the clause and returned the full table, the opposite of SQLite's `LIMIT 0` and inconsistent with `FactStore`. The guard is now `if limit is not None:`, so `0` returns no rows and `None` still means unlimited. The shipped MCP tools route limits through `validate_limit`, which maps `0` to a default, so this is a library-contract fix with no tool-level behavior change.
+
+### Documentation
+
+- Corrected the `generate_point_id` docstring, which described the output as a "version 5" UUID and showed an example the function cannot produce. It emits a deterministic version-4 UUID; the docstring and example now reflect that.
+- Corrected the `QueryPreprocessor.expand_camelcase` docstring example, which showed mixed-case expanded terms while the implementation lowercases them.
+
 ## [1.2.7] - 2026-06-14
 
 ### Fixed

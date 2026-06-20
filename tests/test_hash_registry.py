@@ -174,6 +174,15 @@ class TestHashRegistry:
         entries = registry.list_by_status("active", limit=5)
         assert len(entries) == 5
 
+    def test_list_by_status_limit_zero_returns_no_entries(self, registry):
+        """limit=0 means zero rows (SQLite LIMIT 0 semantics), not unlimited."""
+        for i in range(3):
+            registry.register(f"zero{i:03d}" * 6 + "xxx", uuid4(), f"/path{i}", "pdf")
+
+        assert registry.list_by_status("active", limit=0) == []
+        # None still means no limit.
+        assert len(registry.list_by_status("active", limit=None)) == 3
+
     def test_count(self, registry):
         """Should count entries."""
         assert registry.count() == 0

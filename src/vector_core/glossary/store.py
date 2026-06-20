@@ -519,7 +519,7 @@ class GlossaryStore(ThreadSafeSQLiteStore):
 
         query += " ORDER BY term"
 
-        if limit:
+        if limit is not None:
             query += " LIMIT ?"
             params.append(limit)
 

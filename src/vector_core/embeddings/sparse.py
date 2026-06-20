@@ -170,9 +170,13 @@ class SparseVectorizer:
                 next_idx += 1
                 new_tokens.append(token)
 
-        # Recompute IDF for all affected tokens
-        for token in new_doc_freq:
-            freq = self._doc_freq[token]
+        # Recompute IDF for the ENTIRE vocabulary, not just the tokens in the
+        # new batch: _doc_count (N) grew, so every token's IDF changed, even
+        # ones absent from new_documents. Recomputing only new_doc_freq left
+        # existing tokens with an IDF computed against the smaller corpus,
+        # under-weighting most of the vocabulary. (fit() recomputes the full
+        # vocabulary for the same reason.)
+        for token, freq in self._doc_freq.items():
             self._idf[token] = math.log((self._doc_count + 1) / (freq + 1)) + 1
 
         # Track cumulative vocab growth

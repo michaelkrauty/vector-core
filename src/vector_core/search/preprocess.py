@@ -50,7 +50,7 @@ class QueryPreprocessor:
         """
         Expand camelCase and PascalCase to space-separated words.
 
-        Example: "getUserData" -> ("getUserData get User Data", ["get", "User", "Data"])
+        Example: "getUserData" -> ("getUserData get user data", ["get", "user", "data"])
 
         Args:
             text: Text to expand
