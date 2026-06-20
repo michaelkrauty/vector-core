@@ -1069,6 +1069,13 @@ class FactStore(ThreadSafeSQLiteStore):
         # Each queue item: (current_entity, current_type, path_so_far)
         queue: deque[tuple[str, str | None, list[UUID]]] = deque()
         visited: set[tuple[str, str | None]] = set()
+        # Entities already emitted as reachable (all-reachable mode). Kept
+        # separate from `visited`, which only tracks below-max-depth nodes queued
+        # for further traversal: an entity reached at exactly max_depth is never
+        # added to `visited`, so without this set it would be emitted once per
+        # connecting fact, duplicating it and crowding out other distinct
+        # entities at the limit.
+        collected: set[tuple[str, str | None]] = set()
         paths: list[list[Fact]] = []
 
         # Find starting points
@@ -1089,6 +1096,8 @@ class FactStore(ThreadSafeSQLiteStore):
             key = (ent_name.lower(), ent_type)
             if key not in visited:
                 visited.add(key)
+                # The source is not one of its own reachable connections.
+                collected.add(key)
                 queue.append((ent_name.lower(), ent_type, []))
 
         # BFS traversal with visited limit to prevent resource exhaustion
@@ -1153,8 +1162,13 @@ class FactStore(ThreadSafeSQLiteStore):
                                 paths.append(facts)
                                 if len(paths) >= limit:
                                     break
-                    # No target - collect all reachable entities
-                    elif other_key not in visited:
+                    # No target - collect each reachable entity once. Dedup on
+                    # `collected` rather than `visited` so frontier entities (at
+                    # exactly max_depth, never added to `visited`) are also
+                    # deduplicated, and so emitting an entity here does not
+                    # suppress its below-max-depth traversal enqueue.
+                    elif other_key not in collected:
+                        collected.add(other_key)
                         facts = [self.read(fid) for fid in new_path]
                         paths.append(facts)
                         if len(paths) >= limit:
