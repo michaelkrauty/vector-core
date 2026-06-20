@@ -1,5 +1,9 @@
 """Tests for SparseVectorizer (TF-IDF sparse vectors for hybrid search)."""
 
+import math
+
+import pytest
+
 from vector_core.embeddings.sparse import SparseVector, SparseVectorizer
 
 
@@ -215,6 +219,26 @@ class TestVocabExtension:
         new_hello_idf = vectorizer._idf.get("hello", 0)
         # IDF should change because frequency of "hello" changed
         assert new_hello_idf != old_hello_idf
+
+    def test_extend_updates_idf_for_tokens_absent_from_new_docs(self):
+        """The corpus size grows on extend, so EVERY token's IDF must be
+        recomputed - including existing tokens that do not appear in the new
+        documents. Previously only tokens in the new batch were updated, so the
+        rest kept an IDF computed against the smaller corpus and were
+        under-weighted relative to the just-added tokens."""
+        vectorizer = SparseVectorizer()
+        # "alpha" appears in 1 of 2 docs.
+        vectorizer.fit(["alpha beta", "beta gamma"])
+        old_alpha_idf = vectorizer._idf["alpha"]
+
+        # Extend with docs that do NOT contain "alpha". N grows 2 -> 4 while
+        # alpha's doc frequency stays 1, so its IDF must rise.
+        vectorizer.extend_vocab(["delta epsilon", "epsilon zeta"])
+
+        assert vectorizer._doc_count == 4
+        expected = math.log((4 + 1) / (1 + 1)) + 1
+        assert vectorizer._idf["alpha"] == pytest.approx(expected)
+        assert vectorizer._idf["alpha"] > old_alpha_idf
 
     def test_extend_preserves_existing_tokens(self):
         """extend_vocab doesn't remove existing tokens."""

@@ -69,19 +69,19 @@ def generate_point_id(key: str) -> str:
     """
     Generate deterministic UUID point ID from key.
 
-    Creates a UUID (version 5 style, using SHA256) from the key.
-    Qdrant requires point IDs to be either unsigned integers or UUIDs,
-    so we format the first 128 bits of a SHA256 hash as a UUID.
+    Creates a deterministic version-4 UUID from the first 128 bits of a
+    SHA256 hash of the key. Qdrant requires point IDs to be either unsigned
+    integers or UUIDs.
 
     Args:
         key: Unique key string (e.g., "file:/path/to/file.py")
 
     Returns:
-        UUID string (e.g., "a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+        UUID string (e.g., "a5fecfb3-6489-4eec-a090-03234f11ae4f")
 
     Example:
         >>> generate_point_id("chunk:src/main.py:42")
-        'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
+        'a5fecfb3-6489-4eec-a090-03234f11ae4f'
     """
     hash_bytes = hashlib.sha256(key.encode()).digest()
     # Take first 16 bytes (128 bits) and format as UUID

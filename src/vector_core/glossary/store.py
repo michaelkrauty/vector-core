@@ -504,7 +504,8 @@ class GlossaryStore(ThreadSafeSQLiteStore):
 
         Args:
             domain: Optional domain filter
-            limit: Maximum entries to return
+            limit: Maximum entries to return. ``None`` (the default) returns
+                all entries; ``0`` returns none (SQLite ``LIMIT 0`` semantics).
 
         Returns:
             List of GlossaryEntrySummary
@@ -519,7 +520,7 @@ class GlossaryStore(ThreadSafeSQLiteStore):
 
         query += " ORDER BY term"
 
-        if limit:
+        if limit is not None:
             query += " LIMIT ?"
             params.append(limit)
 
