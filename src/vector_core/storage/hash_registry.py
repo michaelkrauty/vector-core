@@ -234,7 +234,8 @@ class HashRegistry(ThreadSafeSQLiteStore):
 
         Args:
             status: Status to filter by
-            limit: Maximum entries to return
+            limit: Maximum entries to return. ``None`` (the default) returns
+                all matches; ``0`` returns none (SQLite ``LIMIT 0`` semantics).
 
         Returns:
             List of matching entries
