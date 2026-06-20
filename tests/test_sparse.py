@@ -527,11 +527,13 @@ class TestSparseEdgeCases:
 
 
 class TestFuzzyMatchCandidateOrdering:
-    """_find_fuzzy_match must score the most length-similar tokens, not an
-    arbitrary slice, so the closest match is not dropped on a large vocab."""
+    """_find_fuzzy_match must score every length-window token so the closest
+    match is not crowded out by unrelated same-length tokens."""
 
-    def test_closest_match_not_dropped_by_candidate_cap(self):
+    def test_insertion_typo_not_crowded_out_by_same_length_tokens(self):
         vectorizer = SparseVectorizer()
-        vectorizer._vocab = {"helloxx": 0, "hallo": 1}
-        match, _sim = vectorizer._find_fuzzy_match("hello", 0.7, 1)
-        assert match == "hallo"
+        vectorizer._vocab = {f"qqq{i:03d}": i for i in range(600)}
+        vectorizer._vocab["hello"] = 600
+        match, sim = vectorizer._find_fuzzy_match("helllo", 0.7)
+        assert match == "hello"
+        assert sim >= 0.7
