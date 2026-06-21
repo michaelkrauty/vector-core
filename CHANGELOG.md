@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.2.11] - 2026-06-20
+
+### Fixed
+
+- **`FactIndexer.index_fact` no longer deletes the existing point before re-indexing, so a failed re-index can no longer drop a fact from search.** Each fact maps to a single point with a stable id, so the upsert overwrites any existing point in place; the preceding delete was redundant and meant that if the embedding or upsert failed after it, the fact disappeared from search until a full reindex. Re-indexing a fact (for example on an update) is now atomic: a transient failure leaves the previous point intact.
+
 ## [1.2.10] - 2026-06-20
 
 ### Fixed
