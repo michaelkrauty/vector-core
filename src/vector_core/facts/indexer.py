@@ -329,10 +329,9 @@ class FactIndexer:
         if self.global_vocab.get_codebase_doc_count(FACTS_CODEBASE_ID) == 0:
             await self._train_vocabulary()
 
-        # Delete existing point for this fact
-        await self._delete_fact_point(fact.id)
-
-        # Index
+        # Index. The point id is stable per fact, so the upsert overwrites any
+        # existing point in place; pre-deleting first would only open a window
+        # where a failed embed/upsert leaves the fact missing from search.
         await self._index_fact(fact)
 
     async def delete_fact_index(self, fact_id: UUID) -> None:

@@ -214,3 +214,30 @@ class TestIndexAllRobustness:
 
         assert result["total"] == 0
         mock_storage.delete_by_filter.assert_awaited()
+
+
+class TestIndexFactAtomic:
+    """index_fact must not delete the existing point before re-indexing: the
+    point id is stable per fact, so the upsert overwrites in place. Pre-deleting
+    would drop the fact from search if the subsequent embed/upsert fails."""
+
+    @pytest.mark.asyncio
+    async def test_index_fact_does_not_pre_delete(self, indexer, store, monkeypatch):
+        fact = store.create("a", "rel", "b")
+        indexer._delete_fact_point = AsyncMock()
+        indexer._index_fact = AsyncMock()
+        indexer._ensure_global_vocab = AsyncMock()
+        indexer.ensure_collection = AsyncMock()
+        # Pretend the vocab is already trained so index_fact does not retrain.
+        monkeypatch.setattr(
+            indexer.global_vocab,
+            "get_codebase_doc_count",
+            MagicMock(return_value=1),
+        )
+
+        await indexer.index_fact(fact)
+
+        # The upsert (inside _index_fact) overwrites the stable-id point; no
+        # pre-delete that could strand the fact on a transient upsert failure.
+        indexer._delete_fact_point.assert_not_called()
+        indexer._index_fact.assert_awaited_once_with(fact)
