@@ -180,6 +180,25 @@ class TestFindConnectionsTypeFilterCase:
         ) == []
 
 
+class TestFindConnectionsFactTraversal:
+    def test_self_referential_fact_yields_one_path(self, store):
+        fact = store.create("Alice", "knows", "Alice")
+
+        paths = store.find_connections("Alice", "Alice")
+
+        assert [[item.id for item in path] for path in paths] == [[fact.id]]
+
+    def test_distinct_facts_between_same_entities_yield_distinct_paths(self, store):
+        likes = store.create("Alice", "likes", "Bob")
+        knows = store.create("Alice", "knows", "Bob")
+
+        paths = store.find_connections("Alice", "Bob")
+
+        fact_paths = {tuple(item.id for item in path) for path in paths}
+        assert fact_paths == {(likes.id,), (knows.id,)}
+        assert len(paths) == 2
+
+
 class TestIterAllResilience:
     """iter_all snapshots ids then reads lazily; a fact deleted in between
     must be skipped, not raise (a force reindex deletes points up front and
