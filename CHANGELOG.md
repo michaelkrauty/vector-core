@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.2.12] - 2026-07-10
+
+### Fixed
+
+- **`FactStore.find_connections()` no longer returns duplicate paths for a self-referential fact.** A fact whose subject and object are the same entity creates separate subject and object adjacency rows. The breadth-first traversal previously processed both rows and returned the same fact path twice when that entity was also the target. Each fact ID is now traversed once per entity node, while distinct facts between the same entities still produce distinct paths. (#30)
+
 ## [1.2.11] - 2026-06-20
 
 ### Fixed

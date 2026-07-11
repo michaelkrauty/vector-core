@@ -1115,9 +1115,14 @@ class FactStore(ThreadSafeSQLiteStore):
             if len(path) >= max_depth:
                 continue
 
-            # Find all facts involving this entity
+            # Find all facts involving this entity. A self-referential fact
+            # (subject == object) stores one adjacency row per role, so group by
+            # fact_id to visit each fact once per node. Either role resolves to
+            # the same counterpart entity for a self-loop, so MIN() just picks a
+            # deterministic one. Distinct facts keep distinct fact_ids and are
+            # still traversed separately.
             adj_query = """
-                SELECT fact_id, role
+                SELECT fact_id, MIN(role)
                 FROM entity_adjacency
                 WHERE LOWER(entity_name) = ?
             """
@@ -1127,6 +1132,7 @@ class FactStore(ThreadSafeSQLiteStore):
                 adj_query += " AND entity_type = ?"
                 adj_params.append(current_type)
 
+            adj_query += " GROUP BY fact_id"
             adj_cursor = conn.execute(adj_query, adj_params)
 
             for row in adj_cursor.fetchall():
