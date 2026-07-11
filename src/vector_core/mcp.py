@@ -4,7 +4,7 @@ Provides common functionality for MCP servers built on vector-core.
 """
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
@@ -21,6 +21,54 @@ class ToolRegistrationError(RuntimeError):
         super().__init__(
             f"{server_name} is missing expected tools: {sorted(missing_tools)}"
         )
+
+
+def _get_registered_tool_names(mcp: object) -> set[str] | None:
+    """
+    Collect the names of the tools registered on a FastMCP instance.
+
+    FastMCP exposes no supported API for this, so the registry is discovered
+    defensively: the tool manager's ``list_tools()`` first, then the dict
+    layouts used by older releases.
+
+    Returns:
+        The registered tool names, or None if the registry could not be read at
+        all. An empty set means the registry was read and holds no tools, which
+        is a different condition from None and must stay distinguishable.
+    """
+    try:
+        tool_manager = cast(Any, mcp)._tool_manager
+    except Exception:
+        tool_manager = None
+
+    if tool_manager is not None:
+        try:
+            list_tools = tool_manager.list_tools
+            if callable(list_tools):
+                names: set[str] = set()
+                for tool in list_tools():
+                    name = tool.name
+                    if not isinstance(name, str):
+                        raise TypeError("Tool name is not a string")
+                    names.add(name)
+                return names
+        except Exception:
+            pass
+
+    for owner, attribute in (
+        (tool_manager, "tools"),
+        (tool_manager, "_tools"),
+        (mcp, "_tools"),
+    ):
+        if owner is None:
+            continue
+        try:
+            tool_store = getattr(owner, attribute)
+            return {str(name) for name in tool_store.keys()}
+        except Exception:
+            continue
+
+    return None
 
 
 def verify_tools_registered(
@@ -47,26 +95,11 @@ def verify_tools_registered(
     Raises:
         ToolRegistrationError: If any expected tools are missing
     """
-    # FastMCP stores tools in _tool_manager.tools dict
-    # Access via the public list_tools() method if available, or internal structure
-    try:
-        # Try the internal structure (FastMCP implementation detail)
-        if hasattr(mcp, "_tool_manager") and hasattr(mcp._tool_manager, "tools"):
-            registered = set(mcp._tool_manager.tools.keys())
-        elif hasattr(mcp, "_tools"):
-            # Alternative internal structure
-            registered = set(mcp._tools.keys())
-        else:
-            # Fallback: try to get tool names from list_tools
-            logger.warning(
-                f"Cannot verify tools for {server_name}: "
-                "FastMCP internal structure not accessible. "
-                "Tool registration verification skipped."
-            )
-            return
-    except Exception as e:
+    registered = _get_registered_tool_names(mcp)
+    if registered is None:
         logger.warning(
-            f"Cannot verify tools for {server_name}: {e}. "
+            f"Cannot verify tools for {server_name}: "
+            "FastMCP tool registry not accessible. "
             "Tool registration verification skipped."
         )
         return
@@ -100,17 +133,11 @@ def log_registered_tools(mcp: "FastMCP", server_name: str) -> list[str]:
     Returns:
         List of registered tool names
     """
-    try:
-        if hasattr(mcp, "_tool_manager") and hasattr(mcp._tool_manager, "tools"):
-            tools = list(mcp._tool_manager.tools.keys())
-        elif hasattr(mcp, "_tools"):
-            tools = list(mcp._tools.keys())
-        else:
-            logger.warning(f"{server_name}: Cannot access tool list")
-            return []
-    except Exception as e:
-        logger.warning(f"{server_name}: Error accessing tools: {e}")
+    registered = _get_registered_tool_names(mcp)
+    if registered is None:
+        logger.warning(f"{server_name}: Cannot access tool list")
         return []
 
+    tools = list(registered)
     logger.info(f"{server_name} registered tools ({len(tools)}): {sorted(tools)}")
     return tools
