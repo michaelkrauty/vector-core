@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.3.0] - 2026-07-10
+
+### Fixed
+
+- **MCP tool registration verification now discovers tools through the public `ToolManager.list_tools()` API.** `verify_tools_registered()` and `log_registered_tools()` previously probed obsolete private attributes, so current FastMCP releases always skipped verification and reported no registered tools. Both functions now share one discovery path with tolerant fallbacks for older SDK layouts, while preserving warnings when the registry cannot be inspected.
+
 ## [1.2.12] - 2026-07-10
 
 ### Fixed
