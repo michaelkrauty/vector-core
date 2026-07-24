@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.3.1] - 2026-07-24
+
+### Fixed
+
+- **`GlobalVocabulary.update_codebase_incremental()` now establishes a codebase's document count instead of silently skipping it.** The count was moved with a bare `UPDATE`, which matches nothing for a codebase that has never called `register_codebase`. Such a codebase's tokens entered the vocabulary and its per-token contributions were recorded, but its document count stayed absent and read as zero forever. That is not a local inaccuracy: `total_docs` is the sum of every codebase's count and feeds the IDF weights used to rank results for all of them, so a corpus contributing document frequencies while reporting no documents inflates every term's apparent rarity across the whole database. Any consumer that maintains its contribution purely incrementally, rather than seeding it with a full registration first, was affected. The count is now created on first use and clamped at zero, because a corpus with no contribution has nothing to remove and a negative count would make `total_docs` meaningless for every codebase sharing the database.
+
 ## [1.3.0] - 2026-07-10
 
 ### Fixed

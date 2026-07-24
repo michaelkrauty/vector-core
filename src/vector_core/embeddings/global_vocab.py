@@ -536,7 +536,11 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
         """
         Incrementally update a codebase's vocabulary contribution.
 
-        More efficient than full re-registration for small changes.
+        More efficient than full re-registration for small changes. A codebase
+        that has never registered is established by its first call rather than
+        being ignored, so a caller can maintain its contribution purely
+        incrementally without seeding it with ``register_codebase`` first. The
+        established count is clamped at zero.
 
         Uses cross-process file locking to safely coordinate between
         multiple MCP servers sharing the same vocabulary database.
@@ -625,14 +629,22 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
                         "DELETE FROM codebase_contributions WHERE doc_freq <= 0",
                     )
 
-                    # Update doc count
+                    # Update doc count. A codebase that has never registered
+                    # has no row here, and a bare UPDATE would match nothing:
+                    # its tokens would enter the vocabulary while its document
+                    # count stayed absent, reading as zero forever and skewing
+                    # the IDF weights every codebase in this database shares.
+                    # The insert is clamped at zero because a corpus with no
+                    # contribution has nothing to remove, and a negative count
+                    # would make total_docs meaningless for everyone.
                     conn.execute(
                         """
-                        UPDATE codebase_doc_counts
+                        INSERT INTO codebase_doc_counts (codebase_id, doc_count, last_updated)
+                        VALUES (?, MAX(?, 0), ?)
+                        ON CONFLICT(codebase_id) DO UPDATE
                         SET doc_count = doc_count + ?, last_updated = ?
-                        WHERE codebase_id = ?
                         """,
-                        (net_doc_change, now, codebase_id),
+                        (codebase_id, net_doc_change, now, net_doc_change, now),
                     )
 
                     conn.commit()

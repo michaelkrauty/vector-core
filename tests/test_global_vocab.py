@@ -398,6 +398,83 @@ class TestIncrementalUpdate:
         assert vocab.vocab_size == initial_size + 2
         vocab.close()
 
+    def test_update_establishes_a_missing_doc_count(self, tmp_path):
+        """A codebase with no contribution yet must still get its count.
+
+        Regression: the document count was moved with a bare UPDATE, which
+        matches no row for a codebase that has never registered. Its tokens
+        landed in the vocabulary and in codebase_contributions, but its
+        document count stayed absent and therefore read as zero forever. Every
+        caller that maintains its contribution purely incrementally, rather
+        than seeding it with register_codebase first, was affected, and a
+        codebase reporting zero documents while contributing document
+        frequencies skews IDF for every codebase sharing the database.
+        """
+        vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
+
+        vocab.update_codebase_incremental(
+            "fresh",
+            added_tokens=[{"hello", "world"}],
+            removed_tokens=[],
+            net_doc_change=1,
+        )
+
+        assert vocab.get_codebase_doc_count("fresh") == 1
+        assert vocab.total_docs == 1
+        vocab.close()
+
+    def test_update_accumulates_from_a_missing_doc_count(self, tmp_path):
+        """The count keeps accumulating once the row has been established."""
+        vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
+
+        for token in ("alpha", "beta", "gamma"):
+            vocab.update_codebase_incremental(
+                "fresh",
+                added_tokens=[{token}],
+                removed_tokens=[],
+                net_doc_change=1,
+            )
+
+        assert vocab.get_codebase_doc_count("fresh") == 3
+        vocab.close()
+
+    def test_update_does_not_create_a_negative_doc_count(self, tmp_path):
+        """Removing from a corpus that was never registered leaves it empty.
+
+        A corpus with no contribution has nothing to remove, and a negative
+        document count would make total_docs, and therefore every IDF weight
+        derived from it, meaningless for every codebase in the database.
+        """
+        vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
+
+        vocab.update_codebase_incremental(
+            "fresh",
+            added_tokens=[],
+            removed_tokens=[{"hello"}],
+            net_doc_change=-1,
+        )
+
+        assert vocab.get_codebase_doc_count("fresh") == 0
+        assert vocab.total_docs == 0
+        vocab.close()
+
+    def test_update_leaves_an_untouched_codebase_alone(self, tmp_path):
+        """Establishing one codebase's count must not disturb another's."""
+        vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
+        vocab.register_codebase("existing", [{"one"}, {"two"}])
+
+        vocab.update_codebase_incremental(
+            "fresh",
+            added_tokens=[{"three"}],
+            removed_tokens=[],
+            net_doc_change=1,
+        )
+
+        assert vocab.get_codebase_doc_count("existing") == 2
+        assert vocab.get_codebase_doc_count("fresh") == 1
+        assert vocab.total_docs == 3
+        vocab.close()
+
     def test_update_removes_contribution(self, tmp_path):
         """Incremental update decrements doc_freq."""
         vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
