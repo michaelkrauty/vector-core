@@ -473,9 +473,11 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
             return
 
         # Decrement global doc_freq
+        # Floored at zero for the same reason as the incremental path: a
+        # negative document frequency makes vectorize_query raise.
         for token, freq in old_contributions:
             conn.execute(
-                "UPDATE vocabulary SET doc_freq = doc_freq - ? WHERE token = ?",
+                "UPDATE vocabulary SET doc_freq = MAX(doc_freq - ?, 0) WHERE token = ?",
                 (freq, token),
             )
 
@@ -598,8 +600,18 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
                     for token in all_tokens:
                         delta = added_freq.get(token, 0) - removed_freq.get(token, 0)
                         if delta != 0:
+                            # Floored at zero: a document frequency counts
+                            # documents and cannot be negative. Query weighting
+                            # is log((total + 1) / (df + 1)) + 1, so df == -1
+                            # divides by zero and anything lower takes the log
+                            # of a negative number, raising out of
+                            # vectorize_query. That is the search path of every
+                            # codebase sharing this database, so one consumer's
+                            # accounting drift would otherwise take searching
+                            # down for all of them.
                             conn.execute(
-                                "UPDATE vocabulary SET doc_freq = doc_freq + ? WHERE token = ?",
+                                "UPDATE vocabulary SET doc_freq = MAX(doc_freq + ?, 0) "
+                                "WHERE token = ?",
                                 (delta, token),
                             )
 
@@ -634,15 +646,18 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
                     # its tokens would enter the vocabulary while its document
                     # count stayed absent, reading as zero forever and skewing
                     # the IDF weights every codebase in this database shares.
-                    # The insert is clamped at zero because a corpus with no
-                    # contribution has nothing to remove, and a negative count
-                    # would make total_docs meaningless for everyone.
+                    #
+                    # Both branches are floored at zero. total_docs is the sum
+                    # of these counts and is the numerator of the query weight
+                    # log((total + 1) / (df + 1)) + 1, so a negative total
+                    # makes vectorize_query raise a math domain error for every
+                    # codebase in the database, not just this one.
                     conn.execute(
                         """
                         INSERT INTO codebase_doc_counts (codebase_id, doc_count, last_updated)
                         VALUES (?, MAX(?, 0), ?)
                         ON CONFLICT(codebase_id) DO UPDATE
-                        SET doc_count = doc_count + ?, last_updated = ?
+                        SET doc_count = MAX(doc_count + ?, 0), last_updated = ?
                         """,
                         (codebase_id, net_doc_change, now, net_doc_change, now),
                     )

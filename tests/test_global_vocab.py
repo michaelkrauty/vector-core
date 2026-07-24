@@ -475,6 +475,49 @@ class TestIncrementalUpdate:
         assert vocab.total_docs == 3
         vocab.close()
 
+    def test_over_removal_cannot_drive_doc_freq_negative(self, tmp_path):
+        """A document frequency is a count of documents and cannot be negative.
+
+        Query weighting is ``log((total + 1) / (df + 1)) + 1``, so a df of -1
+        divides by zero and anything below it takes the log of a negative
+        number. Either one raises out of ``vectorize_query``, which is on the
+        search path of every codebase sharing the database, so one consumer's
+        accounting drift would take searching down for all of them.
+        """
+        vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
+        vocab.register_codebase("test", [{"shared"}])
+
+        vocab.update_codebase_incremental(
+            "test",
+            added_tokens=[],
+            removed_tokens=[{"shared"}, {"shared"}, {"shared"}],
+            net_doc_change=-3,
+        )
+
+        assert vocab._get_doc_freq()["shared"] == 0
+        assert vocab.vectorize_query("shared") is not None
+        vocab.close()
+
+    def test_reregistration_cannot_drive_doc_freq_negative(self, tmp_path):
+        """The same invariant on the removal half of register_codebase."""
+        vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
+        vocab.register_codebase("a", [{"shared"}])
+        vocab.register_codebase("b", [{"shared"}])
+
+        # Drop b's own contribution out from under the shared counter, then
+        # re-register a smaller corpus for a.
+        vocab.update_codebase_incremental(
+            "a",
+            added_tokens=[],
+            removed_tokens=[{"shared"}, {"shared"}],
+            net_doc_change=-2,
+        )
+        vocab.register_codebase("b", [])
+
+        assert vocab._get_doc_freq().get("shared", 0) >= 0
+        assert vocab.vectorize_query("shared") is not None
+        vocab.close()
+
     def test_update_removes_contribution(self, tmp_path):
         """Incremental update decrements doc_freq."""
         vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
