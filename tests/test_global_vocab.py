@@ -550,6 +550,60 @@ class TestIncrementalUpdate:
         assert total == 1
         vocab.close()
 
+    def test_a_token_added_and_removed_in_one_call_settles_correctly(self, tmp_path):
+        """The contribution settles at max(existing + added - removed, 0).
+
+        Capping the removal alone gets this wrong: with one contribution, one
+        addition and two removals, only one removal would be permitted and the
+        addition would then leave the row at 1 instead of 0, where the
+        zero-count cleanup can no longer reach it.
+        """
+        vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
+        vocab.register_codebase("a", [{"shared"}])
+
+        vocab.update_codebase_incremental(
+            "a",
+            added_tokens=[{"shared"}],
+            removed_tokens=[{"shared"}, {"shared"}],
+            net_doc_change=-1,
+        )
+
+        conn = sqlite3.connect(vocab.db_path)
+        try:
+            row = conn.execute(
+                "SELECT doc_freq FROM codebase_contributions "
+                "WHERE codebase_id = 'a' AND token = 'shared'"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row is None, "a settled contribution of zero must be cleaned up"
+        assert vocab._get_doc_freq().get("shared", 0) == 0
+        vocab.close()
+
+    def test_addition_only_update_reads_no_contributions(self, tmp_path):
+        """An addition needs no current contribution, and this runs inside the
+        writer transaction, so it must not load the codebase's whole table."""
+        vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
+        vocab.register_codebase("a", [{"one"}, {"two"}, {"three"}])
+
+        conn = vocab._get_conn()
+        seen: list[str] = []
+        conn.set_trace_callback(lambda sql: seen.append(" ".join(sql.split())))
+        try:
+            vocab.update_codebase_incremental(
+                "a",
+                added_tokens=[{"four"}],
+                removed_tokens=[],
+                net_doc_change=1,
+            )
+        finally:
+            conn.set_trace_callback(None)
+
+        reads = [s for s in seen if "doc_freq FROM codebase_contributions" in s]
+        assert reads == []
+        assert vocab.get_codebase_doc_count("a") == 4
+        vocab.close()
+
     def test_unregister_removes_a_count_row_without_contributions(self, tmp_path):
         """An incremental removal can establish a zero row with no tokens.
 
