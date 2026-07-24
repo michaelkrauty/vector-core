@@ -1,6 +1,7 @@
 """Tests for GlobalVocabulary (cross-codebase sparse vector search)."""
 
 import concurrent.futures
+import sqlite3
 import tempfile
 from pathlib import Path
 
@@ -396,6 +397,230 @@ class TestIncrementalUpdate:
 
         assert new_tokens == 2
         assert vocab.vocab_size == initial_size + 2
+        vocab.close()
+
+    def test_update_establishes_a_missing_doc_count(self, tmp_path):
+        """A codebase with no contribution yet must still get its count.
+
+        Regression: the document count was moved with a bare UPDATE, which
+        matches no row for a codebase that has never registered. Its tokens
+        landed in the vocabulary and in codebase_contributions, but its
+        document count stayed absent and therefore read as zero forever. Every
+        caller that maintains its contribution purely incrementally, rather
+        than seeding it with register_codebase first, was affected, and a
+        codebase reporting zero documents while contributing document
+        frequencies skews IDF for every codebase sharing the database.
+        """
+        vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
+
+        vocab.update_codebase_incremental(
+            "fresh",
+            added_tokens=[{"hello", "world"}],
+            removed_tokens=[],
+            net_doc_change=1,
+        )
+
+        assert vocab.get_codebase_doc_count("fresh") == 1
+        assert vocab.total_docs == 1
+        vocab.close()
+
+    def test_update_accumulates_from_a_missing_doc_count(self, tmp_path):
+        """The count keeps accumulating once the row has been established."""
+        vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
+
+        for token in ("alpha", "beta", "gamma"):
+            vocab.update_codebase_incremental(
+                "fresh",
+                added_tokens=[{token}],
+                removed_tokens=[],
+                net_doc_change=1,
+            )
+
+        assert vocab.get_codebase_doc_count("fresh") == 3
+        vocab.close()
+
+    def test_update_does_not_create_a_negative_doc_count(self, tmp_path):
+        """Removing from a corpus that was never registered leaves it empty.
+
+        A corpus with no contribution has nothing to remove, and a negative
+        document count would make total_docs, and therefore every IDF weight
+        derived from it, meaningless for every codebase in the database.
+        """
+        vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
+
+        vocab.update_codebase_incremental(
+            "fresh",
+            added_tokens=[],
+            removed_tokens=[{"hello"}],
+            net_doc_change=-1,
+        )
+
+        assert vocab.get_codebase_doc_count("fresh") == 0
+        assert vocab.total_docs == 0
+        vocab.close()
+
+    def test_update_leaves_an_untouched_codebase_alone(self, tmp_path):
+        """Establishing one codebase's count must not disturb another's."""
+        vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
+        vocab.register_codebase("existing", [{"one"}, {"two"}])
+
+        vocab.update_codebase_incremental(
+            "fresh",
+            added_tokens=[{"three"}],
+            removed_tokens=[],
+            net_doc_change=1,
+        )
+
+        assert vocab.get_codebase_doc_count("existing") == 2
+        assert vocab.get_codebase_doc_count("fresh") == 1
+        assert vocab.total_docs == 3
+        vocab.close()
+
+    def test_over_removal_cannot_drive_doc_freq_negative(self, tmp_path):
+        """A document frequency is a count of documents and cannot be negative.
+
+        Query weighting is ``log((total + 1) / (df + 1)) + 1``, so a df of -1
+        divides by zero and anything below it takes the log of a negative
+        number. Either one raises out of ``vectorize_query``, which is on the
+        search path of every codebase sharing the database, so one consumer's
+        accounting drift would take searching down for all of them.
+        """
+        vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
+        vocab.register_codebase("test", [{"shared"}])
+
+        vocab.update_codebase_incremental(
+            "test",
+            added_tokens=[],
+            removed_tokens=[{"shared"}, {"shared"}, {"shared"}],
+            net_doc_change=-3,
+        )
+
+        assert vocab._get_doc_freq()["shared"] == 0
+        assert vocab.vectorize_query("shared") is not None
+        vocab.close()
+
+    def test_reregistration_cannot_drive_doc_freq_negative(self, tmp_path):
+        """The same invariant on the removal half of register_codebase."""
+        vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
+        vocab.register_codebase("a", [{"shared"}])
+        vocab.register_codebase("b", [{"shared"}])
+
+        # Drop b's own contribution out from under the shared counter, then
+        # re-register a smaller corpus for a.
+        vocab.update_codebase_incremental(
+            "a",
+            added_tokens=[],
+            removed_tokens=[{"shared"}, {"shared"}],
+            net_doc_change=-2,
+        )
+        vocab.register_codebase("b", [])
+
+        assert vocab._get_doc_freq().get("shared", 0) >= 0
+        assert vocab.vectorize_query("shared") is not None
+        vocab.close()
+
+    def test_over_removal_leaves_another_codebase_share_intact(self, tmp_path):
+        """A codebase can only take back what it put in.
+
+        Flooring the aggregate on its own would hide the discrepancy rather
+        than prevent it: the over-removal would already have consumed the other
+        codebase's share of the shared token before the floor applied.
+        """
+        vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
+        vocab.register_codebase("a", [{"shared"}])
+        vocab.register_codebase("b", [{"shared"}])
+        assert vocab._get_doc_freq()["shared"] == 2
+
+        vocab.update_codebase_incremental(
+            "a",
+            added_tokens=[],
+            removed_tokens=[{"shared"}, {"shared"}, {"shared"}],
+            net_doc_change=-3,
+        )
+
+        # a contributed one, so only one comes off; b's share survives.
+        assert vocab._get_doc_freq()["shared"] == 1
+        conn = sqlite3.connect(vocab.db_path)
+        try:
+            total = conn.execute(
+                "SELECT SUM(doc_freq) FROM codebase_contributions WHERE token = 'shared'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert total == 1
+        vocab.close()
+
+    def test_a_token_added_and_removed_in_one_call_settles_correctly(self, tmp_path):
+        """The contribution settles at max(existing + added - removed, 0).
+
+        Capping the removal alone gets this wrong: with one contribution, one
+        addition and two removals, only one removal would be permitted and the
+        addition would then leave the row at 1 instead of 0, where the
+        zero-count cleanup can no longer reach it.
+        """
+        vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
+        vocab.register_codebase("a", [{"shared"}])
+
+        vocab.update_codebase_incremental(
+            "a",
+            added_tokens=[{"shared"}],
+            removed_tokens=[{"shared"}, {"shared"}],
+            net_doc_change=-1,
+        )
+
+        conn = sqlite3.connect(vocab.db_path)
+        try:
+            row = conn.execute(
+                "SELECT doc_freq FROM codebase_contributions "
+                "WHERE codebase_id = 'a' AND token = 'shared'"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row is None, "a settled contribution of zero must be cleaned up"
+        assert vocab._get_doc_freq().get("shared", 0) == 0
+        vocab.close()
+
+    def test_addition_only_update_reads_no_contributions(self, tmp_path):
+        """An addition needs no current contribution, and this runs inside the
+        writer transaction, so it must not load the codebase's whole table."""
+        vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
+        vocab.register_codebase("a", [{"one"}, {"two"}, {"three"}])
+
+        conn = vocab._get_conn()
+        seen: list[str] = []
+        conn.set_trace_callback(lambda sql: seen.append(" ".join(sql.split())))
+        try:
+            vocab.update_codebase_incremental(
+                "a",
+                added_tokens=[{"four"}],
+                removed_tokens=[],
+                net_doc_change=1,
+            )
+        finally:
+            conn.set_trace_callback(None)
+
+        reads = [s for s in seen if "doc_freq FROM codebase_contributions" in s]
+        assert reads == []
+        assert vocab.get_codebase_doc_count("a") == 4
+        vocab.close()
+
+    def test_unregister_removes_a_count_row_without_contributions(self, tmp_path):
+        """An incremental removal can establish a zero row with no tokens.
+
+        Leaving it behind would keep an unregistered codebase visible through
+        get_codebase_ids() and counted in stats().
+        """
+        vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
+        vocab.update_codebase_incremental(
+            "ghost",
+            added_tokens=[],
+            removed_tokens=[{"hello"}],
+            net_doc_change=-1,
+        )
+
+        vocab.unregister_codebase("ghost")
+
+        assert "ghost" not in vocab.get_codebase_ids()
         vocab.close()
 
     def test_update_removes_contribution(self, tmp_path):

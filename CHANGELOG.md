@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.3.1] - 2026-07-24
+
+### Fixed
+
+- **`GlobalVocabulary.update_codebase_incremental()` now establishes a codebase's document count instead of silently skipping it.** The count was moved with a bare `UPDATE`, which matches nothing for a codebase that has never called `register_codebase`. Such a codebase's tokens entered the vocabulary and its per-token contributions were recorded, but its document count stayed absent and read as zero forever. That is not a local inaccuracy: `total_docs` is the sum of every codebase's count and feeds the IDF weights used to rank results for all of them, so a corpus contributing document frequencies while reporting no documents inflates every term's apparent rarity across the whole database. Any consumer that maintains its contribution purely incrementally, rather than seeding it with a full registration first, was affected.
+- **An incremental removal can no longer take back more than the codebase contributed.** `update_codebase_incremental` applied the caller's figures to the global `doc_freq` and to the per-codebase contribution independently, so removing a shared token more often than it was added consumed another codebase's share of it, leaving the aggregate below the sum of the contributions. A token now settles at `max(existing + added - removed, 0)` and one delta drives both the contribution and the global counter, so the two stay in step and a call that both adds and removes the same token settles on the same answer. Only tokens being removed have their current contribution read, so an addition-only call reads nothing, which matters because this runs inside the writer transaction.
+- **Document counts and document frequencies can no longer go negative.** Query weighting is `log((total_docs + 1) / (doc_freq + 1)) + 1`. A value of -1 divides by zero and anything below it takes the logarithm of a negative number, so a single consumer's accounting drift would raise out of `vectorize_query` and take searching down for every codebase sharing the database, not only the one that drifted. Both write paths, `update_codebase_incremental` and the removal half of `register_codebase` and `unregister_codebase`, now floor at zero as a backstop behind the cap above. Neither quantity counts anything that can be negative, so the floor asserts a domain invariant rather than hiding a value that was meaningful.
+- **Unregistering a codebase removes its document count even when it holds no token contributions.** `_remove_codebase_contribution` returned early when there was nothing to subtract, so a codebase whose count row existed without contributions stayed visible through `get_codebase_ids()` and was counted by `stats()`.
+
+### Upgrade notes
+
+An existing database cannot recover a document count the old bare `UPDATE` already discarded, because it was never written. The first incremental call after upgrading establishes the row from that call's delta alone, so an affected codebase starts counting from there rather than from its true corpus size. Consumers wanting an accurate count should re-register their corpus once with `register_codebase`, which every full or forced re-index already does.
+
+Where a count or frequency had already been driven negative, the floor stops it getting worse but does not reconstruct the lost quantity, and the aggregate `vocabulary.doc_freq` can sit above the sum of the per-codebase contributions until the codebases involved re-register. The result is a bounded ranking inaccuracy in place of an exception on every search.
+
 ## [1.3.0] - 2026-07-10
 
 ### Fixed

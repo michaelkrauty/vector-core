@@ -31,6 +31,10 @@ logger = logging.getLogger(__name__)
 # Schema version for migrations
 SCHEMA_VERSION = 1
 
+# Bound on tokens per contribution lookup, to stay clear of SQLite's limit on
+# bound parameters while keeping the number of round trips small.
+_CONTRIBUTION_QUERY_BATCH = 500
+
 
 class GlobalVocabulary(ThreadSafeSQLiteStore):
     """
@@ -470,12 +474,22 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
         old_contributions = cursor.fetchall()
 
         if not old_contributions:
+            # A codebase can hold a document count with no token contributions,
+            # for instance after an incremental removal established a zero row.
+            # Returning here would strand it, leaving an unregistered codebase
+            # visible through get_codebase_ids() and counted by stats().
+            conn.execute(
+                "DELETE FROM codebase_doc_counts WHERE codebase_id = ?",
+                (codebase_id,),
+            )
             return
 
         # Decrement global doc_freq
+        # Floored at zero for the same reason as the incremental path: a
+        # negative document frequency makes vectorize_query raise.
         for token, freq in old_contributions:
             conn.execute(
-                "UPDATE vocabulary SET doc_freq = doc_freq - ? WHERE token = ?",
+                "UPDATE vocabulary SET doc_freq = MAX(doc_freq - ?, 0) WHERE token = ?",
                 (freq, token),
             )
 
@@ -526,6 +540,91 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
 
         self._invalidate_cache()
 
+    def _contribution_deltas(
+        self,
+        conn: sqlite3.Connection,
+        codebase_id: str,
+        added_freq: Counter[str],
+        removed_freq: Counter[str],
+    ) -> dict[str, int]:
+        """Effective per-token change to this codebase's contribution.
+
+        A codebase can only take back what it put in, so a token settles at
+        ``max(existing + added - removed, 0)`` and the returned delta is that
+        minus ``existing``. Applying the caller's raw figures to the global
+        counter and to the per-codebase contribution independently is what lets
+        the aggregate drift away from the sum of the contributions: an
+        over-removal consumes another codebase's share of a shared token, and
+        clamping the aggregate afterwards hides that rather than preventing it.
+        Deriving both from one delta keeps them in step, and it settles a call
+        that both adds and removes the same token on the same answer.
+
+        Only tokens with a removal need their current contribution read: a
+        purely added token settles at ``existing + added`` whatever ``existing``
+        is. An addition-only call therefore reads nothing, which matters
+        because this runs inside the writer transaction.
+        """
+        existing = self._contributions_for(conn, codebase_id, list(removed_freq))
+        deltas: dict[str, int] = {}
+        for token in set(added_freq) | set(removed_freq):
+            added = added_freq.get(token, 0)
+            removed = removed_freq.get(token, 0)
+            if not removed:
+                deltas[token] = added
+                continue
+            current = existing.get(token, 0)
+            deltas[token] = max(current + added - removed, 0) - current
+        return {token: delta for token, delta in deltas.items() if delta}
+
+    @staticmethod
+    def _contributions_for(
+        conn: sqlite3.Connection,
+        codebase_id: str,
+        tokens: list[str],
+    ) -> dict[str, int]:
+        """Current contribution for specific tokens, in bounded batches.
+
+        Chunked to stay clear of SQLite's limit on bound parameters, and scoped
+        to the tokens asked for rather than the codebase's whole contribution
+        table, which can hold hundreds of thousands of rows.
+        """
+        found: dict[str, int] = {}
+        for start in range(0, len(tokens), _CONTRIBUTION_QUERY_BATCH):
+            batch = tokens[start : start + _CONTRIBUTION_QUERY_BATCH]
+            placeholders = ",".join("?" * len(batch))
+            cursor = conn.execute(
+                f"SELECT token, doc_freq FROM codebase_contributions "  # noqa: S608
+                f"WHERE codebase_id = ? AND token IN ({placeholders})",
+                (codebase_id, *batch),
+            )
+            found.update(cursor.fetchall())
+        return found
+
+    def _warn_if_count_was_lost(self, conn: sqlite3.Connection, codebase_id: str) -> None:
+        """Report a codebase holding contributions with no document count.
+
+        That combination means it was maintained incrementally by a release
+        whose bare ``UPDATE`` discarded the count. The figure was never written
+        and cannot be reconstructed here, so the row established by this call
+        starts from this call's delta; only a full re-registration restores it.
+        """
+        has_count = conn.execute(
+            "SELECT 1 FROM codebase_doc_counts WHERE codebase_id = ?",
+            (codebase_id,),
+        ).fetchone()
+        if has_count is not None:
+            return
+        has_contributions = conn.execute(
+            "SELECT 1 FROM codebase_contributions WHERE codebase_id = ? LIMIT 1",
+            (codebase_id,),
+        ).fetchone()
+        if has_contributions is not None:
+            logger.warning(
+                f"Codebase '{codebase_id}' has vocabulary contributions but no document "
+                f"count; its historical count was never recorded and cannot be recovered. "
+                f"Re-register the full corpus to restore accurate IDF weighting."
+            )
+
     def update_codebase_incremental(
         self,
         codebase_id: str,
@@ -536,7 +635,11 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
         """
         Incrementally update a codebase's vocabulary contribution.
 
-        More efficient than full re-registration for small changes.
+        More efficient than full re-registration for small changes. A codebase
+        that has never registered is established by its first call rather than
+        being ignored, so a caller can maintain its contribution purely
+        incrementally without seeding it with ``register_codebase`` first. The
+        established count is clamped at zero.
 
         Uses cross-process file locking to safely coordinate between
         multiple MCP servers sharing the same vocabulary database.
@@ -589,35 +692,37 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
                             next_idx += 1
                             new_tokens_count += 1
 
-                    # Update global doc_freq
-                    all_tokens = set(added_freq.keys()) | set(removed_freq.keys())
-                    for token in all_tokens:
-                        delta = added_freq.get(token, 0) - removed_freq.get(token, 0)
-                        if delta != 0:
-                            conn.execute(
-                                "UPDATE vocabulary SET doc_freq = doc_freq + ? WHERE token = ?",
-                                (delta, token),
-                            )
+                    self._warn_if_count_was_lost(conn, codebase_id)
 
-                    # Update per-codebase contributions
-                    for token, freq in removed_freq.items():
+                    # One delta per token drives both the global counter and
+                    # this codebase's contribution, so the aggregate stays equal
+                    # to the sum of the contributions.
+                    deltas = self._contribution_deltas(
+                        conn, codebase_id, added_freq, removed_freq
+                    )
+
+                    for token, delta in deltas.items():
+                        # Floored at zero as a backstop. The delta above is what
+                        # keeps this honest, but a document frequency counts
+                        # documents and can never be negative, and query
+                        # weighting is log((total + 1) / (df + 1)) + 1: df == -1
+                        # divides by zero and anything lower takes the log of a
+                        # negative number, raising out of vectorize_query. That
+                        # is the search path of every codebase sharing this
+                        # database, so a value that slipped through would take
+                        # searching down for all of them.
                         conn.execute(
-                            """
-                            UPDATE codebase_contributions
-                            SET doc_freq = doc_freq - ?
-                            WHERE codebase_id = ? AND token = ?
-                            """,
-                            (freq, codebase_id, token),
+                            "UPDATE vocabulary SET doc_freq = MAX(doc_freq + ?, 0) "
+                            "WHERE token = ?",
+                            (delta, token),
                         )
-
-                    for token, freq in added_freq.items():
                         conn.execute(
                             """
                             INSERT INTO codebase_contributions (codebase_id, token, doc_freq)
                             VALUES (?, ?, ?)
                             ON CONFLICT(codebase_id, token) DO UPDATE SET doc_freq = doc_freq + ?
                             """,
-                            (codebase_id, token, freq, freq),
+                            (codebase_id, token, delta, delta),
                         )
 
                     # Clean up zero-count contributions
@@ -625,14 +730,25 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
                         "DELETE FROM codebase_contributions WHERE doc_freq <= 0",
                     )
 
-                    # Update doc count
+                    # Update doc count. A codebase that has never registered
+                    # has no row here, and a bare UPDATE would match nothing:
+                    # its tokens would enter the vocabulary while its document
+                    # count stayed absent, reading as zero forever and skewing
+                    # the IDF weights every codebase in this database shares.
+                    #
+                    # Both branches are floored at zero. total_docs is the sum
+                    # of these counts and is the numerator of the query weight
+                    # log((total + 1) / (df + 1)) + 1, so a negative total
+                    # makes vectorize_query raise a math domain error for every
+                    # codebase in the database, not just this one.
                     conn.execute(
                         """
-                        UPDATE codebase_doc_counts
-                        SET doc_count = doc_count + ?, last_updated = ?
-                        WHERE codebase_id = ?
+                        INSERT INTO codebase_doc_counts (codebase_id, doc_count, last_updated)
+                        VALUES (?, MAX(?, 0), ?)
+                        ON CONFLICT(codebase_id) DO UPDATE
+                        SET doc_count = MAX(doc_count + ?, 0), last_updated = ?
                         """,
-                        (net_doc_change, now, codebase_id),
+                        (codebase_id, net_doc_change, now, net_doc_change, now),
                     )
 
                     conn.commit()
