@@ -1,6 +1,7 @@
 """Tests for GlobalVocabulary (cross-codebase sparse vector search)."""
 
 import concurrent.futures
+import sqlite3
 import tempfile
 from pathlib import Path
 
@@ -516,6 +517,56 @@ class TestIncrementalUpdate:
 
         assert vocab._get_doc_freq().get("shared", 0) >= 0
         assert vocab.vectorize_query("shared") is not None
+        vocab.close()
+
+    def test_over_removal_leaves_another_codebase_share_intact(self, tmp_path):
+        """A codebase can only take back what it put in.
+
+        Flooring the aggregate on its own would hide the discrepancy rather
+        than prevent it: the over-removal would already have consumed the other
+        codebase's share of the shared token before the floor applied.
+        """
+        vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
+        vocab.register_codebase("a", [{"shared"}])
+        vocab.register_codebase("b", [{"shared"}])
+        assert vocab._get_doc_freq()["shared"] == 2
+
+        vocab.update_codebase_incremental(
+            "a",
+            added_tokens=[],
+            removed_tokens=[{"shared"}, {"shared"}, {"shared"}],
+            net_doc_change=-3,
+        )
+
+        # a contributed one, so only one comes off; b's share survives.
+        assert vocab._get_doc_freq()["shared"] == 1
+        conn = sqlite3.connect(vocab.db_path)
+        try:
+            total = conn.execute(
+                "SELECT SUM(doc_freq) FROM codebase_contributions WHERE token = 'shared'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert total == 1
+        vocab.close()
+
+    def test_unregister_removes_a_count_row_without_contributions(self, tmp_path):
+        """An incremental removal can establish a zero row with no tokens.
+
+        Leaving it behind would keep an unregistered codebase visible through
+        get_codebase_ids() and counted in stats().
+        """
+        vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
+        vocab.update_codebase_incremental(
+            "ghost",
+            added_tokens=[],
+            removed_tokens=[{"hello"}],
+            net_doc_change=-1,
+        )
+
+        vocab.unregister_codebase("ghost")
+
+        assert "ghost" not in vocab.get_codebase_ids()
         vocab.close()
 
     def test_update_removes_contribution(self, tmp_path):

@@ -470,6 +470,14 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
         old_contributions = cursor.fetchall()
 
         if not old_contributions:
+            # A codebase can hold a document count with no token contributions,
+            # for instance after an incremental removal established a zero row.
+            # Returning here would strand it, leaving an unregistered codebase
+            # visible through get_codebase_ids() and counted by stats().
+            conn.execute(
+                "DELETE FROM codebase_doc_counts WHERE codebase_id = ?",
+                (codebase_id,),
+            )
             return
 
         # Decrement global doc_freq
@@ -527,6 +535,50 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
                     raise
 
         self._invalidate_cache()
+
+    def _cap_removals_to_contribution(
+        self,
+        conn: sqlite3.Connection,
+        codebase_id: str,
+        removed_freq: Counter[str],
+    ) -> dict[str, int]:
+        """Cap a removal request at what this codebase actually contributed.
+
+        A codebase can only take back what it put in. Applying the caller's raw
+        figure to the global counter and to the per-codebase contribution
+        independently is what lets the aggregate drift away from the sum of the
+        contributions: an over-removal consumes another codebase's share of a
+        shared token, and clamping the aggregate afterwards hides that rather
+        than preventing it.
+
+        Also reports a codebase holding contributions with no document count,
+        which means it was maintained incrementally by a release whose bare
+        UPDATE discarded the count. That figure was never written and cannot be
+        reconstructed here, so the row established by this call starts from this
+        call's delta; only a full re-registration restores it.
+        """
+        cursor = conn.execute(
+            "SELECT token, doc_freq FROM codebase_contributions WHERE codebase_id = ?",
+            (codebase_id,),
+        )
+        contributed = dict(cursor.fetchall())
+
+        if contributed:
+            row = conn.execute(
+                "SELECT 1 FROM codebase_doc_counts WHERE codebase_id = ?",
+                (codebase_id,),
+            ).fetchone()
+            if row is None:
+                logger.warning(
+                    f"Codebase '{codebase_id}' has vocabulary contributions but no document "
+                    f"count; its historical count was never recorded and cannot be recovered. "
+                    f"Re-register the full corpus to restore accurate IDF weighting."
+                )
+
+        return {
+            token: min(freq, contributed.get(token, 0))
+            for token, freq in removed_freq.items()
+        }
 
     def update_codebase_incremental(
         self,
@@ -595,20 +647,25 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
                             next_idx += 1
                             new_tokens_count += 1
 
+                    effective_removed = self._cap_removals_to_contribution(
+                        conn, codebase_id, removed_freq
+                    )
+
                     # Update global doc_freq
-                    all_tokens = set(added_freq.keys()) | set(removed_freq.keys())
+                    all_tokens = set(added_freq.keys()) | set(effective_removed.keys())
                     for token in all_tokens:
-                        delta = added_freq.get(token, 0) - removed_freq.get(token, 0)
+                        delta = added_freq.get(token, 0) - effective_removed.get(token, 0)
                         if delta != 0:
-                            # Floored at zero: a document frequency counts
-                            # documents and cannot be negative. Query weighting
-                            # is log((total + 1) / (df + 1)) + 1, so df == -1
-                            # divides by zero and anything lower takes the log
-                            # of a negative number, raising out of
+                            # Floored at zero as a backstop. The cap above is
+                            # what keeps this honest, but a document frequency
+                            # counts documents and can never be negative, and
+                            # query weighting is log((total + 1) / (df + 1)) + 1:
+                            # df == -1 divides by zero and anything lower takes
+                            # the log of a negative number, raising out of
                             # vectorize_query. That is the search path of every
-                            # codebase sharing this database, so one consumer's
-                            # accounting drift would otherwise take searching
-                            # down for all of them.
+                            # codebase sharing this database, so a value that
+                            # slipped through would take searching down for all
+                            # of them.
                             conn.execute(
                                 "UPDATE vocabulary SET doc_freq = MAX(doc_freq + ?, 0) "
                                 "WHERE token = ?",
@@ -616,7 +673,7 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
                             )
 
                     # Update per-codebase contributions
-                    for token, freq in removed_freq.items():
+                    for token, freq in effective_removed.items():
                         conn.execute(
                             """
                             UPDATE codebase_contributions
