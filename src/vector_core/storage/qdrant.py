@@ -114,6 +114,7 @@ class QdrantStorage:
         api_key: str | None = None,
         embedding_dim: int | None = None,
         health_check_interval: float = 30.0,
+        timeout: int | None = None,
     ):
         """
         Initialize Qdrant storage.
@@ -123,22 +124,34 @@ class QdrantStorage:
             api_key: Optional API key. Default from settings.
             embedding_dim: Embedding dimension. Default from settings.
             health_check_interval: Seconds between health checks. Default 30s.
+            timeout: Per-request transport timeout in seconds applied to every
+                Qdrant call. Default from settings (`qdrant_operation_timeout`).
         """
         self.url = url or settings.qdrant_url
         self.api_key = api_key or settings.qdrant_api_key
         self.embedding_dim = embedding_dim or settings.embedding_dim
+        self.timeout = timeout or settings.qdrant_operation_timeout
         self._client: AsyncQdrantClient | None = None
         self._health_check_interval = health_check_interval
         self._last_health_check: float = 0.0
         self._healthy = False
 
+    def _new_client(self) -> AsyncQdrantClient:
+        """Build a client carrying the configured transport timeout.
+
+        Both the initial connect and the reconnect path go through here so the
+        timeout cannot be applied to one and forgotten on the other.
+        """
+        return AsyncQdrantClient(
+            url=self.url,
+            api_key=self.api_key,
+            timeout=self.timeout,
+        )
+
     async def _get_client(self) -> AsyncQdrantClient:
         """Get or create Qdrant client with periodic health checking."""
         if self._client is None:
-            self._client = AsyncQdrantClient(
-                url=self.url,
-                api_key=self.api_key,
-            )
+            self._client = self._new_client()
             self._healthy = False
             self._last_health_check = 0.0
 
@@ -166,10 +179,7 @@ class QdrantStorage:
         self._last_health_check = 0.0
 
         # Create new client
-        self._client = AsyncQdrantClient(
-            url=self.url,
-            api_key=self.api_key,
-        )
+        self._client = self._new_client()
 
     async def check_health(self, timeout: float = 5.0) -> bool:
         """

@@ -52,8 +52,12 @@ class VectorCoreSettings(BaseSettings):
     rrf_prefetch_limit: int = 50
 
     # Timeouts (seconds)
+    # search_timeout and qdrant_operation_timeout nest: the latter is the
+    # transport bound every Qdrant request is subject to, while the former is
+    # an asyncio budget for a whole search and must stay under it to be the
+    # binding limit.
     search_timeout: int = 30  # Hybrid search operations
-    qdrant_operation_timeout: int = 60  # Bulk upsert/delete operations
+    qdrant_operation_timeout: int = 60  # Transport timeout for any Qdrant request
     file_lock_timeout: float = 10.0  # File locking timeout
 
     # Limits
