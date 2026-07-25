@@ -12,6 +12,7 @@ from qdrant_client.models import (
 )
 
 from vector_core.embeddings.sparse import SparseVector
+from vector_core.settings import settings
 from vector_core.storage.qdrant import (
     QdrantConnectionError,
     QdrantStorage,
@@ -37,6 +38,63 @@ class TestQdrantStorageInit:
         assert storage.url == "http://custom:6333"
         assert storage.api_key == "secret"
         assert storage.embedding_dim == 384
+
+    def test_timeout_defaults_to_configured_operation_timeout(self):
+        """Storage adopts the configured Qdrant operation timeout by default."""
+        storage = QdrantStorage()
+        assert storage.timeout == settings.qdrant_operation_timeout
+
+    def test_custom_timeout(self):
+        """Storage accepts an explicit transport timeout."""
+        storage = QdrantStorage(timeout=17)
+        assert storage.timeout == 17
+
+
+class TestClientTransportTimeout:
+    """The configured timeout must reach the client on every construction path.
+
+    Without it qdrant-client falls back to its own 5s default, which silently
+    caps every request well below the configured budget.
+    """
+
+    @pytest.mark.asyncio
+    async def test_initial_connect_applies_timeout(self):
+        """The lazily-built client carries the configured timeout."""
+        storage = QdrantStorage(url="http://custom:6333", timeout=42)
+
+        with patch(
+            "vector_core.storage.qdrant.AsyncQdrantClient"
+        ) as mock_cls, patch.object(
+            storage, "check_health", AsyncMock(return_value=True)
+        ):
+            await storage._get_client()
+
+        assert mock_cls.call_args.kwargs["timeout"] == 42
+
+    @pytest.mark.asyncio
+    async def test_reconnect_applies_timeout(self):
+        """A reconnect must not silently drop back to the library default.
+
+        The original defect was exactly this kind of asymmetry: one
+        construction path configured, a second one forgotten.
+        """
+        storage = QdrantStorage(url="http://custom:6333", timeout=42)
+        storage._client = AsyncMock()
+
+        with patch("vector_core.storage.qdrant.AsyncQdrantClient") as mock_cls:
+            await storage._reconnect()
+
+        assert mock_cls.call_args.kwargs["timeout"] == 42
+
+    def test_timeout_is_honoured_by_qdrant_client(self):
+        """The value survives into the real client rather than being ignored.
+
+        Guards against the parameter being accepted but dropped: constructing
+        AsyncQdrantClient performs no I/O, so this stays a unit test.
+        """
+        storage = QdrantStorage(url="http://localhost:6333", timeout=42)
+        client = storage._new_client()
+        assert client._client._timeout == 42
 
 
 class TestCollectionManagement:
@@ -748,6 +806,7 @@ class TestClientCreation:
             mock_class.assert_called_once_with(
                 url="http://localhost:6333",
                 api_key="test_key",
+                timeout=settings.qdrant_operation_timeout,
             )
 
 

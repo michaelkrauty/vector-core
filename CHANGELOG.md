@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.4.0] - 2026-07-25
+
+### Fixed
+
+- **Every Qdrant request now carries the configured `qdrant_operation_timeout` instead of silently falling back to qdrant-client's five second default.** `QdrantStorage` constructed its client without a `timeout`, so the transport abandoned any request that took longer than five seconds regardless of how the setting was configured. The cost fell on exactly the operations the setting was introduced to cover, the ones whose duration scales with the size of the working set: a delete filtered on many payload values, or a bulk upsert of a large batch, exceeded five seconds and raised `ResponseHandlingException(ReadTimeout(''))`. That exception's message is empty, so a caller reported a failure that named neither a timeout nor a duration, and the setting appeared to be in force the whole time because it was declared, documented as covering bulk operations, and validated — only never read on the path that builds the client.
+- **The `asyncio.timeout(qdrant_operation_timeout)` guard around `upsert_batch` is reachable again.** The guard budgeted sixty seconds for a batch while every attempt inside it was capped at the transport's five, so a Qdrant that was healthy but merely slow failed each attempt, exhausted its retry backoff, and surfaced the transport error without the budget ever binding. Both now derive from one value, so the guard bounds the operation as its message has always claimed.
+
+### Changed
+
+- `QdrantStorage` accepts an explicit `timeout` argument, defaulting to `qdrant_operation_timeout`. The initial-connect and reconnect paths now build the client through a single helper, so a timeout can no longer be applied to one path and forgotten on the other — the asymmetry that produced this defect.
+
+### Upgrade notes
+
+A request that previously failed after five seconds now has until `qdrant_operation_timeout` (default 60) to finish, so a saturated or slow Qdrant presents as a slower call rather than an immediate error with an empty message. The tighter bounds above it are unchanged and still bind first: `check_health` keeps its own five second `asyncio` limit, and hybrid search stays bounded by `search_timeout` (default 30). A deployment that relied on the old five second transport cap as a de facto liveness signal should set `VECTOR_QDRANT_OPERATION_TIMEOUT` explicitly.
+
 ## [1.3.1] - 2026-07-24
 
 ### Fixed
