@@ -106,7 +106,7 @@ All settings are configured via environment variables prefixed with `VECTOR_`. M
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `VECTOR_SEARCH_TIMEOUT` | `30` | Timeout in seconds for hybrid search operations |
-| `VECTOR_QDRANT_OPERATION_TIMEOUT` | `60` | Timeout in seconds for bulk upsert/delete operations |
+| `VECTOR_QDRANT_OPERATION_TIMEOUT` | `60` | Transport timeout in seconds applied to every Qdrant request. Bounds above it bind first: health checks use their own 5s limit, and hybrid search uses `VECTOR_SEARCH_TIMEOUT` |
 | `VECTOR_FILE_LOCK_TIMEOUT` | `10.0` | Timeout in seconds for file locking |
 
 ### Limits & Tuning
