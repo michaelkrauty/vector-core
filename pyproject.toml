@@ -1,6 +1,6 @@
 [project]
 name = "vector-core"
-version = "1.4.0"
+version = "1.4.1"
 description = "Shared vector search infrastructure for MCP servers"
 readme = "README.md"
 license = "Apache-2.0"
@@ -20,7 +20,12 @@ dependencies = [
 Homepage = "https://github.com/michaelkrauty/vector-core"
 Repository = "https://github.com/michaelkrauty/vector-core"
 
-[project.optional-dependencies]
+# A dependency group rather than an extra: `uv sync` installs it by default,
+# so `uv run pytest` finds pytest in the project environment. As an extra it
+# was omitted unless `--extra dev` was passed, and uv then fell through to
+# whatever pytest was on PATH, which runs the suite against a different
+# interpreter and a different installed package set than the project pins.
+[dependency-groups]
 dev = [
     "mcp>=1.0",
     "pytest>=8.0.0",

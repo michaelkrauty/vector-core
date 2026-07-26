@@ -37,7 +37,16 @@ Or clone and install in editable mode for development:
 ```bash
 git clone https://github.com/michaelkrauty/vector-core.git
 cd vector-core
-pip install -e ".[dev]"
+uv sync
+```
+
+`uv sync` installs the `dev` dependency group, so `uv run pytest` runs the
+suite against this checkout. With pip, development tooling lives in a
+[PEP 735](https://peps.python.org/pep-0735/) dependency group rather than an
+extra:
+
+```bash
+pip install -e . --group dev   # pip 25.1+
 ```
 
 For use as a local dependency in another project (e.g., with uv):

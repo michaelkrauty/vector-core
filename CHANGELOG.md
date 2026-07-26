@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.4.1] - 2026-07-25
+
+### Changed
+
+- **Development dependencies moved from an extra to a PEP 735 dependency group.** `uv sync` installs a dependency group by default but skips an extra unless it is named, so the project environment was left without pytest and `uv run pytest` silently fell through to whatever pytest was on `PATH`. That interpreter brought its own installed `vector-core`, meaning the suite could report on a copy of the library other than the checkout under test. Running `uv sync` followed by `uv run pytest` now tests this working tree.
+
+  Contributors installing with pip need `pip install -e . --group dev` (pip 25.1+) instead of `pip install -e ".[dev]"`; the README covers both. Deployments that want a lean environment can pass `uv sync --no-default-groups`.
+
 ## [1.4.0] - 2026-07-25
 
 ### Fixed
