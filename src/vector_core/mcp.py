@@ -7,7 +7,7 @@ import logging
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server import MCPServer
 
 logger = logging.getLogger(__name__)
 
@@ -18,18 +18,16 @@ class ToolRegistrationError(RuntimeError):
     def __init__(self, server_name: str, missing_tools: set[str]):
         self.server_name = server_name
         self.missing_tools = missing_tools
-        super().__init__(
-            f"{server_name} is missing expected tools: {sorted(missing_tools)}"
-        )
+        super().__init__(f"{server_name} is missing expected tools: {sorted(missing_tools)}")
 
 
 def _get_registered_tool_names(mcp: object) -> set[str] | None:
     """
-    Collect the names of the tools registered on a FastMCP instance.
+    Collect the names of the tools registered on an MCPServer instance.
 
-    FastMCP exposes no supported API for this, so the registry is discovered
-    defensively: the tool manager's ``list_tools()`` first, then the dict
-    layouts used by older releases.
+    MCPServer exposes no supported synchronous registry accessor, so the manager
+    is discovered defensively: the tool manager's ``list_tools()`` first, then
+    the dict layouts used by older releases.
 
     Returns:
         The registered tool names, or None if the registry could not be read at
@@ -72,12 +70,12 @@ def _get_registered_tool_names(mcp: object) -> set[str] | None:
 
 
 def verify_tools_registered(
-    mcp: "FastMCP",
+    mcp: "MCPServer",
     expected_tools: list[str],
     server_name: str,
 ) -> None:
     """
-    Verify that expected tools are registered with FastMCP instance.
+    Verify that expected tools are registered with an MCPServer instance.
 
     This catches silent failures where tool modules fail to import (e.g., due to
     import errors) and the server starts with missing functionality.
@@ -88,7 +86,7 @@ def verify_tools_registered(
         verify_tools_registered(mcp, EXPECTED_TOOLS, "myserver")
 
     Args:
-        mcp: FastMCP instance to check
+        mcp: MCPServer instance to check
         expected_tools: List of tool names that should be registered
         server_name: Server name for error messages
 
@@ -99,7 +97,7 @@ def verify_tools_registered(
     if registered is None:
         logger.warning(
             f"Cannot verify tools for {server_name}: "
-            "FastMCP tool registry not accessible. "
+            "MCPServer tool registry not accessible. "
             "Tool registration verification skipped."
         )
         return
@@ -113,21 +111,17 @@ def verify_tools_registered(
     # Also log any unexpected tools (informational only)
     extra = registered - expected
     if extra:
-        logger.info(
-            f"{server_name} has additional tools not in expected list: {sorted(extra)}"
-        )
+        logger.info(f"{server_name} has additional tools not in expected list: {sorted(extra)}")
 
-    logger.info(
-        f"{server_name} tool verification passed: {len(registered)} tools registered"
-    )
+    logger.info(f"{server_name} tool verification passed: {len(registered)} tools registered")
 
 
-def log_registered_tools(mcp: "FastMCP", server_name: str) -> list[str]:
+def log_registered_tools(mcp: "MCPServer", server_name: str) -> list[str]:
     """
     Log all registered tools for debugging.
 
     Args:
-        mcp: FastMCP instance
+        mcp: MCPServer instance
         server_name: Server name for log messages
 
     Returns:

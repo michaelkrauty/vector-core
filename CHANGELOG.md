@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.4.2] - 2026-08-20
+
+### Fixed
+
+- **MCP tool registration verification now supports the stable MCP Python SDK v2 API.** The development dependency allowed any SDK version but the tests and type annotations imported `mcp.server.fastmcp.FastMCP`, which SDK v2 removed in favor of `mcp.server.MCPServer`. A clean `uv sync` therefore resolved SDK v2 and failed during test collection before exercising the library. The MCP dependency groups now require the v2 line, and the helper and its real-server tests use `MCPServer` while retaining the defensive registry fallbacks for layout changes.
+
 ## [1.4.1] - 2026-07-25
 
 ### Changed
