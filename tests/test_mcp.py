@@ -1,7 +1,7 @@
 import logging
 
 import pytest
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
 from vector_core.mcp import (
     ToolRegistrationError,
@@ -11,8 +11,8 @@ from vector_core.mcp import (
 )
 
 
-def test_log_registered_tools_discovers_tools_from_real_fastmcp() -> None:
-    mcp = FastMCP("test-server")
+def test_log_registered_tools_discovers_tools_from_real_mcp_server() -> None:
+    mcp = MCPServer("test-server")
 
     @mcp.tool()
     def first_tool() -> str:
@@ -31,11 +31,11 @@ def test_log_registered_tools_discovers_tools_from_real_fastmcp() -> None:
 
 
 def test_get_registered_tool_names_distinguishes_empty_registry() -> None:
-    assert _get_registered_tool_names(FastMCP("empty-server")) == set()
+    assert _get_registered_tool_names(MCPServer("empty-server")) == set()
 
 
 def test_verify_tools_registered_raises_for_missing_tool() -> None:
-    mcp = FastMCP("test-server")
+    mcp = MCPServer("test-server")
 
     @mcp.tool()
     def registered_tool() -> str:
