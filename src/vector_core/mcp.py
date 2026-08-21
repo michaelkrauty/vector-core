@@ -25,9 +25,9 @@ def _get_registered_tool_names(mcp: object) -> set[str] | None:
     """
     Collect the names of the tools registered on an MCPServer instance.
 
-    MCPServer exposes no supported registry accessor, so the manager is discovered
-    defensively: the tool manager's ``list_tools()`` first, then the dict
-    layouts used by older releases.
+    MCPServer exposes no supported synchronous registry accessor, so the manager
+    is discovered defensively: the tool manager's ``list_tools()`` first, then
+    the dict layouts used by older releases.
 
     Returns:
         The registered tool names, or None if the registry could not be read at
