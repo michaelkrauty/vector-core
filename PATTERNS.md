@@ -155,14 +155,13 @@ async def _get_client(self):
     ...
 ```
 
-### Stale Lock Detection (utils/locking.py)
+### Stable Lock Inodes (utils/locking.py)
 
-Lock files older than 1 hour are automatically broken:
+Lock files are permanent, empty inode anchors. `flock` is released when a descriptor closes, including after process death, so pathname age does not indicate a stale lock. Never unlink a lock file: a waiter may already have opened that inode, and deleting the pathname would let a new arrival lock a replacement inode concurrently.
 
 ```python
 from vector_core.utils.locking import file_lock, async_file_lock
 
-# Stale locks auto-detected and removed
 with file_lock(path, timeout=10.0):
     process(path)
 

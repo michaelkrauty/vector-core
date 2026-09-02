@@ -10,11 +10,11 @@ from unittest.mock import patch
 import pytest
 
 from vector_core.utils.locking import (
+    LockManager,
+    _is_lock_stale,
     async_file_lock,
     cleanup_stale_locks,
     file_lock,
-    LockManager,
-    _is_lock_stale,
 )
 
 
@@ -159,8 +159,8 @@ class TestCleanupStaleLocks:
         lock_dir = tmp_path / "nonexistent_locks"
         assert cleanup_stale_locks(lock_dir) == 0
 
-    def test_cleanup_removes_stale_locks(self, tmp_path: Path):
-        """Removes lock files older than 1 hour."""
+    def test_cleanup_retains_stale_locks(self, tmp_path: Path):
+        """Retains old lock files as stable inode anchors."""
         lock_dir = tmp_path / "locks"
         lock_dir.mkdir(parents=True)
 
@@ -177,12 +177,12 @@ class TestCleanupStaleLocks:
         # Run cleanup
         removed = cleanup_stale_locks(lock_dir)
 
-        assert removed == 1
-        assert not stale_lock.exists()
+        assert removed == 0
+        assert stale_lock.exists()
         assert fresh_lock.exists()
 
     def test_cleanup_handles_permission_error(self, tmp_path: Path):
-        """Handles errors when unable to remove lock file."""
+        """Does not attempt to unlink lock files."""
         lock_dir = tmp_path / "locks"
         lock_dir.mkdir(parents=True)
 
@@ -192,15 +192,16 @@ class TestCleanupStaleLocks:
         old_time = time.time() - 7200
         os.utime(stale_lock, (old_time, old_time))
 
-        # Mock unlink to fail
+        # Any unlink attempt would fail the test.
         with patch.object(Path, "unlink", side_effect=PermissionError("Cannot delete")):
             removed = cleanup_stale_locks(lock_dir)
 
         # Should handle error gracefully and return 0
         assert removed == 0
+        assert stale_lock.exists()
 
-    def test_cleanup_ignores_non_lock_files(self, tmp_path: Path):
-        """Only removes .lock files, ignores others."""
+    def test_cleanup_leaves_all_files(self, tmp_path: Path):
+        """Leaves lock and non-lock files untouched."""
         lock_dir = tmp_path / "locks"
         lock_dir.mkdir(parents=True)
 
@@ -216,8 +217,8 @@ class TestCleanupStaleLocks:
 
         removed = cleanup_stale_locks(lock_dir)
 
-        assert removed == 1
-        assert not lock_file.exists()
+        assert removed == 0
+        assert lock_file.exists()
         assert other_file.exists()  # Should not be touched
 
 
@@ -258,7 +259,7 @@ class TestLockManager:
 
     @pytest.mark.asyncio
     async def test_cleanup_stale_locks(self, tmp_path: Path):
-        """Manager can clean up stale locks."""
+        """Manager retains stale-looking lock files."""
         lock_dir = tmp_path / "locks"
         lock_dir.mkdir(parents=True)
         manager = LockManager(lock_dir=lock_dir)
@@ -270,11 +271,11 @@ class TestLockManager:
         os.utime(stale_lock, (old_time, old_time))
 
         removed = manager.cleanup()
-        assert removed == 1
-        assert not stale_lock.exists()
+        assert removed == 0
+        assert stale_lock.exists()
 
     def test_force_cleanup_all_locks(self, tmp_path: Path):
-        """Force cleanup removes all locks regardless of age."""
+        """Force cleanup cannot remove stable lock inode anchors."""
         lock_dir = tmp_path / "locks"
         lock_dir.mkdir(parents=True)
         manager = LockManager(lock_dir=lock_dir)
@@ -284,5 +285,5 @@ class TestLockManager:
         fresh_lock.touch()
 
         removed = manager.cleanup(force=True)
-        assert removed == 1
-        assert not fresh_lock.exists()
+        assert removed == 0
+        assert fresh_lock.exists()
