@@ -12,7 +12,7 @@ Provides:
 - Hash registry for document tracking
 """
 
-__version__ = "1.4.2"
+__version__ = "1.4.3"
 
 # Main exports for convenience
 from vector_core.embeddings.cache import EmbeddingCache

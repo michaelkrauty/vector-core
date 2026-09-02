@@ -44,12 +44,12 @@ from vector_core.settings import settings
 
 logger = logging.getLogger(__name__)
 
-# Stale lock threshold (1 hour) - locks older than this are considered abandoned
+# Legacy age threshold retained for compatibility. Age never permits deletion.
 STALE_LOCK_SECONDS = 3600.0
 
 
 def _is_lock_stale(lock_path: Path, max_age: float = STALE_LOCK_SECONDS) -> bool:
-    """Check if a lock file is stale (older than max_age seconds)."""
+    """Report whether a lock file exceeds the legacy age threshold."""
     try:
         if not lock_path.exists():
             return False
@@ -61,50 +61,18 @@ def _is_lock_stale(lock_path: Path, max_age: float = STALE_LOCK_SECONDS) -> bool
 
 
 def _break_stale_lock(lock_path: Path, max_age: float = STALE_LOCK_SECONDS) -> bool:
+    """Retain a lock file as the stable inode for its lock namespace.
+
+    An unlocked inode is not stale: the kernel releases ``flock`` when the last
+    owning descriptor closes. Deleting the pathname is unsafe even after a
+    successful non-blocking lock, because another process may already have
+    opened that inode but not attempted ``flock`` yet. It could later lock the
+    unlinked inode while a new arrival locks a replacement inode.
+
+    Kept as a no-op for compatibility with callers of this private helper.
     """
-    Remove a stale lock file if it exceeds max_age.
-
-    Uses atomic acquire-then-delete to prevent TOCTOU race conditions:
-    1. Check if lock appears stale (file is old)
-    2. Try to acquire the lock atomically (non-blocking)
-    3. If acquired, the lock is truly abandoned - safe to delete
-    4. If blocked, another process holds it - not actually stale
-
-    Returns True if a stale lock was removed, False otherwise.
-    """
-    if not _is_lock_stale(lock_path, max_age):
-        return False
-
-    try:
-        # Open the lock file for atomic flock acquisition
-        fd = os.open(str(lock_path), os.O_RDWR)
-        try:
-            # Non-blocking acquire - if this succeeds, no one holds the lock
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            # We now hold the lock - it's truly abandoned, safe to delete
-            try:
-                lock_path.unlink()
-                logger.warning(f"Removed stale lock file: {lock_path} (age > {max_age}s)")
-                return True
-            except OSError as e:
-                logger.debug(f"Could not remove stale lock {lock_path}: {e}")
-                return False
-            finally:
-                # Release the lock before closing fd
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-                except OSError:
-                    pass
-        except BlockingIOError:
-            # Lock is actively held by another process - not actually stale
-            # This prevents the race condition where we delete an active lock
-            logger.debug(f"Lock {lock_path} appears stale but is held by another process")
-            return False
-        finally:
-            os.close(fd)
-    except OSError as e:
-        logger.debug(f"Could not check stale lock {lock_path}: {e}")
-        return False
+    _ = lock_path, max_age
+    return False
 
 
 @contextmanager
@@ -139,9 +107,6 @@ def file_lock(
     lock_path = path.with_suffix(path.suffix + ".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Check for and break stale locks before trying to acquire
-    _break_stale_lock(lock_path)
-
     start = time.monotonic()
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
 
@@ -154,7 +119,7 @@ def file_lock(
                 if time.monotonic() - start > timeout:
                     raise TimeoutError(
                         f"Could not acquire lock on {path} within {timeout}s"
-                    )
+                    ) from None
                 time.sleep(0.05)  # Brief sleep before retry
 
         logger.debug(f"Acquired lock on {lock_path}")
@@ -165,11 +130,6 @@ def file_lock(
             logger.debug(f"Released lock on {lock_path}")
     finally:
         os.close(fd)
-        # Clean up lock file (best effort)
-        try:
-            lock_path.unlink(missing_ok=True)
-        except OSError:
-            pass  # Ignore cleanup failures
 
 
 @asynccontextmanager
@@ -203,9 +163,6 @@ async def async_file_lock(
     lock_dir.mkdir(parents=True, exist_ok=True)
     lock_path = lock_dir / f"{name}.lock"
 
-    # Check for and break stale locks before trying to acquire
-    _break_stale_lock(lock_path)
-
     loop = asyncio.get_running_loop()
     fd: int | None = None
 
@@ -214,6 +171,7 @@ async def async_file_lock(
         fd = await loop.run_in_executor(
             None, lambda: os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
         )
+        assert fd is not None
 
         start_time = loop.time()
 
@@ -236,11 +194,6 @@ async def async_file_lock(
         if fd is not None:
             try:
                 os.close(fd)
-            except OSError:
-                pass
-            # Clean up lock file (best effort)
-            try:
-                lock_path.unlink(missing_ok=True)
             except OSError:
                 pass
 
@@ -290,9 +243,7 @@ class LockManager:
         self._lock = asyncio.Lock()
 
     @asynccontextmanager
-    async def acquire(
-        self, name: str, timeout: float = 60.0
-    ) -> AsyncIterator[None]:
+    async def acquire(self, name: str, timeout: float = 60.0) -> AsyncIterator[None]:
         """
         Acquire named lock and track it.
 
@@ -319,59 +270,21 @@ class LockManager:
             return name in self._active_locks
 
     def cleanup(self, force: bool = False) -> int:
+        """Retain every lock file and return zero.
+
+        ``force`` is accepted for API compatibility but cannot make pathname
+        deletion safe while another process may have the inode open.
         """
-        Clean up stale lock files in lock directory.
-
-        By default, only removes locks older than STALE_LOCK_SECONDS (1 hour).
-        Use force=True to remove all locks (e.g., on known clean startup).
-
-        Args:
-            force: If True, remove all locks regardless of age
-
-        Returns:
-            Number of lock files removed
-        """
-        removed = 0
-        try:
-            if self._lock_dir.exists():
-                for lock_file in self._lock_dir.glob("*.lock"):
-                    try:
-                        if force or _is_lock_stale(lock_file):
-                            lock_file.unlink()
-                            removed += 1
-                            if not force:
-                                logger.info(f"Cleaned up stale lock: {lock_file}")
-                    except OSError:
-                        pass
-        except OSError:
-            pass
-        return removed
+        _ = force
+        return 0
 
 
 def cleanup_stale_locks(lock_dir: Path | None = None) -> int:
+    """Retain every lock file and return zero.
+
+    The argument and return value remain for compatibility. Lock files are
+    empty, bounded by the number of lock names used, and must keep a stable
+    inode to preserve mutual exclusion.
     """
-    Convenience function to clean up stale lock files.
-
-    Removes lock files older than STALE_LOCK_SECONDS (1 hour).
-
-    Args:
-        lock_dir: Directory containing lock files (default: settings.cache_dir / "locks")
-
-    Returns:
-        Number of stale lock files removed
-    """
-    lock_dir = lock_dir or (settings.cache_dir / "locks")
-    removed = 0
-    try:
-        if lock_dir.exists():
-            for lock_file in lock_dir.glob("*.lock"):
-                try:
-                    if _is_lock_stale(lock_file):
-                        lock_file.unlink()
-                        removed += 1
-                        logger.info(f"Cleaned up stale lock: {lock_file}")
-                except OSError:
-                    pass
-    except OSError:
-        pass
-    return removed
+    _ = lock_dir
+    return 0

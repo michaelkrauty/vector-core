@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.4.3] - 2026-09-01
+
+### Fixed
+
+- **File locks now retain a stable inode for the lifetime of their lock namespace.** The synchronous and asynchronous context managers unlinked the lock pathname after releasing it, so a waiter that had already opened the old inode could later acquire it while a new arrival acquired a replacement inode. Both then entered the protected section concurrently. Normal release, age-based stale cleanup, and forced cleanup now leave the empty lock file in place; `flock` itself is released automatically when descriptors close, including after process death. The cleanup APIs remain callable for compatibility and return zero.
+
 ## [1.4.2] - 2026-08-20
 
 ### Fixed
