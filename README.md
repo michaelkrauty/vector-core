@@ -9,6 +9,8 @@ Shared vector search infrastructure for MCP servers. Provides dense and sparse e
 - **Hybrid search** combining dense + sparse results with RRF (Reciprocal Rank Fusion)
 - **Qdrant vector storage** with health checks and automatic reconnection
 - **Persistent SQLite-backed embedding cache** to avoid redundant API calls
+- **Cross-process embedding request limits** to protect a shared backend
+- **Recoverable sparse indices** through the append-only global vocabulary
 - **File discovery and change detection** with nested `.gitignore` / `.git/info/exclude`-aware path filtering (plus configurable extra ignore files)
 - **Glossary subsystem** -- shared term definitions stored in SQLite and indexed in Qdrant
 - **Facts subsystem** -- knowledge graph storage with subject-predicate-object triples and source integrity tracking
@@ -79,6 +81,16 @@ All settings are configured via environment variables prefixed with `VECTOR_`. M
 | `VECTOR_EMBEDDING_CONCURRENCY` | `2` | Max concurrent embedding API requests |
 | `VECTOR_EMBEDDING_TIMEOUT` | `120` | Timeout in seconds for embedding API requests |
 | `VECTOR_EMBEDDING_MAX_TEXT_CHARS` | `8000` | Max characters before text truncation |
+| `VECTOR_EMBEDDING_CACHE_NAMESPACE` | `None` | Stable model/deployment identity. Setting a non-empty value opts `embed_all()` into persistent reuse; leave unset to disable it |
+| `VECTOR_EMBEDDING_GLOBAL_CONCURRENCY` | `0` | Max embedding HTTP attempts across all local processes sharing an endpoint/model. `0` disables cross-process limiting |
+
+All processes using the same endpoint, model, and cache directory must use the
+same nonzero `VECTOR_EMBEDDING_GLOBAL_CONCURRENCY` value. During a rolling
+configuration change, mixed capacities make the effective limit the largest
+capacity any process can see; once an enabled scope has created its capacity
+manifest, later clients with a different nonzero value fail fast. A process set
+to `0` deliberately opts out and cannot be constrained by other clients. Stop every process
+using that backend and remove the scope's limiter directory before changing it.
 
 ### Cache
 
@@ -150,6 +162,26 @@ vectors = await client.embed_batch(["hello world", "vector search"])
 vector = await client.embed_single("hello world")
 ```
 
+Persistent reuse applies to `embed_all()` indexing workloads and is deliberately
+opt-in. Configure an immutable model-artifact/deployment fingerprint as the
+namespace, change it whenever weights or serving behavior change, and configure
+the output dimension so reads can begin on the first call. Reusing a namespace
+across different weights is unsupported because the OpenAI embeddings API does
+not expose a standard model-revision fingerprint:
+
+```bash
+export VECTOR_EMBEDDING_CACHE_NAMESPACE="model-artifact-sha256:0123456789abcdef..."
+export VECTOR_EMBEDDING_DIM=1024
+export VECTOR_EMBEDDING_GLOBAL_CONCURRENCY=4
+```
+
+Keys include the namespace, API endpoint, model name, output dimension, cache schema,
+preprocessing version, and hash of the post-truncation input. Values are stored
+as binary float32 vectors. If the configured dimension is `0`, the first request
+infers it and populates the cache; later calls can read it. Cache I/O errors fail
+open and do not prevent embedding requests. The global limit covers only active
+HTTP attempts, not cache hits or retry backoff.
+
 ### Hybrid search
 
 ```python
@@ -161,6 +193,24 @@ results = await searcher.search(
     limit=10,
 )
 ```
+
+### Sparse index recovery
+
+Persisted sparse indices can be inspected through the append-only global
+vocabulary without guessing:
+
+```python
+tokens = vocabulary.get_tokens_by_indices(sparse_vector.indices)
+```
+
+The method raises `KeyError` if any requested index is absent. The low-level
+`file_lock()` and `async_file_lock()` helpers also accept `shared=True` for
+cross-process reader locks; exclusive locking remains the default.
+
+Large recovery jobs can call `register_codebase_frequencies()` with an
+already-aggregated token-to-document-frequency mapping instead of retaining one
+token set per document. `rebuild_aggregate_doc_frequencies()` restores global
+frequencies from all recorded codebase contributions without changing token IDs.
 
 ### Glossary
 

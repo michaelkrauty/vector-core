@@ -3,12 +3,14 @@
 import asyncio
 import fcntl
 import os
+import threading
 import time
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+from vector_core.utils import locking as locking_module
 from vector_core.utils.locking import (
     LockManager,
     _is_lock_stale,
@@ -150,6 +152,74 @@ class TestAsyncFileLock:
         # Should have retried
         assert len(attempts) == 3
 
+    @pytest.mark.asyncio
+    async def test_repeated_cancellation_cannot_strand_or_reuse_fd(self, tmp_path: Path):
+        """A cancelled waiter closes only its own descriptor and leaves the lock usable."""
+        lock_dir = tmp_path / "locks"
+        release = asyncio.Event()
+
+        async def holder() -> None:
+            async with async_file_lock("cancel", lock_dir=lock_dir):
+                await release.wait()
+
+        held = asyncio.create_task(holder())
+        await asyncio.sleep(0.05)
+        waiter = asyncio.create_task(async_file_lock("cancel", lock_dir=lock_dir).__aenter__())
+        await asyncio.sleep(0.05)
+        waiter.cancel()
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+
+        release.set()
+        await held
+        async with async_file_lock("cancel", timeout=0.5, lock_dir=lock_dir):
+            pass
+
+    @pytest.mark.asyncio
+    async def test_open_error_after_cancellation_preserves_cancelled_error(self, tmp_path: Path):
+        started = threading.Event()
+        release = threading.Event()
+
+        def fail_open(*_args):
+            started.set()
+            release.wait(timeout=2.0)
+            raise OSError("late open failure")
+
+        with patch.object(locking_module.os, "open", side_effect=fail_open):
+            context = async_file_lock("late-open", lock_dir=tmp_path)
+            task = asyncio.create_task(context.__aenter__())
+            assert await asyncio.to_thread(started.wait, 1.0)
+            task.cancel()
+            release.set()
+            with pytest.raises(asyncio.CancelledError) as exc_info:
+                await task
+
+        assert isinstance(exc_info.value.__cause__, OSError)
+
+    @pytest.mark.asyncio
+    async def test_flock_error_after_cancellation_preserves_cancelled_error(self, tmp_path: Path):
+        started = threading.Event()
+        release = threading.Event()
+
+        def fail_lock(*_args):
+            started.set()
+            release.wait(timeout=2.0)
+            raise OSError("late flock failure")
+
+        with patch.object(locking_module, "_try_lock", side_effect=fail_lock):
+            context = async_file_lock("late-flock", lock_dir=tmp_path)
+            task = asyncio.create_task(context.__aenter__())
+            assert await asyncio.to_thread(started.wait, 1.0)
+            task.cancel()
+            release.set()
+            with pytest.raises(asyncio.CancelledError) as exc_info:
+                await task
+
+        assert isinstance(exc_info.value.__cause__, OSError)
+        async with async_file_lock("late-flock", timeout=0.5, lock_dir=tmp_path):
+            pass
+
 
 class TestCleanupStaleLocks:
     """Tests for cleanup_stale_locks function."""
@@ -287,3 +357,106 @@ class TestLockManager:
         removed = manager.cleanup(force=True)
         assert removed == 0
         assert fresh_lock.exists()
+
+
+class TestSharedLocks:
+    """Tests for optional shared/read lock acquisition."""
+
+    def test_sync_shared_locks_coexist_and_block_exclusive(self, tmp_path: Path):
+        """Readers may overlap, while a writer waits for every reader."""
+        target = tmp_path / "resource"
+        with file_lock(target, timeout=1.0, shared=True):
+            with file_lock(target, timeout=1.0, shared=True):
+                with pytest.raises(TimeoutError):
+                    with file_lock(target, timeout=0.1):
+                        pass
+
+        with file_lock(target, timeout=1.0):
+            pass
+
+    @pytest.mark.asyncio
+    async def test_async_shared_locks_coexist_and_block_exclusive(self, tmp_path: Path):
+        """Async readers overlap and an exclusive waiter enters after release."""
+        lock_dir = tmp_path / "locks"
+        acquired = asyncio.Event()
+
+        async def writer() -> None:
+            async with async_file_lock("rw", lock_dir=lock_dir):
+                acquired.set()
+
+        async with async_file_lock("rw", lock_dir=lock_dir, shared=True):
+            async with async_file_lock("rw", lock_dir=lock_dir, shared=True):
+                task = asyncio.create_task(writer())
+                await asyncio.sleep(0.15)
+                assert not acquired.is_set()
+
+        await asyncio.wait_for(task, timeout=1.0)
+        assert acquired.is_set()
+
+
+class TestForkSafety:
+    @pytest.mark.parametrize("shared", [False, True])
+    def test_child_unwind_does_not_unlock_parent_sync(self, tmp_path: Path, shared: bool) -> None:
+        target = tmp_path / "fork-sync"
+        context = file_lock(target, timeout=1.0, shared=shared)
+        context.__enter__()
+        child = os.fork()
+        if child == 0:
+            context.__exit__(None, None, None)
+            probe = os.open(tmp_path / "child-probe-sync", os.O_CREAT | os.O_RDWR, 0o600)
+            os.fstat(probe)
+            os.close(probe)
+            os._exit(0)
+
+        try:
+            _pid, status = os.waitpid(child, 0)
+            assert os.waitstatus_to_exitcode(status) == 0
+            with pytest.raises(TimeoutError):
+                with file_lock(target, timeout=0.1):
+                    pass
+        finally:
+            context.__exit__(None, None, None)
+
+        with file_lock(target, timeout=0.5):
+            pass
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("shared", [False, True])
+    async def test_child_unwind_does_not_unlock_parent_async(
+        self, tmp_path: Path, shared: bool
+    ) -> None:
+        lock_dir = tmp_path / "locks"
+        context = async_file_lock(
+            "fork-async",
+            timeout=1.0,
+            lock_dir=lock_dir,
+            shared=shared,
+        )
+        await context.__aenter__()
+        child = os.fork()
+        if child == 0:
+            await context.__aexit__(None, None, None)
+            probe = os.open(tmp_path / "child-probe-async", os.O_CREAT | os.O_RDWR, 0o600)
+            os.fstat(probe)
+            os.close(probe)
+            os._exit(0)
+
+        try:
+            _pid, status = await asyncio.to_thread(os.waitpid, child, 0)
+            assert os.waitstatus_to_exitcode(status) == 0
+            with pytest.raises(TimeoutError):
+                async with async_file_lock(
+                    "fork-async",
+                    timeout=0.1,
+                    lock_dir=lock_dir,
+                ):
+                    pass
+        finally:
+            await context.__aexit__(None, None, None)
+
+        async with async_file_lock(
+            "fork-async",
+            timeout=0.5,
+            lock_dir=lock_dir,
+        ):
+            pass

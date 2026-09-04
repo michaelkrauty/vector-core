@@ -12,7 +12,7 @@ Provides:
 - Hash registry for document tracking
 """
 
-__version__ = "1.4.3"
+__version__ = "1.5.0"
 
 # Main exports for convenience
 from vector_core.embeddings.cache import EmbeddingCache
@@ -22,6 +22,7 @@ from vector_core.embeddings.client import (
     EmbeddingServiceError,
 )
 from vector_core.embeddings.global_vocab import GlobalVocabulary
+from vector_core.embeddings.limiter import GlobalRequestLimiter
 from vector_core.embeddings.sparse import SparseVector, SparseVectorizer
 from vector_core.facts import (
     FACTS_CODEBASE_ID,
@@ -174,6 +175,7 @@ __all__ = [
     "EmbeddingServiceError",
     "CircuitBreakerOpenError",
     "EmbeddingCache",
+    "GlobalRequestLimiter",
     "GlobalVocabulary",
     "SparseVectorizer",
     "SparseVector",

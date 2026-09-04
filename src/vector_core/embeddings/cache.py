@@ -1,14 +1,24 @@
 """Persistent SQLite-backed embedding cache."""
 
 import json
+import logging
+import math
+import sqlite3
+import struct
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
 from vector_core.settings import settings
+from vector_core.utils.hashing import hash_content
+from vector_core.utils.locking import file_lock
 from vector_core.utils.sqlite import SQLiteConfig, ThreadSafeSQLiteStore
+
+EMBEDDING_CACHE_SCHEMA_VERSION = "binary-f32-v1"
+EMBEDDING_PREPROCESSING_VERSION = "truncate-chars-v1"
+logger = logging.getLogger(__name__)
 
 
 class EmbeddingCache(ThreadSafeSQLiteStore):
@@ -39,7 +49,11 @@ class EmbeddingCache(ThreadSafeSQLiteStore):
         self._stats_lock = threading.Lock()  # Only protects in-memory stats dict
         self._stats = {"hits": 0, "misses": 0}
         self._ensure_parent_dir()
-        self._init_db()
+        # Several MCP processes commonly start together. Serialize PRAGMA/DDL
+        # initialization so a harmless first-use race cannot disable caching in
+        # every process except the winner.
+        with file_lock(db_path, timeout=30.0):
+            self._init_db()
 
     # Alias for backward compatibility (cache_path was the public name)
     @property
@@ -63,13 +77,197 @@ class EmbeddingCache(ThreadSafeSQLiteStore):
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_accessed_at ON embeddings(accessed_at)
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS embedding_cache_v2 (
+                cache_key TEXT PRIMARY KEY,
+                embedding BLOB NOT NULL,
+                dim INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                accessed_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_embedding_cache_v2_accessed_at
+            ON embedding_cache_v2(accessed_at)
+        """)
         conn.commit()
 
     @staticmethod
     def hash_content(text: str) -> str:
         """SHA256 hash of text content."""
-        from vector_core.utils.hashing import hash_content
         return hash_content(text)
+
+    @classmethod
+    def make_key(
+        cls,
+        text: str,
+        *,
+        namespace: str,
+        model: str,
+        dim: int,
+        preprocessing_version: str = EMBEDDING_PREPROCESSING_VERSION,
+    ) -> str:
+        """Build a model-safe key for an effective, already-preprocessed input."""
+        if not namespace:
+            raise ValueError("embedding cache namespace must be non-empty")
+        if dim <= 0:
+            raise ValueError("embedding cache dimension must be positive")
+        key_data = {
+            "cache_schema": EMBEDDING_CACHE_SCHEMA_VERSION,
+            "content_hash": cls.hash_content(text),
+            "dim": dim,
+            "model": model,
+            "namespace": namespace,
+            "preprocessing": preprocessing_version,
+        }
+        return cls.hash_content(json.dumps(key_data, sort_keys=True, separators=(",", ":")))
+
+    def get_many(
+        self,
+        cache_keys: Sequence[str],
+        *,
+        expected_dim: int,
+    ) -> dict[str, list[float]]:
+        """Read and validate many binary float32 vectors in one transaction."""
+        unique_keys = list(dict.fromkeys(cache_keys))
+        if not unique_keys:
+            return {}
+        if expected_dim <= 0:
+            raise ValueError("expected_dim must be positive")
+
+        conn = self._get_conn()
+        rows: list[tuple[str, bytes, int]] = []
+        now = datetime.now(UTC).isoformat()
+        with conn:
+            conn.execute("BEGIN")
+            # Stay below SQLite builds that retain the historical 999-variable limit.
+            for start in range(0, len(unique_keys), 900):
+                chunk = unique_keys[start : start + 900]
+                placeholders = ",".join("?" for _ in chunk)
+                rows.extend(
+                    conn.execute(
+                        "SELECT cache_key, embedding, dim FROM embedding_cache_v2 "
+                        f"WHERE cache_key IN ({placeholders})",
+                        chunk,
+                    ).fetchall()
+                )
+
+        results: dict[str, list[float]] = {}
+        invalid: list[tuple[str]] = []
+        expected_bytes = expected_dim * 4
+        for cache_key, blob, stored_dim in rows:
+            if (
+                stored_dim != expected_dim
+                or not isinstance(blob, bytes)
+                or len(blob) != expected_bytes
+            ):
+                invalid.append((cache_key,))
+                continue
+            vector = list(struct.unpack(f"<{expected_dim}f", blob))
+            if not all(math.isfinite(value) for value in vector):
+                invalid.append((cache_key,))
+                continue
+            results[cache_key] = vector
+
+        # Access timestamps and corrupt-entry cleanup are maintenance only. Do
+        # not turn a valid read into a miss if another process wins this write.
+        try:
+            with conn:
+                if invalid:
+                    conn.executemany("DELETE FROM embedding_cache_v2 WHERE cache_key = ?", invalid)
+                if results:
+                    conn.executemany(
+                        "UPDATE embedding_cache_v2 SET accessed_at = ? WHERE cache_key = ?",
+                        ((now, key) for key in results),
+                    )
+        except sqlite3.Error:
+            logger.debug("Could not update embedding cache access metadata", exc_info=True)
+
+        with self._stats_lock:
+            self._stats["hits"] += len(results)
+            self._stats["misses"] += len(unique_keys) - len(results)
+        return results
+
+    def set_many(
+        self,
+        embeddings: Mapping[str, Sequence[float]],
+        *,
+        expected_dim: int,
+    ) -> None:
+        """Validate and write many vectors as little-endian float32 atomically."""
+        if not embeddings:
+            return
+        if expected_dim <= 0:
+            raise ValueError("expected_dim must be positive")
+
+        now = datetime.now(UTC).isoformat()
+        rows: list[tuple[str, bytes, int, str, str]] = []
+        for cache_key, vector in embeddings.items():
+            if len(vector) != expected_dim or not all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(value)
+                for value in vector
+            ):
+                raise ValueError(
+                    f"invalid embedding for {cache_key}: expected {expected_dim} finite values"
+                )
+            blob = struct.pack(f"<{expected_dim}f", *vector)
+            rows.append((cache_key, blob, expected_dim, now, now))
+
+        conn = self._get_conn()
+        with conn:
+            conn.executemany(
+                """
+                INSERT INTO embedding_cache_v2
+                    (cache_key, embedding, dim, created_at, accessed_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    embedding = excluded.embedding,
+                    dim = excluded.dim,
+                    accessed_at = excluded.accessed_at
+                """,
+                rows,
+            )
+            self._maybe_evict_combined(conn)
+
+    def _maybe_evict_combined(self, conn: sqlite3.Connection) -> None:
+        """Enforce one entry limit across legacy and deployment-safe caches."""
+        legacy_count = conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+        v2_count = conn.execute("SELECT COUNT(*) FROM embedding_cache_v2").fetchone()[0]
+        if legacy_count + v2_count <= self.max_entries:
+            return
+        to_delete = max(
+            legacy_count + v2_count - self.max_entries,
+            int(self.max_entries * 0.1),
+            1,
+        )
+        # Prefer retiring legacy entries because their keys do not identify an
+        # embedding deployment. Preserve their own LRU order while doing so.
+        legacy_delete = min(legacy_count, to_delete)
+        if legacy_delete:
+            conn.execute(
+                """
+                DELETE FROM embeddings WHERE content_hash IN (
+                    SELECT content_hash FROM embeddings
+                    ORDER BY accessed_at ASC
+                    LIMIT ?
+                )
+                """,
+                (legacy_delete,),
+            )
+        v2_delete = to_delete - legacy_delete
+        if v2_delete:
+            conn.execute(
+                """
+                DELETE FROM embedding_cache_v2 WHERE cache_key IN (
+                    SELECT cache_key FROM embedding_cache_v2
+                    ORDER BY accessed_at ASC
+                    LIMIT ?
+                )
+                """,
+                (v2_delete,),
+            )
 
     def get(self, content_hash: str) -> list[float] | None:
         """
@@ -83,8 +281,7 @@ class EmbeddingCache(ThreadSafeSQLiteStore):
         """
         conn = self._get_conn()
         cursor = conn.execute(
-            "SELECT embedding FROM embeddings WHERE content_hash = ?",
-            (content_hash,)
+            "SELECT embedding FROM embeddings WHERE content_hash = ?", (content_hash,)
         )
         row = cursor.fetchone()
 
@@ -99,7 +296,7 @@ class EmbeddingCache(ThreadSafeSQLiteStore):
         # Update accessed_at for LRU
         conn.execute(
             "UPDATE embeddings SET accessed_at = ? WHERE content_hash = ?",
-            (datetime.now(UTC).isoformat(), content_hash)
+            (datetime.now(UTC).isoformat(), content_hash),
         )
         conn.commit()
 
@@ -114,10 +311,7 @@ class EmbeddingCache(ThreadSafeSQLiteStore):
         except (UnicodeDecodeError, json.JSONDecodeError):
             # Corrupted or legacy pickle entry - treat as cache miss
             # Delete the corrupted entry to allow re-caching
-            conn.execute(
-                "DELETE FROM embeddings WHERE content_hash = ?",
-                (content_hash,)
-            )
+            conn.execute("DELETE FROM embeddings WHERE content_hash = ?", (content_hash,))
             conn.commit()
             with self._stats_lock:
                 self._stats["hits"] -= 1  # Undo the hit count
@@ -141,25 +335,23 @@ class EmbeddingCache(ThreadSafeSQLiteStore):
         conn = self._get_conn()
         now = datetime.now(UTC).isoformat()
 
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO embeddings
-            (content_hash, embedding, model, dim, created_at, accessed_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                content_hash,
-                json.dumps(embedding).encode("utf-8"),  # JSON serialization (secure)
-                model or settings.embedding_model,
-                len(embedding),
-                now,
-                now,
+        with conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO embeddings
+                (content_hash, embedding, model, dim, created_at, accessed_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    content_hash,
+                    json.dumps(embedding).encode("utf-8"),  # JSON serialization (secure)
+                    model or settings.embedding_model,
+                    len(embedding),
+                    now,
+                    now,
+                ),
             )
-        )
-        conn.commit()
-
-        # Evict old entries if over limit
-        self._maybe_evict()
+            self._maybe_evict_combined(conn)
 
     def get_or_compute(
         self,
@@ -218,28 +410,19 @@ class EmbeddingCache(ThreadSafeSQLiteStore):
     def _maybe_evict(self) -> None:
         """Evict oldest entries if cache exceeds limit."""
         conn = self._get_conn()
-        cursor = conn.execute("SELECT COUNT(*) FROM embeddings")
-        count = cursor.fetchone()[0]
-
-        if count > self.max_entries:
-            # Delete oldest 10% to avoid frequent evictions
-            to_delete = max(1, int(self.max_entries * 0.1))
-            conn.execute(
-                """
-                DELETE FROM embeddings WHERE content_hash IN (
-                    SELECT content_hash FROM embeddings
-                    ORDER BY accessed_at ASC
-                    LIMIT ?
-                )
-                """,
-                (to_delete,)
-            )
-            conn.commit()
+        with conn:
+            self._maybe_evict_combined(conn)
 
     def stats(self) -> dict:
         """Get cache statistics."""
         conn = self._get_conn()
-        cursor = conn.execute("SELECT COUNT(*), SUM(LENGTH(embedding)) FROM embeddings")
+        cursor = conn.execute("""
+            SELECT COUNT(*), SUM(size) FROM (
+                SELECT LENGTH(embedding) AS size FROM embeddings
+                UNION ALL
+                SELECT LENGTH(embedding) AS size FROM embedding_cache_v2
+            )
+        """)
         row = cursor.fetchone()
         count = row[0] or 0
         size_bytes = row[1] or 0
@@ -253,17 +436,14 @@ class EmbeddingCache(ThreadSafeSQLiteStore):
             "size_mb": round(size_bytes / (1024 * 1024), 2),
             "hits": hits,
             "misses": misses,
-            "hit_rate": (
-                round(hits / (hits + misses), 3)
-                if (hits + misses) > 0
-                else 0.0
-            ),
+            "hit_rate": (round(hits / (hits + misses), 3) if (hits + misses) > 0 else 0.0),
         }
 
     def clear(self) -> None:
         """Clear all cached embeddings."""
         conn = self._get_conn()
         conn.execute("DELETE FROM embeddings")
+        conn.execute("DELETE FROM embedding_cache_v2")
         conn.commit()
         with self._stats_lock:
             self._stats = {"hits": 0, "misses": 0}

@@ -7,6 +7,7 @@ from vector_core.embeddings.client import (
     SyncEmbeddingClient,
 )
 from vector_core.embeddings.global_vocab import GlobalVocabulary
+from vector_core.embeddings.limiter import GlobalRequestLimiter
 from vector_core.embeddings.sparse import SparseVector, SparseVectorizer
 from vector_core.embeddings.tokenization import (
     DEFAULT_STOP_TOKENS,
@@ -20,6 +21,7 @@ __all__ = [
     "SyncEmbeddingClient",
     "EmbeddingServiceError",
     "EmbeddingCache",
+    "GlobalRequestLimiter",
     "SparseVectorizer",
     "SparseVector",
     "GlobalVocabulary",

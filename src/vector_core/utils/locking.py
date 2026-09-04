@@ -26,6 +26,7 @@ Usage:
 import asyncio
 import logging
 import sys
+import threading
 
 if sys.platform == "win32":
     raise ImportError(
@@ -36,16 +37,121 @@ if sys.platform == "win32":
 import fcntl
 import os
 import time
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
+from typing import TypeVar
 
 from vector_core.settings import settings
 
 logger = logging.getLogger(__name__)
+R = TypeVar("R")
+
+_held_lock_fds: set[int] = set()
+_fork_condition = threading.Condition()
+
+
+class _ForkState:
+    active_opens = 0
+    forking = False
+
+
+_fork_state = _ForkState()
+
+
+def _before_fork() -> None:
+    _fork_condition.acquire()
+    _fork_state.forking = True
+    while _fork_state.active_opens:
+        _fork_condition.wait()
+
+
+def _after_fork_parent() -> None:
+    _fork_state.forking = False
+    _fork_condition.notify_all()
+    _fork_condition.release()
+
+
+def _after_fork_child() -> None:
+    # Closing a duplicated flock descriptor preserves the parent's lock. Calling
+    # LOCK_UN here would unlock the shared open-file description for both.
+    for fd in _held_lock_fds:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    _held_lock_fds.clear()
+    _fork_state.active_opens = 0
+    _fork_state.forking = False
+    _fork_condition.notify_all()
+    _fork_condition.release()
+
+
+os.register_at_fork(
+    before=_before_fork,
+    after_in_parent=_after_fork_parent,
+    after_in_child=_after_fork_child,
+)
 
 # Legacy age threshold retained for compatibility. Age never permits deletion.
 STALE_LOCK_SECONDS = 3600.0
+
+
+async def _run_worker_uninterrupted(
+    fn: Callable[..., R],
+    *args: object,
+) -> tuple[R, asyncio.CancelledError | None]:
+    """Finish one fd-using worker before propagating task cancellation."""
+    worker = asyncio.create_task(asyncio.to_thread(fn, *args))
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(worker)
+            return result, cancellation
+        except asyncio.CancelledError as exc:
+            if worker.done():
+                if worker.cancelled():
+                    raise
+                try:
+                    return worker.result(), exc
+                except BaseException as worker_error:
+                    raise exc from worker_error
+            cancellation = exc
+        except BaseException as worker_error:
+            if cancellation is not None:
+                raise cancellation from worker_error
+            raise
+
+
+def _open_lock_fd(path: Path) -> int:
+    """Open and register a descriptor atomically with respect to fork."""
+    with _fork_condition:
+        while _fork_state.forking:
+            _fork_condition.wait()
+        _fork_state.active_opens += 1
+    fd: int | None = None
+    try:
+        fd = os.open(str(path), os.O_CREAT | os.O_RDWR)
+        return fd
+    finally:
+        with _fork_condition:
+            if fd is not None:
+                _held_lock_fds.add(fd)
+            _fork_state.active_opens -= 1
+            _fork_condition.notify_all()
+
+
+def _close_owned_lock(fd: int, owner_pid: int, *, unlock: bool) -> None:
+    """Release only in the process that acquired this context."""
+    if os.getpid() != owner_pid:
+        return
+    with _fork_condition:
+        try:
+            if unlock:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+            _held_lock_fds.discard(fd)
 
 
 def _is_lock_stale(lock_path: Path, max_age: float = STALE_LOCK_SECONDS) -> bool:
@@ -79,9 +185,11 @@ def _break_stale_lock(lock_path: Path, max_age: float = STALE_LOCK_SECONDS) -> b
 def file_lock(
     path: Path,
     timeout: float | None = None,
+    *,
+    shared: bool = False,
 ) -> Iterator[None]:
     """
-    Acquire exclusive file lock (synchronous, blocking with timeout).
+    Acquire a POSIX file lock (synchronous, blocking with timeout).
 
     Creates a .lock file adjacent to the target path. Uses POSIX flock()
     which is released automatically when the process exits or file
@@ -90,6 +198,7 @@ def file_lock(
     Args:
         path: Path to file to lock (lock file created as path.lock)
         timeout: Max seconds to wait for lock (raises TimeoutError if exceeded)
+        shared: Acquire a shared/read lock instead of an exclusive/write lock
 
     Yields:
         None (lock is held while in context)
@@ -108,12 +217,16 @@ def file_lock(
     lock_path.parent.mkdir(parents=True, exist_ok=True)
 
     start = time.monotonic()
-    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+    owner_pid = os.getpid()
+    fd = _open_lock_fd(lock_path)
+    lock_mode = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+    acquired = False
 
     try:
         while True:
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, lock_mode | fcntl.LOCK_NB)
+                acquired = True
                 break  # Lock acquired
             except BlockingIOError:
                 if time.monotonic() - start > timeout:
@@ -126,10 +239,9 @@ def file_lock(
         try:
             yield
         finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
             logger.debug(f"Released lock on {lock_path}")
     finally:
-        os.close(fd)
+        _close_owned_lock(fd, owner_pid, unlock=acquired)
 
 
 @asynccontextmanager
@@ -137,9 +249,11 @@ async def async_file_lock(
     name: str,
     timeout: float = 60.0,
     lock_dir: Path | None = None,
+    *,
+    shared: bool = False,
 ) -> AsyncIterator[None]:
     """
-    Acquire exclusive file lock (async, non-blocking with timeout).
+    Acquire a POSIX file lock (async, non-blocking with timeout).
 
     Uses thread pool executor to avoid blocking the event loop while
     waiting for lock acquisition.
@@ -148,6 +262,7 @@ async def async_file_lock(
         name: Lock name (used as filename in lock_dir)
         timeout: Max seconds to wait for lock (raises TimeoutError if exceeded)
         lock_dir: Directory for lock files (default: settings.cache_dir / "locks")
+        shared: Acquire a shared/read lock instead of an exclusive/write lock
 
     Yields:
         None (lock is held while in context)
@@ -163,45 +278,55 @@ async def async_file_lock(
     lock_dir.mkdir(parents=True, exist_ok=True)
     lock_path = lock_dir / f"{name}.lock"
 
-    loop = asyncio.get_running_loop()
     fd: int | None = None
+    owner_pid = os.getpid()
+    acquired = False
 
     try:
-        # Open lock file
-        fd = await loop.run_in_executor(
-            None, lambda: os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+        fd, cancellation = await _run_worker_uninterrupted(
+            _open_lock_fd,
+            lock_path,
         )
+        if cancellation is not None:
+            raise cancellation
         assert fd is not None
 
-        start_time = loop.time()
+        start_time = asyncio.get_running_loop().time()
 
         while True:
-            acquired = await loop.run_in_executor(None, _try_lock, fd)
+            acquired, cancellation = await _run_worker_uninterrupted(
+                _try_lock,
+                fd,
+                shared,
+            )
+            if cancellation is not None:
+                raise cancellation
             if acquired:
+                acquired = True
                 logger.debug(f"Acquired async lock: {name}")
                 break
-            if loop.time() - start_time >= timeout:
+            if asyncio.get_running_loop().time() - start_time >= timeout:
                 raise TimeoutError(f"Timeout waiting for lock: {name} ({timeout}s)")
             await asyncio.sleep(0.1)
 
         try:
             yield
         finally:
-            await loop.run_in_executor(None, _release_lock, fd)
             logger.debug(f"Released async lock: {name}")
 
     finally:
         if fd is not None:
             try:
-                os.close(fd)
+                _close_owned_lock(fd, owner_pid, unlock=acquired)
             except OSError:
                 pass
 
 
-def _try_lock(fd: int) -> bool:
-    """Try to acquire exclusive lock (non-blocking)."""
+def _try_lock(fd: int, shared: bool = False) -> bool:
+    """Try to acquire a shared or exclusive lock without blocking."""
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_mode = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+        fcntl.flock(fd, lock_mode | fcntl.LOCK_NB)
         return True
     except BlockingIOError:
         return False
