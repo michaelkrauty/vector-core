@@ -519,9 +519,18 @@ class EmbeddingClient:
         if cache is not None:
             if self.dim > 0:
                 return await self._embed_all_cached(effective_texts, cache, progress_cb=progress_cb)
-            embeddings = await self._embed_all_uncached(effective_texts, progress_cb=progress_cb)
+            unique_texts = list(dict.fromkeys(effective_texts))
+            text_counts = Counter(effective_texts)
+            unique_embeddings = await self._embed_all_uncached(
+                unique_texts,
+                progress_cb=progress_cb,
+                progress_weights=[text_counts[text] for text in unique_texts],
+                progress_total=len(effective_texts),
+            )
+            by_text = dict(zip(unique_texts, unique_embeddings, strict=True))
+            embeddings = [by_text[text] for text in effective_texts]
             try:
-                await self._write_cache_entries(cache, effective_texts, embeddings)
+                await self._write_cache_entries(cache, unique_texts, unique_embeddings)
             except Exception:
                 logger.warning(
                     "Persistent embedding cache write failed; continuing without it",

@@ -5,6 +5,7 @@ import sqlite3
 import tempfile
 import threading
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -673,6 +674,78 @@ class TestIncrementalUpdate:
             )
 
         assert vocab.get_codebase_doc_count("fresh") == 3
+        vocab.close()
+
+    @pytest.mark.parametrize("net_doc_change", [True, 2**63, -(2**63)])
+    def test_update_rejects_doc_changes_outside_sqlite_integer(self, tmp_path, net_doc_change):
+        vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
+
+        with pytest.raises(ValueError, match="signed SQLite INTEGER"):
+            vocab.update_codebase_incremental(
+                "fresh",
+                added_tokens=[{"hello"}],
+                removed_tokens=[],
+                net_doc_change=net_doc_change,
+            )
+
+        assert vocab.vocab_size == 0
+        assert vocab.get_codebase_doc_count("fresh") == 0
+        vocab.close()
+
+    def test_update_rolls_back_non_sqlite_exception(self, tmp_path, monkeypatch):
+        vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(
+                vocab,
+                "_contribution_deltas",
+                MagicMock(side_effect=RuntimeError("injected")),
+            )
+            with pytest.raises(RuntimeError, match="injected"):
+                vocab.update_codebase_incremental(
+                    "fresh",
+                    added_tokens=[{"transient"}],
+                    removed_tokens=[],
+                    net_doc_change=1,
+                )
+
+        assert vocab._get_conn().in_transaction is False
+        assert vocab.vocab_size == 0
+        vocab.update_codebase_incremental(
+            "fresh",
+            added_tokens=[{"committed"}],
+            removed_tokens=[],
+            net_doc_change=1,
+        )
+        assert vocab.vocab_size == 1
+        vocab.close()
+
+    def test_update_rejects_cumulative_doc_count_overflow(self, tmp_path):
+        vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
+        vocab.register_codebase_frequencies("full", {}, 2**63 - 1)
+
+        with pytest.raises(OverflowError, match="document count"):
+            vocab.update_codebase_incremental(
+                "full",
+                added_tokens=[],
+                removed_tokens=[],
+                net_doc_change=1,
+            )
+
+        assert vocab.get_codebase_doc_count("full") == 2**63 - 1
+        assert vocab._get_conn().in_transaction is False
+        vocab.close()
+
+    def test_registration_rejects_aggregate_doc_count_overflow(self, tmp_path):
+        vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
+        vocab.register_codebase_frequencies("full", {}, 2**63 - 1)
+
+        with pytest.raises(OverflowError, match="total document count"):
+            vocab.register_codebase_frequencies("extra", {}, 1)
+
+        assert vocab.get_codebase_doc_count("full") == 2**63 - 1
+        assert vocab.get_codebase_doc_count("extra") == 0
+        assert vocab._get_conn().in_transaction is False
         vocab.close()
 
     def test_update_does_not_create_a_negative_doc_count(self, tmp_path):

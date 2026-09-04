@@ -229,24 +229,45 @@ class EmbeddingCache(ThreadSafeSQLiteStore):
                 """,
                 rows,
             )
-            self._maybe_evict_v2(conn)
+            self._maybe_evict_combined(conn)
 
-    def _maybe_evict_v2(self, conn: sqlite3.Connection) -> None:
-        """Evict v2 entries inside the caller's write transaction."""
-        count = conn.execute("SELECT COUNT(*) FROM embedding_cache_v2").fetchone()[0]
-        if count <= self.max_entries:
+    def _maybe_evict_combined(self, conn: sqlite3.Connection) -> None:
+        """Enforce one entry limit across legacy and deployment-safe caches."""
+        legacy_count = conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+        v2_count = conn.execute("SELECT COUNT(*) FROM embedding_cache_v2").fetchone()[0]
+        if legacy_count + v2_count <= self.max_entries:
             return
-        to_delete = max(count - self.max_entries, int(self.max_entries * 0.1), 1)
-        conn.execute(
-            """
-            DELETE FROM embedding_cache_v2 WHERE cache_key IN (
-                SELECT cache_key FROM embedding_cache_v2
-                ORDER BY accessed_at ASC
-                LIMIT ?
-            )
-            """,
-            (to_delete,),
+        to_delete = max(
+            legacy_count + v2_count - self.max_entries,
+            int(self.max_entries * 0.1),
+            1,
         )
+        # Prefer retiring legacy entries because their keys do not identify an
+        # embedding deployment. Preserve their own LRU order while doing so.
+        legacy_delete = min(legacy_count, to_delete)
+        if legacy_delete:
+            conn.execute(
+                """
+                DELETE FROM embeddings WHERE content_hash IN (
+                    SELECT content_hash FROM embeddings
+                    ORDER BY accessed_at ASC
+                    LIMIT ?
+                )
+                """,
+                (legacy_delete,),
+            )
+        v2_delete = to_delete - legacy_delete
+        if v2_delete:
+            conn.execute(
+                """
+                DELETE FROM embedding_cache_v2 WHERE cache_key IN (
+                    SELECT cache_key FROM embedding_cache_v2
+                    ORDER BY accessed_at ASC
+                    LIMIT ?
+                )
+                """,
+                (v2_delete,),
+            )
 
     def get(self, content_hash: str) -> list[float] | None:
         """
@@ -314,25 +335,23 @@ class EmbeddingCache(ThreadSafeSQLiteStore):
         conn = self._get_conn()
         now = datetime.now(UTC).isoformat()
 
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO embeddings
-            (content_hash, embedding, model, dim, created_at, accessed_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                content_hash,
-                json.dumps(embedding).encode("utf-8"),  # JSON serialization (secure)
-                model or settings.embedding_model,
-                len(embedding),
-                now,
-                now,
-            ),
-        )
-        conn.commit()
-
-        # Evict old entries if over limit
-        self._maybe_evict()
+        with conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO embeddings
+                (content_hash, embedding, model, dim, created_at, accessed_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    content_hash,
+                    json.dumps(embedding).encode("utf-8"),  # JSON serialization (secure)
+                    model or settings.embedding_model,
+                    len(embedding),
+                    now,
+                    now,
+                ),
+            )
+            self._maybe_evict_combined(conn)
 
     def get_or_compute(
         self,
@@ -391,23 +410,8 @@ class EmbeddingCache(ThreadSafeSQLiteStore):
     def _maybe_evict(self) -> None:
         """Evict oldest entries if cache exceeds limit."""
         conn = self._get_conn()
-        cursor = conn.execute("SELECT COUNT(*) FROM embeddings")
-        count = cursor.fetchone()[0]
-
-        if count > self.max_entries:
-            # Delete oldest 10% to avoid frequent evictions
-            to_delete = max(1, int(self.max_entries * 0.1))
-            conn.execute(
-                """
-                DELETE FROM embeddings WHERE content_hash IN (
-                    SELECT content_hash FROM embeddings
-                    ORDER BY accessed_at ASC
-                    LIMIT ?
-                )
-                """,
-                (to_delete,),
-            )
-            conn.commit()
+        with conn:
+            self._maybe_evict_combined(conn)
 
     def stats(self) -> dict:
         """Get cache statistics."""

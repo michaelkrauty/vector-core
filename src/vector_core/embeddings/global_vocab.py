@@ -13,6 +13,7 @@ import threading
 import time
 from collections import Counter
 from collections.abc import Mapping
+from itertools import chain
 from pathlib import Path
 from typing import Any
 
@@ -386,6 +387,44 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
         max_idx = row[0]
         return 0 if max_idx is None else max_idx + 1
 
+    @staticmethod
+    def _validate_total_doc_count(
+        conn: sqlite3.Connection,
+        codebase_id: str,
+        replacement_count: int,
+    ) -> None:
+        """Ensure replacing one codebase count keeps the exact aggregate representable."""
+        total = replacement_count
+        rows = conn.execute(
+            "SELECT doc_count FROM codebase_doc_counts WHERE codebase_id != ?",
+            (codebase_id,),
+        )
+        for (count,) in rows:
+            if type(count) is not int or count < 0 or count > SQLITE_MAX_INTEGER:
+                raise RuntimeError("stored document count is outside the SQLite INTEGER range")
+            total += count
+            if total > SQLITE_MAX_INTEGER:
+                raise OverflowError("total document count exceeds the SQLite INTEGER range")
+
+    @staticmethod
+    def _validate_frequency_delta(
+        conn: sqlite3.Connection,
+        token: str,
+        delta: int,
+    ) -> None:
+        """Ensure a positive aggregate-frequency delta cannot overflow SQLite."""
+        if delta <= 0:
+            return
+        row = conn.execute(
+            "SELECT doc_freq FROM vocabulary WHERE token = ?",
+            (token,),
+        ).fetchone()
+        current = row[0] if row else 0
+        if type(current) is not int or current < 0 or current > SQLITE_MAX_INTEGER:
+            raise RuntimeError("stored document frequency is outside the SQLite INTEGER range")
+        if delta > SQLITE_MAX_INTEGER or current > SQLITE_MAX_INTEGER - delta:
+            raise OverflowError("document frequency exceeds the SQLite INTEGER range")
+
     def register_codebase(
         self,
         codebase_id: str,
@@ -459,6 +498,7 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
                 # Begin transaction BEFORE any writes
                 conn.execute("BEGIN IMMEDIATE")
                 try:
+                    self._validate_total_doc_count(conn, codebase_id, doc_count)
                     # Remove old contribution if exists (within transaction)
                     self._remove_codebase_contribution(conn, codebase_id)
 
@@ -482,6 +522,7 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
 
                     # Update doc_freq for all tokens
                     for token, freq in new_doc_freq.items():
+                        self._validate_frequency_delta(conn, token, freq)
                         conn.execute(
                             "UPDATE vocabulary SET doc_freq = doc_freq + ? WHERE token = ?",
                             (freq, token),
@@ -692,7 +733,7 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
                 f"Re-register the full corpus to restore accurate IDF weighting."
             )
 
-    def update_codebase_incremental(
+    def update_codebase_incremental(  # noqa: PLR0912, PLR0915
         self,
         codebase_id: str,
         added_tokens: list[set[str]],
@@ -720,6 +761,13 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
         Returns:
             Number of new tokens added to vocabulary
         """
+        if (
+            type(net_doc_change) is not int
+            or net_doc_change < -SQLITE_MAX_INTEGER
+            or net_doc_change > SQLITE_MAX_INTEGER
+        ):
+            raise ValueError("net_doc_change must fit in a signed SQLite INTEGER")
+
         # Calculate doc_freq deltas (outside lock for performance)
         added_freq: Counter[str] = Counter()
         for doc_tokens in added_tokens:
@@ -730,6 +778,11 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
         for doc_tokens in removed_tokens:
             for token in doc_tokens:
                 removed_freq[token] += 1
+        if any(
+            frequency > SQLITE_MAX_INTEGER
+            for frequency in chain(added_freq.values(), removed_freq.values())
+        ):
+            raise ValueError("incremental document frequencies exceed the SQLite INTEGER range")
 
         new_tokens_count = 0
 
@@ -741,6 +794,26 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
             with self._conn_lock:
                 conn.execute("BEGIN IMMEDIATE")
                 try:
+                    current_row = conn.execute(
+                        "SELECT doc_count FROM codebase_doc_counts WHERE codebase_id = ?",
+                        (codebase_id,),
+                    ).fetchone()
+                    current_count = current_row[0] if current_row else 0
+                    if (
+                        type(current_count) is not int
+                        or current_count < 0
+                        or current_count > SQLITE_MAX_INTEGER
+                    ):
+                        raise RuntimeError(
+                            "stored document count is outside the SQLite INTEGER range"
+                        )
+                    replacement_count = max(current_count + net_doc_change, 0)
+                    if replacement_count > SQLITE_MAX_INTEGER:
+                        raise OverflowError(
+                            "codebase document count exceeds the SQLite INTEGER range"
+                        )
+                    self._validate_total_doc_count(conn, codebase_id, replacement_count)
+
                     # Get current max index (inside transaction for consistency)
                     next_idx = self._get_next_index(conn)
 
@@ -767,6 +840,7 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
                     deltas = self._contribution_deltas(conn, codebase_id, added_freq, removed_freq)
 
                     for token, delta in deltas.items():
+                        self._validate_frequency_delta(conn, token, delta)
                         # Floored at zero as a backstop. The delta above is what
                         # keeps this honest, but a document frequency counts
                         # documents and can never be negative, and query
@@ -830,6 +904,9 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
                 except sqlite3.Error as e:
                     conn.rollback()
                     logger.error(f"SQLite error updating codebase {codebase_id}: {e}")
+                    raise
+                except BaseException:
+                    conn.rollback()
                     raise
 
         self._invalidate_cache()

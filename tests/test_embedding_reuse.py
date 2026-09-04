@@ -164,6 +164,50 @@ async def test_embed_all_caches_effective_input_and_scatters_duplicates(
 
 
 @pytest.mark.asyncio
+async def test_auto_dimension_deduplicates_before_first_request(tmp_path: Path) -> None:
+    client = EmbeddingClient(
+        model="model-a",
+        dim=0,
+        cache_namespace="deployment-a",
+        cache_path=tmp_path / "embeddings.db",
+    )
+
+    async def embed_batch(texts: list[str]) -> list[list[float]]:
+        client.dim = 2
+        return [[float(ord(text[0])), 1.0] for text in texts]
+
+    client.embed_batch = AsyncMock(side_effect=embed_batch)
+    progress: list[tuple[int, int]] = []
+
+    result = await client.embed_all(
+        ["alpha", "beta", "alpha"],
+        progress_cb=lambda done, total: progress.append((done, total)),
+    )
+
+    client.embed_batch.assert_awaited_once_with(["alpha", "beta"])
+    assert result == [[97.0, 1.0], [98.0, 1.0], [97.0, 1.0]]
+    assert progress == [(3, 3)]
+    await client.close()
+
+
+def test_cache_entry_limit_applies_across_legacy_and_v2_tables(tmp_path: Path) -> None:
+    cache = EmbeddingCache(tmp_path / "embeddings.db", max_entries=3)
+    cache.set("legacy-a", [1.0, 2.0])
+    cache.set("legacy-b", [1.0, 2.0])
+    cache.set_many(
+        {"v2-a": [1.0, 2.0], "v2-b": [1.0, 2.0]},
+        expected_dim=2,
+    )
+
+    conn = cache._get_conn()
+    legacy = conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+    v2 = conn.execute("SELECT COUNT(*) FROM embedding_cache_v2").fetchone()[0]
+    assert legacy + v2 <= 3
+    assert v2 == 2
+    cache.close()
+
+
+@pytest.mark.asyncio
 async def test_unset_namespace_never_opens_persistent_cache(tmp_path: Path) -> None:
     client = EmbeddingClient(dim=2, cache_namespace=None, cache_path=tmp_path / "bad")
     client.embed_batch = AsyncMock(return_value=[[1.0, 2.0]])
