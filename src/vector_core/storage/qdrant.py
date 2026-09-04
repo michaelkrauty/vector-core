@@ -22,6 +22,7 @@ from qdrant_client.models import (
     ScoredPoint,
     SparseVectorParams,
     VectorParams,
+    WriteOrdering,
 )
 from qdrant_client.models import (
     SparseVector as QdrantSparseVector,
@@ -38,6 +39,7 @@ PointId = int | str
 
 class QdrantConnectionError(Exception):
     """Raised when Qdrant is unavailable or connection fails."""
+
     pass
 
 
@@ -160,9 +162,7 @@ class QdrantStorage:
         if now - self._last_health_check >= self._health_check_interval:
             if not await self.check_health():
                 # Connection unhealthy - force reconnect
-                logger.warning(
-                    f"Qdrant health check failed, reconnecting to {self.url}"
-                )
+                logger.warning(f"Qdrant health check failed, reconnecting to {self.url}")
                 await self._reconnect()
 
         return self._client
@@ -233,14 +233,11 @@ class QdrantStorage:
             return any(c.name == name for c in collections.collections)
         except httpx.ConnectError as e:
             raise QdrantConnectionError(
-                f"Cannot connect to Qdrant at {self.url}. "
-                f"Ensure Qdrant is running. Error: {e}"
+                f"Cannot connect to Qdrant at {self.url}. Ensure Qdrant is running. Error: {e}"
             ) from e
         except Exception as e:
             if "connect" in str(e).lower() or "refused" in str(e).lower():
-                raise QdrantConnectionError(
-                    f"Qdrant connection failed at {self.url}: {e}"
-                ) from e
+                raise QdrantConnectionError(f"Qdrant connection failed at {self.url}: {e}") from e
             raise
 
     async def create_collection(
@@ -357,10 +354,7 @@ class QdrantStorage:
         client = await self._get_client()
 
         # Split into batches
-        batches = [
-            points[i : i + batch_size]
-            for i in range(0, len(points), batch_size)
-        ]
+        batches = [points[i : i + batch_size] for i in range(0, len(points), batch_size)]
 
         # Use semaphore to limit concurrent upserts
         semaphore = asyncio.Semaphore(concurrency)
@@ -378,7 +372,7 @@ class QdrantStorage:
                         last_error = e
                         if attempt < max_retries - 1:
                             # Exponential backoff: 1s, 2s, 4s... capped at max_delay
-                            delay = min(2 ** attempt, max_delay)
+                            delay = min(2**attempt, max_delay)
                             await asyncio.sleep(delay)
                 if last_error:
                     raise last_error
@@ -386,9 +380,7 @@ class QdrantStorage:
         # Run all batches concurrently (limited by semaphore)
         try:
             async with asyncio.timeout(settings.qdrant_operation_timeout):
-                await asyncio.gather(
-                    *(upsert_with_retry(batch) for batch in batches)
-                )
+                await asyncio.gather(*(upsert_with_retry(batch) for batch in batches))
         except TimeoutError as e:
             # Bare TimeoutError has empty __str__, so the MCP tool layer
             # surfaces a useless "Error executing tool X: " at the client.
@@ -561,7 +553,12 @@ class QdrantStorage:
             payload=payload,
         )
 
-        await client.upsert(collection, [point])
+        await client.upsert(
+            collection,
+            [point],
+            wait=True,
+            ordering=WriteOrdering.STRONG,
+        )
 
     async def get_metadata(self, collection: str) -> dict[str, Any] | None:
         """

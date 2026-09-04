@@ -31,6 +31,10 @@ class VectorCoreSettings(BaseSettings):
     embedding_timeout: int = 120
     # Max chars for text before truncation (~32k context -> ~8000 safe at 4 chars/token avg)
     embedding_max_text_chars: int = 8000
+    # Persistent reuse is opt-in: unset namespace means no cache is opened.
+    embedding_cache_namespace: str | None = None
+    # Cross-process backend request capacity. 0 disables global coordination.
+    embedding_global_concurrency: int = 0
 
     # Cache (reconstructible data)
     cache_dir: Path = Path.home() / ".cache" / "vector-core"
@@ -104,6 +108,14 @@ class VectorCoreSettings(BaseSettings):
             raise ValueError(f"{info.field_name} must be positive, got {v}")
         return v
 
+    @field_validator("embedding_global_concurrency", mode="after")
+    @classmethod
+    def validate_non_negative_int(cls, v: int) -> int:
+        """Validate integer settings where zero explicitly disables a feature."""
+        if v < 0:
+            raise ValueError(f"embedding_global_concurrency must be non-negative, got {v}")
+        return v
+
     @field_validator(
         "dense_weight",
         "sparse_weight",
@@ -132,6 +144,7 @@ class VectorCoreSettings(BaseSettings):
         common_dims = {64, 128, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 8192}
         if v not in common_dims:
             import warnings
+
             warnings.warn(
                 f"embedding_dim={v} is not a common value. "
                 f"Common values: {sorted(common_dims)}. "
@@ -145,9 +158,7 @@ class VectorCoreSettings(BaseSettings):
     def validate_weights_not_both_zero(self) -> Self:
         """Ensure at least one search weight is positive."""
         if self.dense_weight == 0 and self.sparse_weight == 0:
-            raise ValueError(
-                "At least one of dense_weight or sparse_weight must be > 0"
-            )
+            raise ValueError("At least one of dense_weight or sparse_weight must be > 0")
         return self
 
 
@@ -180,52 +191,54 @@ class VectorCoreSettingsMixin:
 
     # Properties to delegate to vector-core settings
     # Subclasses can extend this set if needed
-    _delegated_properties: frozenset[str] = frozenset({
-        # Qdrant
-        "qdrant_url",
-        "qdrant_api_key",
-        "collection_name",
-        # Embeddings
-        "embedding_url",
-        "embedding_model",
-        "embedding_dim",
-        "embedding_batch_size",
-        "embedding_concurrency",
-        "embedding_timeout",
-        "embedding_max_text_chars",
-        # Cache
-        "cache_dir",
-        "cache_max_size_gb",
-        "cache_max_entries",
-        # Shared data
-        "shared_data_dir",
-        # Indexing
-        "max_file_size_kb",
-        "max_payload_content_chars",
-        # Search
-        "dense_weight",
-        "sparse_weight",
-        "rrf_k",
-        "rrf_prefetch_limit",
-        # Timeouts
-        "search_timeout",
-        "qdrant_operation_timeout",
-        "file_lock_timeout",
-        # Limits
-        "scroll_max_results",
-        # GlobalVocabulary
-        "global_vocab_cache_ttl",
-        # Display
-        "content_hash_display_length",
-        # Circuit breaker
-        "circuit_breaker_threshold",
-        "circuit_breaker_reset_seconds",
-    })
+    _delegated_properties: frozenset[str] = frozenset(
+        {
+            # Qdrant
+            "qdrant_url",
+            "qdrant_api_key",
+            "collection_name",
+            # Embeddings
+            "embedding_url",
+            "embedding_model",
+            "embedding_dim",
+            "embedding_batch_size",
+            "embedding_concurrency",
+            "embedding_timeout",
+            "embedding_max_text_chars",
+            "embedding_cache_namespace",
+            "embedding_global_concurrency",
+            # Cache
+            "cache_dir",
+            "cache_max_size_gb",
+            "cache_max_entries",
+            # Shared data
+            "shared_data_dir",
+            # Indexing
+            "max_file_size_kb",
+            "max_payload_content_chars",
+            # Search
+            "dense_weight",
+            "sparse_weight",
+            "rrf_k",
+            "rrf_prefetch_limit",
+            # Timeouts
+            "search_timeout",
+            "qdrant_operation_timeout",
+            "file_lock_timeout",
+            # Limits
+            "scroll_max_results",
+            # GlobalVocabulary
+            "global_vocab_cache_ttl",
+            # Display
+            "content_hash_display_length",
+            # Circuit breaker
+            "circuit_breaker_threshold",
+            "circuit_breaker_reset_seconds",
+        }
+    )
 
     def __getattr__(self, name: str):
         """Delegate attribute access to vector-core settings for known properties."""
         if name in self._delegated_properties:
             return getattr(settings, name)
-        raise AttributeError(
-            f"'{type(self).__name__}' has no attribute '{name}'"
-        )
+        raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")

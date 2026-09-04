@@ -3,12 +3,17 @@
 import asyncio
 import hashlib
 import logging
+import math
 import threading
 import time
+from collections import Counter
 from collections.abc import Callable
+from pathlib import Path
 
 import httpx
 
+from vector_core.embeddings.cache import EmbeddingCache
+from vector_core.embeddings.limiter import GlobalRequestLimiter
 from vector_core.settings import settings
 from vector_core.utils.retry import retry_operation
 
@@ -17,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 class EmbeddingServiceError(Exception):
     """Raised when the embedding service is unavailable or returns an error."""
+
     pass
 
 
@@ -43,7 +49,7 @@ class EmbeddingClient:
     - Any OpenAI-compatible embedding API
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0917
         self,
         base_url: str | None = None,
         model: str | None = None,
@@ -51,6 +57,10 @@ class EmbeddingClient:
         timeout: float | None = None,
         concurrency: int | None = None,
         dim: int | None = None,
+        cache_namespace: str | None = None,
+        cache_path: Path | None = None,
+        global_concurrency: int | None = None,
+        limiter_dir: Path | None = None,
     ):
         """
         Initialize embedding client.
@@ -62,6 +72,10 @@ class EmbeddingClient:
             timeout: Request timeout in seconds. Default from settings.
             concurrency: Max concurrent batch requests. Default from settings.
             dim: Embedding dimension. Default from settings.
+            cache_namespace: Stable model/deployment identity enabling persistent reuse.
+            cache_path: Persistent cache database path. Default under cache_dir.
+            global_concurrency: Cross-process HTTP request capacity. 0 disables it.
+            limiter_dir: Directory containing stable request-slot lock files.
         """
         self.base_url = (base_url or settings.embedding_url).rstrip("/")
         self.model = model or settings.embedding_model
@@ -69,6 +83,24 @@ class EmbeddingClient:
         self.timeout = float(timeout or settings.embedding_timeout)
         self.concurrency = concurrency or settings.embedding_concurrency
         self.dim = dim or settings.embedding_dim
+        self.cache_namespace = (
+            cache_namespace if cache_namespace is not None else settings.embedding_cache_namespace
+        )
+        self._cache_path = cache_path or (settings.cache_dir / "embeddings.db")
+        self._embedding_cache: EmbeddingCache | None = None
+        self._embedding_cache_init_lock = asyncio.Lock()
+        self._persistent_cache_failed = False
+        capacity = (
+            global_concurrency
+            if global_concurrency is not None
+            else settings.embedding_global_concurrency
+        )
+        limiter_scope = "\0".join((self.base_url, self.model))
+        self._request_limiter = GlobalRequestLimiter(
+            capacity,
+            limiter_scope,
+            limiter_dir or (settings.cache_dir / "embedding-request-locks"),
+        )
 
         # Persistent HTTP client (reuse connections)
         self._client: httpx.AsyncClient | None = None
@@ -109,28 +141,36 @@ class EmbeddingClient:
         async close to avoid "Event loop is closed" errors. The client will be
         GC'd and connections will timeout naturally.
         """
-        if self._client:
-            try:
-                current_loop = asyncio.get_running_loop()
-                if self._client_loop is current_loop:
-                    # Same loop - safe to close properly
-                    await self._client.aclose()
-                else:
-                    # Different loop - cannot safely close httpx client
-                    # httpx.AsyncClient has internal locks bound to creation loop
-                    logger.debug(
-                        "Skipping async httpx client close (called from different event loop)"
-                    )
-            except RuntimeError:
-                # No running loop - cannot close async resources
-                logger.debug("Skipping async httpx client close (no running event loop)")
-            finally:
-                self._client = None
-                self._client_loop = None
-        # Reset circuit breaker state
-        with self._circuit_lock:
-            self._circuit_failure_count = 0
-            self._circuit_open_until = None
+        try:
+            if self._client:
+                try:
+                    current_loop = asyncio.get_running_loop()
+                    if self._client_loop is current_loop:
+                        # Same loop - safe to close properly
+                        await self._client.aclose()
+                    else:
+                        # Different loop - cannot safely close httpx client
+                        # httpx.AsyncClient has internal locks bound to creation loop
+                        logger.debug(
+                            "Skipping async httpx client close (called from different event loop)"
+                        )
+                except RuntimeError:
+                    # No running loop - cannot close async resources
+                    logger.debug("Skipping async httpx client close (no running event loop)")
+        finally:
+            self._client = None
+            self._client_loop = None
+            cache = self._embedding_cache
+            self._embedding_cache = None
+            if cache is not None:
+                try:
+                    cache.close()
+                except Exception:
+                    logger.warning("Could not close persistent embedding cache", exc_info=True)
+            # Reset circuit breaker state even when HTTP shutdown is cancelled.
+            with self._circuit_lock:
+                self._circuit_failure_count = 0
+                self._circuit_open_until = None
 
     async def __aenter__(self) -> "EmbeddingClient":
         """Context manager entry."""
@@ -160,9 +200,7 @@ class EmbeddingClient:
 
             # Circuit timeout expired - enter half-open state
             # Allow request through, will reset or re-open based on result
-            logger.info(
-                f"Circuit breaker half-open: allowing request to {self.base_url}"
-            )
+            logger.info(f"Circuit breaker half-open: allowing request to {self.base_url}")
 
     def _record_success(self) -> None:
         """Record a successful request. Resets failure count and closes circuit."""
@@ -213,8 +251,7 @@ class EmbeddingClient:
         self._check_circuit()
 
         # Truncate very long texts that might cause 400 errors
-        max_chars = settings.embedding_max_text_chars
-        truncated = [t[:max_chars] if len(t) > max_chars else t for t in texts]
+        truncated = self._truncate_texts(texts)
 
         client = await self._get_client()
 
@@ -223,19 +260,18 @@ class EmbeddingClient:
 
         async def make_request() -> httpx.Response:
             """Make the embedding request (can be retried on transient errors)."""
-            resp = await client.post(
-                f"{self.base_url}/v1/embeddings",
-                json={
-                    "input": truncated,
-                    "model": self.model,
-                    "encoding_format": "float",
-                },
-            )
+            async with self._request_limiter.acquire():
+                resp = await client.post(
+                    f"{self.base_url}/v1/embeddings",
+                    json={
+                        "input": truncated,
+                        "model": self.model,
+                        "encoding_format": "float",
+                    },
+                )
             # 503 is transient - re-raise for retry
             if resp.status_code == 503:
-                raise httpx.ConnectError(
-                    f"Service unavailable (503) at {self.base_url}"
-                )
+                raise httpx.ConnectError(f"Service unavailable (503) at {self.base_url}")
             resp.raise_for_status()
             return resp
 
@@ -290,8 +326,7 @@ class EmbeddingClient:
                             f"Text preview: {preview!r}"
                         )
                         raise EmbeddingServiceError(
-                            f"Failed to embed text: {e}. "
-                            f"Text preview: {preview!r}"
+                            f"Failed to embed text: {e}. Text preview: {preview!r}"
                         ) from e
                 return results
             # Single text failed - include preview for debugging
@@ -302,10 +337,88 @@ class EmbeddingClient:
 
         # Success - reset circuit breaker
         self._record_success()
-        data = resp.json()
-        # Sort by index to ensure order matches input
-        sorted_data = sorted(data["data"], key=lambda x: x["index"])
-        return [item["embedding"] for item in sorted_data]
+        try:
+            data = resp.json()
+            return self._validate_response_embeddings(data, len(texts))
+        except (KeyError, OverflowError, TypeError, ValueError) as error:
+            raise EmbeddingServiceError(
+                f"Embedding service returned an invalid response: {error}"
+            ) from error
+
+    @staticmethod
+    def _validate_vector(vector: object, expected_dim: int) -> list[float]:
+        if not isinstance(vector, list) or len(vector) != expected_dim:
+            raise ValueError(f"expected embedding dimension {expected_dim}")
+        if not all(
+            isinstance(value, (int, float)) and not isinstance(value, bool) for value in vector
+        ):
+            raise ValueError("embedding contains a non-numeric value")
+        values = [float(value) for value in vector]
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("embedding contains a non-finite value")
+        return values
+
+    def _validate_response_embeddings(
+        self, payload: object, expected_count: int
+    ) -> list[list[float]]:
+        if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+            raise ValueError("embedding response has no data list")
+        items = payload["data"]
+        if len(items) != expected_count:
+            raise ValueError(
+                f"embedding response count {len(items)} does not match {expected_count} inputs"
+            )
+        by_index: dict[int, object] = {}
+        for item in items:
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("index"), int)
+                or isinstance(item.get("index"), bool)
+            ):
+                raise ValueError("embedding response item has no integer index")
+            index = item["index"]
+            if index in by_index or not 0 <= index < expected_count:
+                raise ValueError(f"invalid or duplicate embedding index {index}")
+            by_index[index] = item.get("embedding")
+
+        inferred_dim = self.dim
+        if inferred_dim == 0:
+            first = by_index[0]
+            if not isinstance(first, list) or not first:
+                raise ValueError("cannot infer embedding dimension from response")
+            inferred_dim = len(first)
+        values = [
+            self._validate_vector(by_index[index], inferred_dim) for index in range(expected_count)
+        ]
+        if self.dim == 0:
+            self.dim = inferred_dim
+        return values
+
+    @staticmethod
+    def _truncate_texts(texts: list[str]) -> list[str]:
+        max_chars = settings.embedding_max_text_chars
+        return [text[:max_chars] if len(text) > max_chars else text for text in texts]
+
+    async def _get_embedding_cache(self) -> EmbeddingCache | None:
+        """Open the opt-in persistent cache, permanently failing open per client."""
+        if not self.cache_namespace or self._persistent_cache_failed:
+            return None
+        if self._embedding_cache is None:
+            async with self._embedding_cache_init_lock:
+                if self._embedding_cache is not None:
+                    return self._embedding_cache
+                try:
+                    self._embedding_cache = await asyncio.to_thread(
+                        EmbeddingCache,
+                        cache_path=self._cache_path,
+                    )
+                except Exception:
+                    self._persistent_cache_failed = True
+                    logger.warning(
+                        "Persistent embedding cache unavailable; continuing without it",
+                        exc_info=True,
+                    )
+        return self._embedding_cache
 
     async def embed_single(self, text: str) -> list[float]:
         """
@@ -401,8 +514,40 @@ class EmbeddingClient:
         if not texts:
             return []
 
+        effective_texts = self._truncate_texts(texts)
+        cache = await self._get_embedding_cache()
+        if cache is not None:
+            if self.dim > 0:
+                return await self._embed_all_cached(effective_texts, cache, progress_cb=progress_cb)
+            embeddings = await self._embed_all_uncached(effective_texts, progress_cb=progress_cb)
+            try:
+                await self._write_cache_entries(cache, effective_texts, embeddings)
+            except Exception:
+                logger.warning(
+                    "Persistent embedding cache write failed; continuing without it",
+                    exc_info=True,
+                )
+                self._persistent_cache_failed = True
+                cache.close()
+                self._embedding_cache = None
+            return embeddings
+
+        return await self._embed_all_uncached(texts, progress_cb=progress_cb)
+
+    async def _embed_all_uncached(
+        self,
+        texts: list[str],
+        progress_cb: Callable[[int, int], None] | None = None,
+        *,
+        progress_weights: list[int] | None = None,
+        initial_completed: int = 0,
+        progress_total: int | None = None,
+    ) -> list[list[float]]:
+        """Embed all supplied effective texts with the existing batch scheduler."""
         total = len(texts)
-        completed = 0
+        weights = progress_weights or [1] * total
+        completed = initial_completed
+        callback_total = progress_total if progress_total is not None else sum(weights)
 
         async def embed_with_progress(
             batch_idx: int,
@@ -411,9 +556,10 @@ class EmbeddingClient:
         ) -> tuple[int, list[list[float]]]:
             nonlocal completed
             result = await self._embed_batch_with_semaphore(batch_idx, batch, semaphore)
-            completed += len(batch)
+            batch_start = batch_idx * self.batch_size
+            completed += sum(weights[batch_start : batch_start + len(batch)])
             if progress_cb:
-                progress_cb(completed, total)
+                progress_cb(completed, callback_total)
             return result
 
         # Create batches with their indices
@@ -426,10 +572,7 @@ class EmbeddingClient:
         semaphore = asyncio.Semaphore(self.concurrency)
 
         # Process batches concurrently with semaphore limiting
-        tasks = [
-            embed_with_progress(batch_idx, batch, semaphore)
-            for batch_idx, batch in batches
-        ]
+        tasks = [embed_with_progress(batch_idx, batch, semaphore) for batch_idx, batch in batches]
 
         # Gather results (concurrent execution up to semaphore limit)
         results = await asyncio.gather(*tasks)
@@ -443,6 +586,87 @@ class EmbeddingClient:
             embeddings.extend(batch_embeddings)
 
         return embeddings
+
+    async def _write_cache_entries(
+        self,
+        cache: EmbeddingCache,
+        effective_texts: list[str],
+        embeddings: list[list[float]],
+    ) -> None:
+        if not self.cache_namespace or self.dim <= 0:
+            return
+        entries = {
+            EmbeddingCache.make_key(
+                text,
+                namespace=self.cache_namespace,
+                model=self.model,
+                dim=self.dim,
+            ): embedding
+            for text, embedding in zip(effective_texts, embeddings, strict=True)
+        }
+        await asyncio.to_thread(cache.set_many, entries, expected_dim=self.dim)
+
+    async def _embed_all_cached(
+        self,
+        effective_texts: list[str],
+        cache: EmbeddingCache,
+        progress_cb: Callable[[int, int], None] | None = None,
+    ) -> list[list[float]]:
+        """Resolve cache hits and scatter each unique miss back to every input position."""
+        assert self.cache_namespace is not None
+        keys = [
+            EmbeddingCache.make_key(
+                text,
+                namespace=self.cache_namespace,
+                model=self.model,
+                dim=self.dim,
+            )
+            for text in effective_texts
+        ]
+        unique_keys = list(dict.fromkeys(keys))
+        try:
+            cached = await asyncio.to_thread(cache.get_many, unique_keys, expected_dim=self.dim)
+        except Exception:
+            logger.warning(
+                "Persistent embedding cache read failed; continuing without it",
+                exc_info=True,
+            )
+            self._persistent_cache_failed = True
+            cache.close()
+            self._embedding_cache = None
+            return await self._embed_all_uncached(effective_texts, progress_cb=progress_cb)
+        missing_keys = [key for key in unique_keys if key not in cached]
+        key_to_text = dict(zip(keys, effective_texts, strict=True))
+        key_counts = Counter(keys)
+        cached_count = sum(key_counts[key] for key in cached)
+
+        if missing_keys:
+            if progress_cb and cached_count:
+                progress_cb(cached_count, len(keys))
+            missing_vectors = await self._embed_all_uncached(
+                [key_to_text[key] for key in missing_keys],
+                progress_cb=progress_cb,
+                progress_weights=[key_counts[key] for key in missing_keys],
+                initial_completed=cached_count,
+                progress_total=len(keys),
+            )
+            fresh = dict(zip(missing_keys, missing_vectors, strict=True))
+            try:
+                await asyncio.to_thread(cache.set_many, fresh, expected_dim=self.dim)
+            except Exception:
+                logger.warning(
+                    "Persistent embedding cache write failed; continuing without it",
+                    exc_info=True,
+                )
+                self._persistent_cache_failed = True
+                cache.close()
+                self._embedding_cache = None
+            cached.update(fresh)
+
+        result = [cached[key] for key in keys]
+        if progress_cb and not missing_keys:
+            progress_cb(len(result), len(result))
+        return result
 
 
 class _SyncAsyncBridge:
@@ -486,7 +710,7 @@ class SyncEmbeddingClient:
     the client and closes the async client on that same loop.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0917
         self,
         base_url: str | None = None,
         model: str | None = None,
@@ -494,6 +718,10 @@ class SyncEmbeddingClient:
         timeout: float | None = None,
         concurrency: int | None = None,
         dim: int | None = None,
+        cache_namespace: str | None = None,
+        cache_path: Path | None = None,
+        global_concurrency: int | None = None,
+        limiter_dir: Path | None = None,
     ) -> None:
         self._client = EmbeddingClient(
             base_url=base_url,
@@ -502,6 +730,10 @@ class SyncEmbeddingClient:
             timeout=timeout,
             concurrency=concurrency,
             dim=dim,
+            cache_namespace=cache_namespace,
+            cache_path=cache_path,
+            global_concurrency=global_concurrency,
+            limiter_dir=limiter_dir,
         )
         self._bridge = _SyncAsyncBridge()
 

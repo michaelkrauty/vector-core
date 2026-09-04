@@ -12,14 +12,15 @@ import sqlite3
 import threading
 import time
 from collections import Counter
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from vector_core.embeddings.sparse import SparseVector
 from vector_core.embeddings.tokenization import (
     CAMEL_CASE_PATTERN,
-    IDENTIFIER_PATTERN,
     DEFAULT_STOP_TOKENS,
+    IDENTIFIER_PATTERN,
     levenshtein_similarity,
 )
 from vector_core.settings import settings
@@ -30,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 # Schema version for migrations
 SCHEMA_VERSION = 1
+SQLITE_MAX_INTEGER = 2**63 - 1
 
 # Bound on tokens per contribution lookup, to stay clear of SQLite's limit on
 # bound parameters while keeping the number of round trips small.
@@ -108,6 +110,7 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
         min_token_length: int = 2,
         stop_tokens: set[str] | None = None,
         cache_ttl: float | None = None,
+        synchronous: str = "NORMAL",
     ):
         """
         Initialize global vocabulary.
@@ -119,9 +122,11 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
             cache_ttl: Cache TTL in seconds for multi-server consistency.
                        Default: settings.global_vocab_cache_ttl (5s).
                        Lower values improve consistency when multiple servers share the DB.
+            synchronous: SQLite durability mode. Use ``FULL`` when coordinating
+                         this database with an external write-ahead intent.
         """
         db_path = db_path or (settings.cache_dir / "global_vocabulary.db")
-        super().__init__(db_path, config=SQLiteConfig())
+        super().__init__(db_path, config=SQLiteConfig(synchronous=synchronous))
         self.min_token_length = min_token_length
         self.stop_tokens = stop_tokens if stop_tokens is not None else DEFAULT_STOP_TOKENS
 
@@ -191,7 +196,7 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
             # New database - set schema version
             conn.execute(
                 "INSERT INTO metadata (key, value) VALUES ('schema_version', ?)",
-                (str(SCHEMA_VERSION),)
+                (str(SCHEMA_VERSION),),
             )
             conn.commit()
         else:
@@ -210,6 +215,10 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
             self._doc_freq_cache = None
             self._total_docs_cache = None
             self._cache_timestamp = 0.0
+
+    def invalidate_cache(self) -> None:
+        """Discard process-local vocabulary snapshots before a coordinated read."""
+        self._invalidate_cache()
 
     def _is_cache_expired(self) -> bool:
         """Check if cache has expired based on TTL."""
@@ -244,16 +253,16 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
         with self._cache_lock:
             if self._vocab_cache is not None:
                 return self._vocab_cache
-
-        conn = self._get_conn()
-        cursor = conn.execute("SELECT token, idx FROM vocabulary")
-        vocab = {row[0]: row[1] for row in cursor.fetchall()}
-
-        with self._cache_lock:
+            # Read and publish under the same lock as invalidation. Otherwise a
+            # pre-commit read can publish after a writer's invalidation and
+            # resurrect a stale cache until the next TTL expiry.
+            conn = self._get_conn()
+            cursor = conn.execute("SELECT token, idx FROM vocabulary")
+            vocab = {row[0]: row[1] for row in cursor.fetchall()}
             self._vocab_cache = vocab
             if self._cache_timestamp == 0.0:
                 self._cache_timestamp = time.time()
-        return vocab
+            return vocab
 
     def _get_doc_freq(self) -> dict[str, int]:
         """Get document frequency mapping (token -> count), using cache with TTL."""
@@ -262,16 +271,13 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
         with self._cache_lock:
             if self._doc_freq_cache is not None:
                 return self._doc_freq_cache
-
-        conn = self._get_conn()
-        cursor = conn.execute("SELECT token, doc_freq FROM vocabulary")
-        doc_freq = {row[0]: row[1] for row in cursor.fetchall()}
-
-        with self._cache_lock:
+            conn = self._get_conn()
+            cursor = conn.execute("SELECT token, doc_freq FROM vocabulary")
+            doc_freq = {row[0]: row[1] for row in cursor.fetchall()}
             self._doc_freq_cache = doc_freq
             if self._cache_timestamp == 0.0:
                 self._cache_timestamp = time.time()
-        return doc_freq
+            return doc_freq
 
     @property
     def total_docs(self) -> int:
@@ -281,17 +287,14 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
         with self._cache_lock:
             if self._total_docs_cache is not None:
                 return self._total_docs_cache
-
-        conn = self._get_conn()
-        cursor = conn.execute("SELECT SUM(doc_count) FROM codebase_doc_counts")
-        row = cursor.fetchone()
-        total = row[0] or 0
-
-        with self._cache_lock:
+            conn = self._get_conn()
+            cursor = conn.execute("SELECT SUM(doc_count) FROM codebase_doc_counts")
+            row = cursor.fetchone()
+            total = row[0] or 0
             self._total_docs_cache = total
             if self._cache_timestamp == 0.0:
                 self._cache_timestamp = time.time()
-        return total
+            return total
 
     @property
     def vocab_size(self) -> int:
@@ -302,11 +305,37 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
         """Get document count for a specific codebase."""
         conn = self._get_conn()
         cursor = conn.execute(
-            "SELECT doc_count FROM codebase_doc_counts WHERE codebase_id = ?",
-            (codebase_id,)
+            "SELECT doc_count FROM codebase_doc_counts WHERE codebase_id = ?", (codebase_id,)
         )
         row = cursor.fetchone()
         return row[0] if row else 0
+
+    def get_tokens_by_indices(self, indices: list[int]) -> dict[int, str]:
+        """Return the current token for every requested sparse index.
+
+        Vocabulary indices are append-only, so this mapping is suitable for
+        inspecting and recovering persisted sparse vectors. Missing indices
+        raise instead of silently producing a partial or guessed mapping.
+        """
+        unique_indices = list(dict.fromkeys(indices))
+        if not unique_indices:
+            return {}
+
+        conn = self._get_conn()
+        found: dict[int, str] = {}
+        for start in range(0, len(unique_indices), 900):
+            batch = unique_indices[start : start + 900]
+            placeholders = ",".join("?" for _ in batch)
+            rows = conn.execute(
+                f"SELECT idx, token FROM vocabulary WHERE idx IN ({placeholders})",  # noqa: S608
+                batch,
+            ).fetchall()
+            found.update(rows)
+
+        missing = [index for index in unique_indices if index not in found]
+        if missing:
+            raise KeyError(f"unknown vocabulary indices: {missing}")
+        return {index: found[index] for index in unique_indices}
 
     def tokenize(self, text: str) -> list[str]:
         """
@@ -384,7 +413,39 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
             for token in doc_tokens:
                 new_doc_freq[token] += 1
 
-        doc_count = len(tokens_per_doc)
+        return self.register_codebase_frequencies(
+            codebase_id,
+            new_doc_freq,
+            len(tokens_per_doc),
+        )
+
+    def register_codebase_frequencies(
+        self,
+        codebase_id: str,
+        doc_frequencies: Mapping[str, int],
+        doc_count: int,
+    ) -> int:
+        """Atomically replace a contribution from pre-aggregated frequencies.
+
+        This is equivalent to :meth:`register_codebase` without retaining one
+        token set per document, which is useful when reconstructing a large
+        corpus from persisted sparse vectors.
+        """
+        if type(doc_count) is not int or doc_count < 0 or doc_count > SQLITE_MAX_INTEGER:
+            raise ValueError("doc_count must be a non-negative signed 64-bit integer")
+        new_doc_freq = Counter(doc_frequencies)
+        invalid = {
+            token: frequency
+            for token, frequency in new_doc_freq.items()
+            if not isinstance(token, str)
+            or not token
+            or type(frequency) is not int
+            or frequency <= 0
+            or frequency > doc_count
+            or frequency > SQLITE_MAX_INTEGER
+        }
+        if invalid:
+            raise ValueError("document frequencies must be positive and no greater than doc_count")
         new_tokens_count = 0
 
         # Cross-process file lock for multi-server coordination
@@ -455,6 +516,12 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
                 except sqlite3.Error as e:
                     conn.rollback()
                     logger.error(f"SQLite error registering codebase {codebase_id}: {e}")
+                    raise
+                except BaseException:
+                    # Python parameter binding can fail outside sqlite3.Error
+                    # (for example, integers wider than SQLite's signed 64-bit
+                    # range). Never leave BEGIN IMMEDIATE holding the writer lock.
+                    conn.rollback()
                     raise
 
         self._invalidate_cache()
@@ -697,9 +764,7 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
                     # One delta per token drives both the global counter and
                     # this codebase's contribution, so the aggregate stays equal
                     # to the sum of the contributions.
-                    deltas = self._contribution_deltas(
-                        conn, codebase_id, added_freq, removed_freq
-                    )
+                    deltas = self._contribution_deltas(conn, codebase_id, added_freq, removed_freq)
 
                     for token, delta in deltas.items():
                         # Floored at zero as a backstop. The delta above is what
@@ -712,8 +777,7 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
                         # database, so a value that slipped through would take
                         # searching down for all of them.
                         conn.execute(
-                            "UPDATE vocabulary SET doc_freq = MAX(doc_freq + ?, 0) "
-                            "WHERE token = ?",
+                            "UPDATE vocabulary SET doc_freq = MAX(doc_freq + ?, 0) WHERE token = ?",
                             (delta, token),
                         )
                         conn.execute(
@@ -858,9 +922,7 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
             if token in vocab:
                 matched_token = token
             elif fuzzy:
-                matched_token, similarity = self._find_fuzzy_match(
-                    token, vocab, fuzzy_threshold
-                )
+                matched_token, similarity = self._find_fuzzy_match(token, vocab, fuzzy_threshold)
 
             if matched_token:
                 idx = vocab[matched_token]
@@ -926,10 +988,62 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
         return best_match, best_score
 
     def get_codebase_ids(self) -> list[str]:
-        """Get list of registered codebase IDs."""
+        """Get every ID holding either a document count or token contribution."""
         conn = self._get_conn()
-        cursor = conn.execute("SELECT codebase_id FROM codebase_doc_counts")
+        cursor = conn.execute(
+            """
+            SELECT codebase_id FROM codebase_doc_counts
+            UNION
+            SELECT codebase_id FROM codebase_contributions
+            """
+        )
         return [row[0] for row in cursor.fetchall()]
+
+    def rebuild_aggregate_doc_frequencies(self) -> None:
+        """Make every global frequency equal the sum of codebase contributions.
+
+        This repairs historical residue that is not attributable to any current
+        contribution. Vocabulary token IDs remain untouched, so persisted sparse
+        vectors remain valid.
+        """
+        with file_lock(self.db_path, timeout=60.0):
+            conn = self._get_conn()
+            with self._conn_lock:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    conn.execute("DROP TABLE IF EXISTS temp.aggregate_doc_freq")
+                    conn.execute(
+                        """
+                        CREATE TEMP TABLE aggregate_doc_freq (
+                            token TEXT PRIMARY KEY,
+                            doc_freq INTEGER NOT NULL
+                        ) WITHOUT ROWID
+                        """
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO aggregate_doc_freq (token, doc_freq)
+                        SELECT token, SUM(doc_freq)
+                        FROM codebase_contributions
+                        GROUP BY token
+                        """
+                    )
+                    conn.execute(
+                        """
+                        UPDATE vocabulary
+                        SET doc_freq = COALESCE(
+                            (SELECT doc_freq FROM aggregate_doc_freq
+                             WHERE aggregate_doc_freq.token = vocabulary.token),
+                            0
+                        )
+                        """
+                    )
+                    conn.execute("DROP TABLE temp.aggregate_doc_freq")
+                    conn.commit()
+                except sqlite3.Error:
+                    conn.rollback()
+                    raise
+        self._invalidate_cache()
 
     def get_codebase_stats(self, codebase_id: str) -> dict[str, Any] | None:
         """Get statistics for a specific codebase."""

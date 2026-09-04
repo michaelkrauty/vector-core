@@ -9,6 +9,7 @@ from qdrant_client.models import (
     PointIdsList,
     PointStruct,
     ScoredPoint,
+    WriteOrdering,
 )
 
 from vector_core.embeddings.sparse import SparseVector
@@ -62,10 +63,9 @@ class TestClientTransportTimeout:
         """The lazily-built client carries the configured timeout."""
         storage = QdrantStorage(url="http://custom:6333", timeout=42)
 
-        with patch(
-            "vector_core.storage.qdrant.AsyncQdrantClient"
-        ) as mock_cls, patch.object(
-            storage, "check_health", AsyncMock(return_value=True)
+        with (
+            patch("vector_core.storage.qdrant.AsyncQdrantClient") as mock_cls,
+            patch.object(storage, "check_health", AsyncMock(return_value=True)),
         ):
             await storage._get_client()
 
@@ -110,7 +110,7 @@ class TestCollectionManagement:
         mock_collections = MagicMock()
         mock_collections.collections = [mock_collection]
 
-        with patch.object(storage, '_get_client') as mock_get_client:
+        with patch.object(storage, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.get_collections = AsyncMock(return_value=mock_collections)
             mock_get_client.return_value = mock_client
@@ -127,7 +127,7 @@ class TestCollectionManagement:
         mock_collections = MagicMock()
         mock_collections.collections = []
 
-        with patch.object(storage, '_get_client') as mock_get_client:
+        with patch.object(storage, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.get_collections = AsyncMock(return_value=mock_collections)
             mock_get_client.return_value = mock_client
@@ -141,7 +141,7 @@ class TestCollectionManagement:
         """collection_exists raises QdrantConnectionError on connect failure."""
         storage = QdrantStorage()
 
-        with patch.object(storage, '_get_client') as mock_get_client:
+        with patch.object(storage, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.get_collections = AsyncMock(
                 side_effect=httpx.ConnectError("Connection refused")
@@ -156,12 +156,10 @@ class TestCollectionManagement:
         """collection_exists re-raises non-connection errors (line 143)."""
         storage = QdrantStorage()
 
-        with patch.object(storage, '_get_client') as mock_get_client:
+        with patch.object(storage, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
             # Use an exception that doesn't contain "connect" or "refused"
-            mock_client.get_collections = AsyncMock(
-                side_effect=ValueError("Some other error")
-            )
+            mock_client.get_collections = AsyncMock(side_effect=ValueError("Some other error"))
             mock_get_client.return_value = mock_client
 
             with pytest.raises(ValueError, match="Some other error"):
@@ -172,7 +170,7 @@ class TestCollectionManagement:
         """create_collection creates hybrid collection."""
         storage = QdrantStorage(embedding_dim=384)
 
-        with patch.object(storage, '_get_client') as mock_get_client:
+        with patch.object(storage, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.create_collection = AsyncMock()
             mock_get_client.return_value = mock_client
@@ -190,7 +188,7 @@ class TestCollectionManagement:
         """delete_collection deletes the collection."""
         storage = QdrantStorage()
 
-        with patch.object(storage, '_get_client') as mock_get_client:
+        with patch.object(storage, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.delete_collection = AsyncMock()
             mock_get_client.return_value = mock_client
@@ -215,7 +213,7 @@ class TestCollectionManagement:
         mock_collections = MagicMock()
         mock_collections.collections = [mock_col1, mock_col2, mock_col3]
 
-        with patch.object(storage, '_get_client') as mock_get_client:
+        with patch.object(storage, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.get_collections = AsyncMock(return_value=mock_collections)
             mock_get_client.return_value = mock_client
@@ -241,7 +239,7 @@ class TestCollectionManagement:
         mock_collections = MagicMock()
         mock_collections.collections = [mock_col1, mock_col2, mock_col3]
 
-        with patch.object(storage, '_get_client') as mock_get_client:
+        with patch.object(storage, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.get_collections = AsyncMock(return_value=mock_collections)
             mock_get_client.return_value = mock_client
@@ -262,7 +260,7 @@ class TestPointOperations:
 
         sparse = SparseVector(indices=[0, 1], values=[0.5, 0.5])
 
-        with patch.object(storage, '_get_client') as mock_get_client:
+        with patch.object(storage, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.upsert = AsyncMock()
             mock_get_client.return_value = mock_client
@@ -284,7 +282,7 @@ class TestPointOperations:
         """upsert_batch does nothing for empty input."""
         storage = QdrantStorage()
 
-        with patch.object(storage, '_get_client') as mock_get_client:
+        with patch.object(storage, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_get_client.return_value = mock_client
 
@@ -306,7 +304,7 @@ class TestPointOperations:
             for i in range(5)
         ]
 
-        with patch.object(storage, '_get_client') as mock_get_client:
+        with patch.object(storage, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.upsert = AsyncMock()
             mock_get_client.return_value = mock_client
@@ -339,13 +337,13 @@ class TestPointOperations:
                 raise Exception("Transient error")
             # Third attempt succeeds
 
-        with patch.object(storage, '_get_client') as mock_get_client:
+        with patch.object(storage, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.upsert = mock_upsert
             mock_get_client.return_value = mock_client
 
             # Patch asyncio.sleep to speed up test
-            with patch('asyncio.sleep', new_callable=AsyncMock):
+            with patch("asyncio.sleep", new_callable=AsyncMock):
                 await storage.upsert_batch("test", points, max_retries=3)
 
         # Should have retried
@@ -367,12 +365,12 @@ class TestPointOperations:
         async def mock_upsert_always_fails(*args, **kwargs):
             raise Exception("Persistent error")
 
-        with patch.object(storage, '_get_client') as mock_get_client:
+        with patch.object(storage, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.upsert = mock_upsert_always_fails
             mock_get_client.return_value = mock_client
 
-            with patch('asyncio.sleep', new_callable=AsyncMock):
+            with patch("asyncio.sleep", new_callable=AsyncMock):
                 with pytest.raises(Exception, match="Persistent error"):
                     await storage.upsert_batch("test", points, max_retries=3)
 
@@ -397,7 +395,7 @@ class TestPointOperations:
             # Sleep well past the patched timeout so asyncio.timeout fires
             await asyncio.sleep(5)
 
-        with patch.object(storage, '_get_client') as mock_get_client:
+        with patch.object(storage, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.upsert = slow_upsert
             mock_get_client.return_value = mock_client
@@ -405,9 +403,7 @@ class TestPointOperations:
             with patch("vector_core.storage.qdrant.settings") as mock_settings:
                 mock_settings.qdrant_operation_timeout = 0.01
                 with pytest.raises(TimeoutError) as exc_info:
-                    await storage.upsert_batch(
-                        "test_collection", points, max_retries=1
-                    )
+                    await storage.upsert_batch("test_collection", points, max_retries=1)
 
         msg = str(exc_info.value)
         assert msg, "TimeoutError must not have an empty message"
@@ -422,7 +418,7 @@ class TestPointOperations:
         """delete_by_filter deletes matching points."""
         storage = QdrantStorage()
 
-        with patch.object(storage, '_get_client') as mock_get_client:
+        with patch.object(storage, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.delete = AsyncMock()
             mock_get_client.return_value = mock_client
@@ -436,7 +432,7 @@ class TestPointOperations:
         """delete_points deletes the given IDs via a PointIdsList selector."""
         storage = QdrantStorage()
 
-        with patch.object(storage, '_get_client') as mock_get_client:
+        with patch.object(storage, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.delete = AsyncMock()
             mock_get_client.return_value = mock_client
@@ -455,7 +451,7 @@ class TestPointOperations:
         """delete_points with no IDs is a no-op and never touches the client."""
         storage = QdrantStorage()
 
-        with patch.object(storage, '_get_client') as mock_get_client:
+        with patch.object(storage, "_get_client") as mock_get_client:
             await storage.delete_points("test", [])
 
             mock_get_client.assert_not_called()
@@ -468,7 +464,7 @@ class TestPointOperations:
         mock_point = MagicMock()
         mock_point.payload = {"key": "value"}
 
-        with patch.object(storage, '_get_client') as mock_get_client:
+        with patch.object(storage, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.scroll = AsyncMock(return_value=([mock_point], None))
             mock_get_client.return_value = mock_client
@@ -498,7 +494,7 @@ class TestPointOperations:
             else:
                 return ([mock_point2], None)
 
-        with patch.object(storage, '_get_client') as mock_get_client:
+        with patch.object(storage, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.scroll = AsyncMock(side_effect=mock_scroll)
             mock_get_client.return_value = mock_client
@@ -517,7 +513,7 @@ class TestMetadataStorage:
         """store_metadata stores at point ID=0."""
         storage = QdrantStorage(embedding_dim=384)
 
-        with patch.object(storage, '_get_client') as mock_get_client:
+        with patch.object(storage, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.upsert = AsyncMock()
             mock_get_client.return_value = mock_client
@@ -528,6 +524,10 @@ class TestMetadataStorage:
             call_args = mock_client.upsert.call_args
             points = call_args[0][1]
             assert points[0].id == 0  # Reserved ID for metadata
+            assert call_args.kwargs == {
+                "wait": True,
+                "ordering": WriteOrdering.STRONG,
+            }
 
     @pytest.mark.asyncio
     async def test_get_metadata_exists(self):
@@ -537,7 +537,7 @@ class TestMetadataStorage:
         mock_point = MagicMock()
         mock_point.payload = {"type": "__metadata__", "key": "value"}
 
-        with patch.object(storage, '_get_client') as mock_get_client:
+        with patch.object(storage, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.retrieve = AsyncMock(return_value=[mock_point])
             mock_get_client.return_value = mock_client
@@ -552,7 +552,7 @@ class TestMetadataStorage:
         """get_metadata returns None when no metadata."""
         storage = QdrantStorage()
 
-        with patch.object(storage, '_get_client') as mock_get_client:
+        with patch.object(storage, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.retrieve = AsyncMock(return_value=[])
             mock_get_client.return_value = mock_client
@@ -572,7 +572,7 @@ class TestMetadataStorage:
             "vocab_data": '{"hello": 1}',  # JSON string
         }
 
-        with patch.object(storage, '_get_client') as mock_get_client:
+        with patch.object(storage, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.retrieve = AsyncMock(return_value=[mock_point])
             mock_get_client.return_value = mock_client
@@ -602,7 +602,7 @@ class TestMetadataStorage:
             "plain": "hello",
         }
 
-        with patch.object(storage, '_get_client') as mock_get_client:
+        with patch.object(storage, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.retrieve = AsyncMock(return_value=[mock_point])
             mock_get_client.return_value = mock_client
@@ -628,7 +628,7 @@ class TestQueryOperations:
             ScoredPoint(id=1, version=1, score=0.9, payload={"key": "value"}, vector=None),
         ]
 
-        with patch.object(storage, '_get_client') as mock_get_client:
+        with patch.object(storage, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.query_points = AsyncMock(return_value=mock_response)
             mock_get_client.return_value = mock_client
@@ -654,7 +654,7 @@ class TestQueryOperations:
             ScoredPoint(id=1, version=1, score=0.8, payload={"key": "value"}, vector=None),
         ]
 
-        with patch.object(storage, '_get_client') as mock_get_client:
+        with patch.object(storage, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.query_points = AsyncMock(return_value=mock_response)
             mock_get_client.return_value = mock_client
@@ -704,7 +704,7 @@ class TestRetrievePoints:
         mock_point.id = 12345
         mock_point.payload = {"key": "value"}
 
-        with patch.object(storage, '_get_client') as mock_get_client:
+        with patch.object(storage, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.retrieve = AsyncMock(return_value=[mock_point])
             mock_get_client.return_value = mock_client
@@ -723,7 +723,7 @@ class TestGetClient:
         """get_client returns the underlying Qdrant client."""
         storage = QdrantStorage()
 
-        with patch.object(storage, '_get_client') as mock_get_client:
+        with patch.object(storage, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_get_client.return_value = mock_client
 

@@ -3,16 +3,17 @@
 import concurrent.futures
 import sqlite3
 import tempfile
+import threading
 from pathlib import Path
 
 import pytest
 
 from vector_core.embeddings.global_vocab import GlobalVocabulary
+from vector_core.embeddings.sparse import SparseVector
 from vector_core.embeddings.tokenization import (
     levenshtein_distance,
     levenshtein_similarity,
 )
-from vector_core.embeddings.sparse import SparseVector
 
 
 class TestGlobalVocabularyInit:
@@ -48,6 +49,18 @@ class TestGlobalVocabularyInit:
             assert vocab.min_token_length == 4
             assert vocab.stop_tokens == {"custom", "stop"}
             vocab.close()
+
+    def test_custom_sqlite_synchronous_mode(self, tmp_path):
+        """External intent journals can request power-loss durable commits."""
+        vocab = GlobalVocabulary(
+            db_path=tmp_path / "test.db",
+            synchronous="FULL",
+        )
+
+        mode = vocab._get_conn().execute("PRAGMA synchronous").fetchone()[0]
+
+        assert mode == 2
+        vocab.close()
 
     def test_empty_vocab_stats(self, tmp_path):
         """Empty vocabulary has correct stats."""
@@ -92,9 +105,7 @@ class TestTokenization:
 
     def test_min_length_filter(self, tmp_path):
         """Short tokens are filtered."""
-        vocab = GlobalVocabulary(
-            db_path=tmp_path / "test.db", min_token_length=3
-        )
+        vocab = GlobalVocabulary(db_path=tmp_path / "test.db", min_token_length=3)
         tokens = vocab.tokenize("a ab abc abcd")
 
         assert "a" not in tokens
@@ -121,6 +132,219 @@ class TestCodebaseRegistration:
         assert vocab.vocab_size == 4
         assert vocab.total_docs == 2
         vocab.close()
+
+    def test_token_recovery_rejects_unknown_index(self, tmp_path):
+        """Recovery never returns a partial mapping for a corrupt sparse vector."""
+        vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
+        vocab.register_codebase("test", [{"known"}])
+
+        with pytest.raises(KeyError, match=r"unknown vocabulary indices: \[99\]"):
+            vocab.get_tokens_by_indices([0, 99])
+        vocab.close()
+
+    def test_token_recovery_returns_every_requested_index(self, tmp_path):
+        """Recovery returns a complete mapping in requested-index order."""
+        vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
+        vocab.register_codebase("test", [{"alpha", "beta", "gamma"}])
+        token_to_index = vocab._get_vocab()
+        requested = list(reversed(token_to_index.values()))
+
+        assert vocab.get_tokens_by_indices(requested) == {
+            index: token for token, index in reversed(token_to_index.items())
+        }
+        vocab.close()
+
+    def test_codebase_ids_include_contribution_without_count(self, tmp_path):
+        """Repair tooling can discover historical contribution-only rows."""
+        vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
+        vocab.register_codebase("stranded", [{"token"}])
+        conn = vocab._get_conn()
+        conn.execute("DELETE FROM codebase_doc_counts WHERE codebase_id = 'stranded'")
+        conn.commit()
+
+        assert "stranded" in vocab.get_codebase_ids()
+        vocab.close()
+
+    def test_rebuild_aggregate_frequencies_preserves_indices(self, tmp_path):
+        """Unattributed global residue is removed without renumbering tokens."""
+        vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
+        vocab.register_codebase("one", [{"shared", "first"}])
+        vocab.register_codebase("two", [{"shared", "second"}, {"second"}])
+        indices_before = vocab._get_vocab().copy()
+        conn = vocab._get_conn()
+        conn.execute("UPDATE vocabulary SET doc_freq = doc_freq + 100")
+        conn.commit()
+
+        vocab.rebuild_aggregate_doc_frequencies()
+
+        assert vocab._get_vocab() == indices_before
+        assert vocab._get_doc_freq()["shared"] == 2
+        assert vocab._get_doc_freq()["first"] == 1
+        assert vocab._get_doc_freq()["second"] == 2
+        vocab.close()
+
+    def test_preaggregated_registration_matches_document_registration(self, tmp_path):
+        vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
+
+        vocab.register_codebase_frequencies(
+            "test",
+            {"alpha": 2, "beta": 1},
+            2,
+        )
+
+        assert vocab.get_codebase_doc_count("test") == 2
+        assert vocab._get_doc_freq()["alpha"] == 2
+        assert vocab._get_doc_freq()["beta"] == 1
+        vocab.close()
+
+    def test_preaggregated_registration_rejects_impossible_frequency(self, tmp_path):
+        vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
+
+        with pytest.raises(ValueError, match="no greater than doc_count"):
+            vocab.register_codebase_frequencies("test", {"alpha": 2}, 1)
+
+        assert vocab.get_codebase_ids() == []
+        vocab.close()
+
+    @pytest.mark.parametrize(
+        ("frequencies", "doc_count"),
+        [
+            ({"alpha": 0.5}, 1),
+            ({"alpha": True}, 1),
+            ({"alpha": 1}, 1.5),
+            ({"alpha": 1}, True),
+            ({1: 1}, 1),
+            ({"": 1}, 1),
+            ({"alpha": 1}, 2**100),
+            ({"alpha": 2**100}, 2**100),
+        ],
+    )
+    def test_preaggregated_registration_rejects_invalid_runtime_types(
+        self, tmp_path, frequencies, doc_count
+    ):
+        vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
+
+        with pytest.raises(ValueError):
+            vocab.register_codebase_frequencies("test", frequencies, doc_count)
+
+        assert vocab.get_codebase_ids() == []
+        assert vocab._get_conn().in_transaction is False
+        vocab.close()
+
+    def test_aggregate_rebuild_never_drops_same_named_main_table(self, tmp_path):
+        vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
+        conn = vocab._get_conn()
+        conn.execute("CREATE TABLE aggregate_doc_freq (sentinel TEXT)")
+        conn.execute("INSERT INTO aggregate_doc_freq VALUES ('keep')")
+        conn.commit()
+
+        vocab.rebuild_aggregate_doc_frequencies()
+
+        assert conn.execute("SELECT sentinel FROM aggregate_doc_freq").fetchone() == ("keep",)
+        vocab.close()
+
+    def test_public_invalidation_refreshes_cross_process_snapshot(self, tmp_path):
+        """A coordinated reader can discard maps cached before another writer."""
+        db_path = tmp_path / "test.db"
+        reader = GlobalVocabulary(db_path=db_path, cache_ttl=3600)
+        writer = GlobalVocabulary(db_path=db_path, cache_ttl=3600)
+        reader.register_codebase("initial", [{"first"}])
+        assert "second" not in reader._get_vocab()
+        writer.register_codebase("later", [{"second"}])
+        assert "second" not in reader._get_vocab()
+
+        reader.invalidate_cache()
+
+        assert "second" in reader._get_vocab()
+        reader.close()
+        writer.close()
+
+    @pytest.mark.parametrize(
+        ("kind", "query_fragment"),
+        [
+            ("vocab", "SELECT token, idx FROM vocabulary"),
+            ("frequencies", "SELECT token, doc_freq FROM vocabulary"),
+            ("total", "SELECT SUM(doc_count) FROM codebase_doc_counts"),
+        ],
+    )
+    def test_invalidation_cannot_be_overwritten_by_inflight_read(
+        self, tmp_path, monkeypatch, kind, query_fragment
+    ):
+        """A read started before invalidation cannot publish after it."""
+        db_path = tmp_path / f"{kind}.db"
+        reader = GlobalVocabulary(db_path=db_path, cache_ttl=3600)
+        writer = GlobalVocabulary(db_path=db_path, cache_ttl=3600)
+        writer.register_codebase("initial", [{"alpha"}])
+        reader.invalidate_cache()
+        real_conn = reader._get_conn()
+        fetched = threading.Event()
+        release = threading.Event()
+        invalidated = threading.Event()
+        blocked_once = False
+
+        class BlockingCursor:
+            def __init__(self, cursor):
+                self.cursor = cursor
+
+            def fetchall(self):
+                rows = self.cursor.fetchall()
+                fetched.set()
+                release.wait(timeout=2.0)
+                return rows
+
+            def fetchone(self):
+                row = self.cursor.fetchone()
+                fetched.set()
+                release.wait(timeout=2.0)
+                return row
+
+        class BlockingConnection:
+            def execute(self, sql, parameters=()):
+                nonlocal blocked_once
+                cursor = real_conn.execute(sql, parameters)
+                if query_fragment in sql and not blocked_once:
+                    blocked_once = True
+                    return BlockingCursor(cursor)
+                return cursor
+
+        def blocking_connection():
+            return BlockingConnection()
+
+        monkeypatch.setattr(reader, "_get_conn", blocking_connection)
+
+        def read_value():
+            if kind == "vocab":
+                return reader._get_vocab()
+            if kind == "frequencies":
+                return reader._get_doc_freq()
+            return reader.total_docs
+
+        read_thread = threading.Thread(target=read_value)
+        read_thread.start()
+        assert fetched.wait(1.0)
+        writer.register_codebase("later", [{"beta"}])
+
+        def invalidate():
+            reader.invalidate_cache()
+            invalidated.set()
+
+        invalidate_thread = threading.Thread(target=invalidate)
+        invalidate_thread.start()
+        assert not invalidated.wait(0.05)
+        release.set()
+        read_thread.join(timeout=1.0)
+        invalidate_thread.join(timeout=1.0)
+        assert not read_thread.is_alive()
+        assert not invalidate_thread.is_alive()
+
+        if kind == "vocab":
+            assert "beta" in reader._get_vocab()
+        elif kind == "frequencies":
+            assert reader._get_doc_freq()["beta"] == 1
+        else:
+            assert reader.total_docs == 2
+        reader.close()
+        writer.close()
 
     def test_register_multiple_codebases(self, tmp_path):
         """Multiple codebases share vocabulary."""
@@ -205,10 +429,13 @@ class TestDocumentVectorization:
     def test_vectorize_document_tf_weights(self, tmp_path):
         """Document vectors use TF weights (not IDF)."""
         vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
-        vocab.register_codebase("test", [
-            {"hello"},  # hello in 1 doc
-            {"rare"},   # rare in 1 doc
-        ])
+        vocab.register_codebase(
+            "test",
+            [
+                {"hello"},  # hello in 1 doc
+                {"rare"},  # rare in 1 doc
+            ],
+        )
 
         # Both terms appear once, should have similar TF weights
         vec_hello = vocab.vectorize_document("hello hello hello")
@@ -271,11 +498,14 @@ class TestQueryVectorization:
     def test_vectorize_query_idf_weights(self, tmp_path):
         """Query vectors use IDF weights."""
         vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
-        vocab.register_codebase("test", [
-            {"common", "rare"},
-            {"common"},
-            {"common"},
-        ])
+        vocab.register_codebase(
+            "test",
+            [
+                {"common", "rare"},
+                {"common"},
+                {"common"},
+            ],
+        )
 
         vec = vocab.vectorize_query("common rare")
 
@@ -359,14 +589,20 @@ class TestCrossCodebaseConsistency:
         vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
 
         # Two codebases with some overlap
-        vocab.register_codebase("codebase1", [
-            {"authenticate", "user", "session"},
-            {"validate", "token"},
-        ])
-        vocab.register_codebase("codebase2", [
-            {"authenticate", "api", "key"},
-            {"authorize", "request"},
-        ])
+        vocab.register_codebase(
+            "codebase1",
+            [
+                {"authenticate", "user", "session"},
+                {"validate", "token"},
+            ],
+        )
+        vocab.register_codebase(
+            "codebase2",
+            [
+                {"authenticate", "api", "key"},
+                {"authorize", "request"},
+            ],
+        )
 
         # Query should use global IDF
         query_vec = vocab.vectorize_query("authenticate user")
@@ -627,10 +863,13 @@ class TestIncrementalUpdate:
         """Incremental update decrements doc_freq."""
         vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
 
-        vocab.register_codebase("test", [
-            {"hello", "world"},
-            {"hello", "foo"},
-        ])
+        vocab.register_codebase(
+            "test",
+            [
+                {"hello", "world"},
+                {"hello", "foo"},
+            ],
+        )
 
         # Remove a doc with "hello"
         vocab.update_codebase_incremental(
@@ -732,10 +971,7 @@ class TestThreadSafety:
             except Exception as e:
                 errors.append(e)
 
-        threads = [
-            threading.Thread(target=get_instance_thread)
-            for _ in range(10)
-        ]
+        threads = [threading.Thread(target=get_instance_thread) for _ in range(10)]
         for t in threads:
             t.start()
         for t in threads:
@@ -760,10 +996,7 @@ class TestThreadSafety:
             )
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-            futures = [
-                executor.submit(register, f"codebase_{i}")
-                for i in range(10)
-            ]
+            futures = [executor.submit(register, f"codebase_{i}") for i in range(10)]
             concurrent.futures.wait(futures)
 
         assert vocab.total_docs == 10
@@ -914,7 +1147,9 @@ class TestEdgeCases:
                 value TEXT NOT NULL
             )
         """)
-        conn.execute("INSERT INTO metadata VALUES ('schema_version', ?)", (str(SCHEMA_VERSION + 1),))
+        conn.execute(
+            "INSERT INTO metadata VALUES ('schema_version', ?)", (str(SCHEMA_VERSION + 1),)
+        )
         conn.commit()
         conn.close()
 
@@ -1051,10 +1286,7 @@ class TestExceptionRollback:
 
         # Incremental update
         new_tokens = vocab.update_codebase_incremental(
-            "test",
-            added_tokens=[{"newtok1", "newtok2"}],
-            removed_tokens=[],
-            net_doc_change=1
+            "test", added_tokens=[{"newtok1", "newtok2"}], removed_tokens=[], net_doc_change=1
         )
 
         assert new_tokens >= 0
@@ -1139,9 +1371,7 @@ class TestFuzzyMatching:
         """Only tokens of similar length are considered."""
         vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
         # Add tokens of varying lengths
-        vocab.register_codebase("test", [
-            {"ab", "abc", "abcd", "abcdefghij", "abcdefghijklmnop"}
-        ])
+        vocab.register_codebase("test", [{"ab", "abc", "abcd", "abcdefghij", "abcdefghijklmnop"}])
 
         vocab_dict = vocab._get_vocab()
         # Looking for 4-char token, should only match similar lengths
