@@ -8,6 +8,7 @@ import struct
 import sys
 import threading
 from contextlib import asynccontextmanager
+from multiprocessing import Process
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -19,6 +20,12 @@ from vector_core.embeddings.cache import EmbeddingCache
 from vector_core.embeddings.client import EmbeddingClient, EmbeddingServiceError
 from vector_core.embeddings.limiter import GlobalRequestLimiter
 from vector_core.settings import VectorCoreSettings
+
+
+def _initialize_shared_cache(path: Path, index: int) -> None:
+    cache = EmbeddingCache(path)
+    cache.set_many({f"key-{index}": [float(index), 1.0]}, expected_dim=2)
+    cache.close()
 
 
 def test_global_concurrency_setting_allows_zero_but_not_negative() -> None:
@@ -90,6 +97,20 @@ def test_bulk_cache_write_validates_every_vector_before_transaction(tmp_path: Pa
         )
 
     assert cache.get_many(["would-be-valid"], expected_dim=2) == {}
+    cache.close()
+
+
+def test_concurrent_processes_initialize_one_cache(tmp_path: Path) -> None:
+    path = tmp_path / "embeddings.db"
+    processes = [Process(target=_initialize_shared_cache, args=(path, index)) for index in range(6)]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=10)
+        assert process.exitcode == 0
+
+    cache = EmbeddingCache(path)
+    assert len(cache.get_many([f"key-{index}" for index in range(6)], expected_dim=2)) == 6
     cache.close()
 
 

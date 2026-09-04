@@ -13,6 +13,7 @@ from typing import cast
 
 from vector_core.settings import settings
 from vector_core.utils.hashing import hash_content
+from vector_core.utils.locking import file_lock
 from vector_core.utils.sqlite import SQLiteConfig, ThreadSafeSQLiteStore
 
 EMBEDDING_CACHE_SCHEMA_VERSION = "binary-f32-v1"
@@ -48,7 +49,11 @@ class EmbeddingCache(ThreadSafeSQLiteStore):
         self._stats_lock = threading.Lock()  # Only protects in-memory stats dict
         self._stats = {"hits": 0, "misses": 0}
         self._ensure_parent_dir()
-        self._init_db()
+        # Several MCP processes commonly start together. Serialize PRAGMA/DDL
+        # initialization so a harmless first-use race cannot disable caching in
+        # every process except the winner.
+        with file_lock(db_path, timeout=30.0):
+            self._init_db()
 
     # Alias for backward compatibility (cache_path was the public name)
     @property
