@@ -330,11 +330,22 @@ def test_cache_namespaces_do_not_split_backend_limiter_scope(tmp_path: Path) -> 
     assert first._request_limiter._scope_dir == second._request_limiter._scope_dir
     assert first._request_limiter._scope_dir != other_model._request_limiter._scope_dir
 
+    other_endpoint = EmbeddingClient(
+        base_url="http://other-backend",
+        model="model",
+        dim=2,
+        cache_namespace="cache-a",
+        limiter_dir=tmp_path,
+    )
+    first.dim = 2
+    assert first._persistent_cache_key("text") != other_endpoint._persistent_cache_key("text")
+
 
 def test_limiter_closes_descriptor_on_unexpected_flock_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    limiter = GlobalRequestLimiter(1, "scope", tmp_path)
     opened: list[int] = []
     real_open = limiter_module.os.open
 
@@ -351,9 +362,20 @@ def test_limiter_closes_descriptor_on_unexpected_flock_error(
     )
 
     with pytest.raises(OSError, match="unexpected"):
-        GlobalRequestLimiter(1, "scope", tmp_path)._try_acquire()
+        limiter._try_acquire()
     with pytest.raises(OSError):
         os.fstat(opened[0])
+
+
+def test_limiter_rejects_mixed_capacities_for_one_scope(tmp_path: Path) -> None:
+    GlobalRequestLimiter(2, "shared-scope", tmp_path)
+    GlobalRequestLimiter(2, "shared-scope", tmp_path)
+
+    with pytest.raises(ValueError, match="differs from the existing scope"):
+        GlobalRequestLimiter(3, "shared-scope", tmp_path)
+    # Zero explicitly disables coordination and remains a backwards-compatible
+    # opt-out even when enabled clients have established a manifest.
+    GlobalRequestLimiter(0, "shared-scope", tmp_path)
 
 
 @pytest.mark.asyncio

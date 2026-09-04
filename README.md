@@ -87,7 +87,10 @@ All settings are configured via environment variables prefixed with `VECTOR_`. M
 All processes using the same endpoint, model, and cache directory must use the
 same nonzero `VECTOR_EMBEDDING_GLOBAL_CONCURRENCY` value. During a rolling
 configuration change, mixed capacities make the effective limit the largest
-capacity any process can see.
+capacity any process can see; once an enabled scope has created its capacity
+manifest, later clients with a different nonzero value fail fast. A process set
+to `0` deliberately opts out and cannot be constrained by other clients. Stop every process
+using that backend and remove the scope's limiter directory before changing it.
 
 ### Cache
 
@@ -160,17 +163,19 @@ vector = await client.embed_single("hello world")
 ```
 
 Persistent reuse applies to `embed_all()` indexing workloads and is deliberately
-opt-in. Configure a stable namespace that changes whenever the deployed model or
-its behavior changes, and configure the output dimension so reads can begin on
-the first call:
+opt-in. Configure an immutable model-artifact/deployment fingerprint as the
+namespace, change it whenever weights or serving behavior change, and configure
+the output dimension so reads can begin on the first call. Reusing a namespace
+across different weights is unsupported because the OpenAI embeddings API does
+not expose a standard model-revision fingerprint:
 
 ```bash
-export VECTOR_EMBEDDING_CACHE_NAMESPACE=production-embedding-v1
+export VECTOR_EMBEDDING_CACHE_NAMESPACE="model-artifact-sha256:0123456789abcdef..."
 export VECTOR_EMBEDDING_DIM=1024
 export VECTOR_EMBEDDING_GLOBAL_CONCURRENCY=4
 ```
 
-Keys include the namespace, API model name, output dimension, cache schema,
+Keys include the namespace, API endpoint, model name, output dimension, cache schema,
 preprocessing version, and hash of the post-truncation input. Values are stored
 as binary float32 vectors. If the configured dimension is `0`, the first request
 infers it and populates the cache; later calls can read it. Cache I/O errors fail

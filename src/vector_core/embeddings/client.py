@@ -596,15 +596,20 @@ class EmbeddingClient:
         if not self.cache_namespace or self.dim <= 0:
             return
         entries = {
-            EmbeddingCache.make_key(
-                text,
-                namespace=self.cache_namespace,
-                model=self.model,
-                dim=self.dim,
-            ): embedding
+            self._persistent_cache_key(text): embedding
             for text, embedding in zip(effective_texts, embeddings, strict=True)
         }
         await asyncio.to_thread(cache.set_many, entries, expected_dim=self.dim)
+
+    def _persistent_cache_key(self, effective_text: str) -> str:
+        """Key one effective input to an explicit deployment and endpoint."""
+        assert self.cache_namespace is not None
+        return EmbeddingCache.make_key(
+            effective_text,
+            namespace=f"{self.cache_namespace}\0{self.base_url}",
+            model=self.model,
+            dim=self.dim,
+        )
 
     async def _embed_all_cached(
         self,
@@ -614,15 +619,7 @@ class EmbeddingClient:
     ) -> list[list[float]]:
         """Resolve cache hits and scatter each unique miss back to every input position."""
         assert self.cache_namespace is not None
-        keys = [
-            EmbeddingCache.make_key(
-                text,
-                namespace=self.cache_namespace,
-                model=self.model,
-                dim=self.dim,
-            )
-            for text in effective_texts
-        ]
+        keys = [self._persistent_cache_key(text) for text in effective_texts]
         unique_keys = list(dict.fromkeys(keys))
         try:
             cached = await asyncio.to_thread(cache.get_many, unique_keys, expected_dim=self.dim)

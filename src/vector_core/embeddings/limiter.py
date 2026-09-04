@@ -47,6 +47,42 @@ class GlobalRequestLimiter:
         self.capacity = capacity
         scope_hash = hashlib.sha256(scope.encode()).hexdigest()
         self._scope_dir = lock_dir / scope_hash
+        self._validate_capacity_manifest()
+
+    def _validate_capacity_manifest(self) -> None:
+        """Reject conflicting capacities for an existing endpoint/model scope."""
+        if self.capacity == 0:
+            return
+        self._scope_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = self._scope_dir / "capacity.lock"
+        capacity_path = self._scope_dir / "capacity"
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            capacity_fd = os.open(capacity_path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                raw = os.read(capacity_fd, 64).decode("ascii").strip()
+                if raw:
+                    try:
+                        configured = int(raw)
+                    except ValueError as exc:
+                        raise RuntimeError(
+                            f"Invalid embedding limiter capacity manifest: {capacity_path}"
+                        ) from exc
+                    if configured != self.capacity:
+                        raise ValueError(
+                            "embedding global concurrency differs from the existing "
+                            f"scope ({self.capacity} != {configured}); stop every process "
+                            f"using this backend and remove {self._scope_dir} before changing it"
+                        )
+                else:
+                    os.write(capacity_fd, f"{self.capacity}\n".encode("ascii"))
+                    os.fsync(capacity_fd)
+            finally:
+                os.close(capacity_fd)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
 
     def _try_acquire(self) -> int | None:
         self._scope_dir.mkdir(parents=True, exist_ok=True)
