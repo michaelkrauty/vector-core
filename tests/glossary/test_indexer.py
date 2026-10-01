@@ -94,6 +94,9 @@ def migration(monkeypatch):
 
     state.ensure = AsyncMock(side_effect=ensure)
     monkeypatch.setattr(indexer_module, "ensure_embedding_collection", state.ensure)
+    monkeypatch.setattr(
+        indexer_module, "active_embedding_collection", AsyncMock(return_value="test_collection")
+    )
     monkeypatch.setattr(indexer_module, "embedding_collection_lock", lock)
     return state
 

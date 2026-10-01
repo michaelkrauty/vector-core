@@ -95,6 +95,19 @@ async def test_glossary_search_migrates_exact_long_input_and_retains_source(reso
     client.embed_all.assert_awaited_once_with([_generate_embedding_content(entry)], role="document")
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_glossary_ensure_reports_creation_only_for_current_call(resources, legacy):
+    storage, glossary, _, vocab = resources
+    if legacy:
+        await seed(storage, {"type": "document", "content": "retained text"})
+    client = embedder()
+    indexer = GlossaryIndexer("shared", glossary, storage, client, vocab)
+    assert await indexer.ensure_collection() is True
+    assert await indexer.ensure_collection() is False
+    another = GlossaryIndexer("shared", glossary, storage, embedder(), vocab)
+    assert await another.ensure_collection() is False
+
+
 async def test_mismatched_glossary_row_does_not_publish_or_write(resources):
     storage, glossary, _, vocab = resources
     entry = glossary.create("API", "Interface", "definition", "software", ["First"])

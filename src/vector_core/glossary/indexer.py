@@ -14,6 +14,7 @@ from vector_core.glossary.models import GlossaryEntry
 from vector_core.glossary.store import GlossaryStore
 from vector_core.storage.embedding_migration import (
     CollectionGeneration,
+    active_embedding_collection,
     embedding_collection_lock,
     ensure_embedding_collection,
 )
@@ -101,8 +102,12 @@ class GlossaryIndexer:
         Returns:
             True if collection was created, False if existed
         """
-        generation = await self._ensure_generation()
-        return generation.migrated
+        if self._generation is not None:
+            return False
+        async with embedding_collection_lock(self.storage, self.logical_name):
+            previous = await active_embedding_collection(self.storage, self.logical_name)
+            generation = await self._ensure_generation(lock_held=True)
+            return generation.physical_name != previous
 
     async def _resolve_embedding_text(self, payload: dict[str, Any]) -> str:
         return await resolve_shared_embedding_text(payload, glossary_store=self.glossary_store)
