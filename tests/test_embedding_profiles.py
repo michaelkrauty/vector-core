@@ -231,6 +231,31 @@ async def test_raw_tokenizer_budget_includes_postprocessor_tokens(tokenizer_file
     assert len(tokenizer.encode(sent, add_special_tokens=False).ids) == 2
 
 
+@pytest.mark.parametrize("kind", ["wordpiece", "unigram"])
+async def test_token_limit_preserves_later_merged_prefix(tmp_path, kind):
+    if kind == "wordpiece":
+        vocabulary = ["[UNK]", "a", "##b", "##c", "##d", "##e", "##f", "abcdef", "tail"]
+        model = models.WordPiece(
+            {token: i for i, token in enumerate(vocabulary)}, unk_token="[UNK]"
+        )
+    else:
+        vocabulary = ["[UNK]", "a", "b", "c", "d", "e", "f", "abcdef", "tail"]
+        model = models.Unigram([(token, -1.0) for token in vocabulary], unk_id=0)
+    tokenizer = Tokenizer(model)
+    tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+    path = tmp_path / "nonmonotonic-tokenizer.json"
+    tokenizer.save(str(path))
+    assert len(tokenizer.encode("abcd").ids) > 1
+    assert len(tokenizer.encode("abcdef").ids) == 1
+    requests = []
+    async with wire(
+        EmbeddingClient(model="generic", dim=2, tokenizer_path=path, max_input_tokens=1),
+        requests,
+    ) as client:
+        await client.embed_single("abcdef tail tail")
+    assert requests[0]["input"] == ["abcdef"]
+
+
 def test_formatting_changes_identity_and_roundtrip(tokenizer_file):
     base = EmbeddingClient(model="alias", dim=2).configured_identity()
     changes: list[dict[str, Any]] = [

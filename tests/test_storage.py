@@ -1,14 +1,18 @@
 """Tests for QdrantStorage."""
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import (
+    Distance,
     PointIdsList,
     PointStruct,
     ScoredPoint,
+    VectorParams,
     WriteOrdering,
 )
 
@@ -39,6 +43,11 @@ class TestQdrantStorageInit:
         assert storage.url == "http://custom:6333"
         assert storage.api_key == "secret"
         assert storage.embedding_dim == 384
+
+    def test_explicit_auto_detect_dimension(self, monkeypatch):
+        """An explicit zero must not inherit a configured nonzero default."""
+        monkeypatch.setattr(settings, "embedding_dim", 384)
+        assert QdrantStorage(embedding_dim=0).embedding_dim == 0
 
     def test_timeout_defaults_to_configured_operation_timeout(self):
         """Storage adopts the configured Qdrant operation timeout by default."""
@@ -516,6 +525,13 @@ class TestMetadataStorage:
         with patch.object(storage, "_get_client") as mock_get_client:
             mock_client = AsyncMock()
             mock_client.upsert = AsyncMock()
+            mock_client.get_collection.return_value = SimpleNamespace(
+                config=SimpleNamespace(
+                    params=SimpleNamespace(
+                        vectors={"dense": VectorParams(size=3, distance=Distance.COSINE)}
+                    )
+                )
+            )
             mock_get_client.return_value = mock_client
 
             await storage.store_metadata("test", {"key": "value"})
@@ -524,10 +540,27 @@ class TestMetadataStorage:
             call_args = mock_client.upsert.call_args
             points = call_args[0][1]
             assert points[0].id == 0  # Reserved ID for metadata
+            assert points[0].vector["dense"] == [0.0] * 3
+            mock_client.get_collection.assert_awaited_once_with("test")
+            assert storage.embedding_dim == 384
             assert call_args.kwargs == {
                 "wait": True,
                 "ordering": WriteOrdering.STRONG,
             }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("vectors", [{}, VectorParams(size=3, distance=Distance.COSINE)])
+    async def test_store_metadata_requires_named_dense_schema(self, vectors):
+        """A configured default cannot substitute for an unknown target schema."""
+        storage = QdrantStorage(embedding_dim=384)
+        mock_client = AsyncMock()
+        mock_client.get_collection.return_value = SimpleNamespace(
+            config=SimpleNamespace(params=SimpleNamespace(vectors=vectors))
+        )
+        with patch.object(storage, "_get_client", return_value=mock_client):
+            with pytest.raises(RuntimeError, match="no valid named dense vector schema"):
+                await storage.store_metadata("test", {"key": "value"})
+        mock_client.upsert.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_get_metadata_exists(self):
@@ -769,7 +802,10 @@ class TestClientCreation:
         assert storage._client is None
 
         # Call _get_client
-        client = await storage._get_client()
+        with patch.object(
+            storage, "_new_client", return_value=AsyncQdrantClient(location=":memory:")
+        ):
+            client = await storage._get_client()
 
         # Client should now be set
         assert client is not None
@@ -845,8 +881,6 @@ class TestHealthCheck:
     @pytest.mark.asyncio
     async def test_check_health_returns_false_on_timeout(self):
         """check_health returns False on timeout."""
-        import asyncio
-
         storage = QdrantStorage()
 
         async def slow_response():
@@ -897,8 +931,6 @@ class TestHealthCheck:
     @pytest.mark.asyncio
     async def test_get_client_triggers_health_check_periodically(self):
         """_get_client triggers health check when interval elapsed."""
-        import time
-
         storage = QdrantStorage(health_check_interval=0.0)  # Immediate health check
 
         with patch("vector_core.storage.qdrant.AsyncQdrantClient") as mock_class:

@@ -2,8 +2,10 @@
 
 import hashlib
 import json
+import re
 from dataclasses import asdict, dataclass
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from vector_core.embeddings.cache import EMBEDDING_PREPROCESSING_VERSION
 
@@ -28,6 +30,7 @@ class EmbeddingIdentity:
     max_input_bytes: int = 0
     max_input_tokens: int | None = None
     tokenizer_fingerprint: str | None = None
+    endpoint_auth_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.model, str) or not isinstance(self.endpoint, str):
@@ -50,11 +53,29 @@ class EmbeddingIdentity:
             type(self.max_input_tokens) is not int or self.max_input_tokens <= 0
         ):
             raise ValueError("Embedding identity requires a positive token limit")
-        object.__setattr__(self, "endpoint", self.endpoint.rstrip("/"))
+        if self.endpoint_auth_fingerprint is not None and (
+            not isinstance(self.endpoint_auth_fingerprint, str)
+            or re.fullmatch(r"[0-9a-f]{64}", self.endpoint_auth_fingerprint) is None
+        ):
+            raise ValueError("Embedding endpoint auth fingerprint must be a SHA-256 digest")
+        endpoint = self.endpoint.rstrip("/")
+        parsed = urlsplit(endpoint)
+        if "@" in parsed.netloc:
+            userinfo, _, host = parsed.netloc.rpartition("@")
+            # Persist only an opaque discriminator; the HTTP client retains its original URL.
+            object.__setattr__(
+                self, "endpoint_auth_fingerprint", hashlib.sha256(userinfo.encode()).hexdigest()
+            )
+            endpoint = urlunsplit(parsed._replace(netloc=host))
+        object.__setattr__(self, "endpoint", endpoint)
         object.__setattr__(self, "namespace", self.namespace or None)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        value = asdict(self)
+        # Keep unauthenticated identities compatible with existing manifests and cache keys.
+        if self.endpoint_auth_fingerprint is None:
+            value.pop("endpoint_auth_fingerprint")
+        return value
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "EmbeddingIdentity":

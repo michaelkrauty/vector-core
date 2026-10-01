@@ -514,13 +514,6 @@ class EmbeddingClient:
         # Qwen servers may append EOS. Nemotron's contract adds no special tokens.
         budget = (self.max_input_tokens or 0) - (8 if self.profile == "qwen3" else 0)
 
-        def fits(value: str) -> bool:
-            assert tokenizer is not None
-            # Generic tokenizers may insert CLS/SEP or other postprocessor
-            # tokens. Known profiles account for backend specials above.
-            tokens = tokenizer.encode(prefix + value, add_special_tokens=self.profile == "raw")
-            return len(tokens.ids) <= budget
-
         prepared = []
         for text in texts:
             if not isinstance(text, str) or not text.strip():
@@ -529,21 +522,42 @@ class EmbeddingClient:
             if self.max_input_bytes:
                 body = body.encode("utf-8")[:byte_budget].decode("utf-8", errors="ignore")
             if tokenizer is not None:
-                if not fits(body):
-                    low, high = 0, len(body)
-                    while low < high:
-                        middle = (low + high + 1) // 2
-                        if fits(body[:middle]):
-                            low = middle
-                        else:
-                            high = middle - 1
-                    body = body[:low]
-                if not fits(body):
-                    raise ValueError("Embedding role prefix exceeds the token budget")
+                body = self._truncate_by_tokens(prefix, body, budget)
             if not body.strip():
                 raise ValueError("Embedding input limit leaves no non-blank content after prefix")
             prepared.append(prefix + body)
         return prepared
+
+    def _truncate_by_tokens(self, prefix: str, body: str, budget: int) -> str:
+        tokenizer = self._tokenizer
+        assert tokenizer is not None
+        while True:
+            # Raw postprocessors may add CLS/SEP. Known profiles separately
+            # account for their backend's special-token policy.
+            encoding = tokenizer.encode(prefix + body, add_special_tokens=self.profile == "raw")
+            if len(encoding.ids) <= budget:
+                return body
+            available = budget - sum(encoding.special_tokens_mask)
+            offsets = [
+                end
+                for (_, end), special in zip(
+                    encoding.offsets,
+                    encoding.special_tokens_mask,
+                    strict=True,
+                )
+                if not special
+            ]
+            # Token counts of character prefixes are not monotonic: a longer
+            # WordPiece/Unigram prefix can merge into fewer tokens. Cut at actual
+            # token boundaries instead, then re-encode to verify the boundary.
+            ends = [
+                end
+                for end in offsets[: max(available, 0)]
+                if len(prefix) < end < len(prefix) + len(body)
+            ]
+            if not ends:
+                raise ValueError("Embedding token budget leaves no content after the role prefix")
+            body = body[: max(ends) - len(prefix)]
 
     def _formatting_config(self) -> dict:
         return {

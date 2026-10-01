@@ -209,7 +209,7 @@ results = await searcher.search(
 
 ### Automatic embedding-model migration
 
-Consumers can bind a logical index to the current embedding configuration through `ensure_embedding_collection()`. Its identity includes model, deployment namespace, endpoint, resolved dimension, and preprocessing. A first uncached embedding request validates the configured dimension or resolves an automatic dimension. An incompatible or unidentified legacy collection is rebuilt into a new physical collection; the old collection remains intact.
+Consumers can bind a logical index to the current embedding configuration through `ensure_embedding_collection()`. Its identity includes model, deployment namespace, endpoint, resolved dimension, and preprocessing. Endpoint authentication credentials are excluded from stored metadata; an opaque digest distinguishes authenticated deployments. A first uncached embedding request validates the configured dimension or resolves an automatic dimension. An incompatible or unidentified legacy collection is rebuilt into a new physical collection; the old collection remains intact.
 
 ```python
 from vector_core.storage.embedding_migration import (

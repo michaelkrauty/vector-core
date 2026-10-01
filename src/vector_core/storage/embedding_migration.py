@@ -335,7 +335,6 @@ async def ensure_embedding_collection(
             )
 
     identity = await embedder.resolve_identity()
-    storage.embedding_dim = identity.dimension
     source = await active_embedding_collection(storage, logical_name)
     binding_key = (_storage_scope(storage.url), logical_name)
     bindings = _bindings.setdefault(embedder, {})
