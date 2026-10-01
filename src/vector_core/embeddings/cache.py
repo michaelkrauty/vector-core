@@ -17,7 +17,7 @@ from vector_core.utils.locking import file_lock
 from vector_core.utils.sqlite import SQLiteConfig, ThreadSafeSQLiteStore
 
 EMBEDDING_CACHE_SCHEMA_VERSION = "binary-f32-v1"
-EMBEDDING_PREPROCESSING_VERSION = "truncate-chars-v1"
+EMBEDDING_PREPROCESSING_VERSION = "role-prefix-context-v2"
 logger = logging.getLogger(__name__)
 
 
@@ -106,6 +106,8 @@ class EmbeddingCache(ThreadSafeSQLiteStore):
         model: str,
         dim: int,
         preprocessing_version: str = EMBEDDING_PREPROCESSING_VERSION,
+        role: str = "document",
+        profile: str = "raw",
     ) -> str:
         """Build a model-safe key for an effective, already-preprocessed input."""
         if not namespace:
@@ -119,6 +121,8 @@ class EmbeddingCache(ThreadSafeSQLiteStore):
             "model": model,
             "namespace": namespace,
             "preprocessing": preprocessing_version,
+            "role": role,
+            "profile": profile,
         }
         return cls.hash_content(json.dumps(key_data, sort_keys=True, separators=(",", ":")))
 

@@ -2,22 +2,28 @@
 
 import asyncio
 import hashlib
+import json
 import logging
 import math
 import threading
 import time
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from pathlib import Path
+from types import TracebackType
+from typing import Any, Literal, TypeVar
 
 import httpx
 
 from vector_core.embeddings.cache import EmbeddingCache
+from vector_core.embeddings.identity import EmbeddingIdentity
 from vector_core.embeddings.limiter import GlobalRequestLimiter
 from vector_core.settings import settings
 from vector_core.utils.retry import retry_operation
 
 logger = logging.getLogger(__name__)
+EmbeddingRole = Literal["query", "document"]
+T = TypeVar("T")
 
 
 class EmbeddingServiceError(Exception):
@@ -49,7 +55,7 @@ class EmbeddingClient:
     - Any OpenAI-compatible embedding API
     """
 
-    def __init__(  # noqa: PLR0917
+    def __init__(  # noqa: PLR0915, PLR0917
         self,
         base_url: str | None = None,
         model: str | None = None,
@@ -61,6 +67,14 @@ class EmbeddingClient:
         cache_path: Path | None = None,
         global_concurrency: int | None = None,
         limiter_dir: Path | None = None,
+        *,
+        profile: str | None = None,
+        query_instruction: str | None = None,
+        query_prefix: str | None = None,
+        document_prefix: str | None = None,
+        max_input_bytes: int | None = None,
+        tokenizer_path: Path | None = None,
+        max_input_tokens: int | None = None,
     ):
         """
         Initialize embedding client.
@@ -82,7 +96,91 @@ class EmbeddingClient:
         self.batch_size = batch_size or settings.embedding_batch_size
         self.timeout = float(timeout or settings.embedding_timeout)
         self.concurrency = concurrency or settings.embedding_concurrency
-        self.dim = dim or settings.embedding_dim
+        self.dim = dim if dim is not None else settings.embedding_dim
+        self._max_text_chars = settings.embedding_max_text_chars
+        self.profile = profile if profile is not None else settings.embedding_profile
+        if self.profile == "auto":
+            alias = self.model.lower().replace("_", "-")
+            self.profile = (
+                "nemotron3"
+                if "nemotron-3-embed" in alias
+                else "qwen3"
+                if "qwen3-embedding" in alias
+                else "raw"
+            )
+        if self.profile not in {"raw", "qwen3", "nemotron3"}:
+            raise ValueError(f"Unknown embedding profile: {self.profile}")
+        instruction = (
+            query_instruction
+            if query_instruction is not None
+            else settings.embedding_query_instruction
+        )
+        default_query = {
+            "raw": "",
+            "qwen3": f"Instruct: {instruction}\nQuery:",
+            "nemotron3": "query: ",
+        }
+        query_prefix = query_prefix if query_prefix is not None else settings.embedding_query_prefix
+        document_prefix = (
+            document_prefix if document_prefix is not None else settings.embedding_document_prefix
+        )
+        self.query_prefix = default_query[self.profile] if query_prefix is None else query_prefix
+        self.document_prefix = (
+            ("passage: " if self.profile == "nemotron3" else "")
+            if document_prefix is None
+            else document_prefix
+        )
+        self.max_input_tokens = (
+            max_input_tokens
+            if max_input_tokens is not None
+            else settings.embedding_max_input_tokens
+        )
+        if self.max_input_tokens is None:
+            self.max_input_tokens = {"nemotron3": 4096, "qwen3": 32768}.get(self.profile)
+        tokenizer_path = tokenizer_path or settings.embedding_tokenizer_path
+        self._tokenizer = None
+        self.tokenizer_fingerprint = None
+        if tokenizer_path is not None:
+            try:
+                from tokenizers import Tokenizer  # noqa: PLC0415 - optional dependency
+            except ImportError as error:
+                raise ValueError(
+                    "Local embedding tokenizer requires vector-core[tokenizer]"
+                ) from error
+            tokenizer_json = Path(tokenizer_path).read_bytes()
+            self._tokenizer = Tokenizer.from_str(tokenizer_json.decode("utf-8"))
+            self._tokenizer.no_truncation()
+            self._tokenizer.no_padding()
+            self.tokenizer_fingerprint = hashlib.sha256(tokenizer_json).hexdigest()
+            if self.max_input_tokens is None:
+                raise ValueError("A local tokenizer requires embedding_max_input_tokens")
+        byte_limit = (
+            max_input_bytes if max_input_bytes is not None else settings.embedding_max_input_bytes
+        )
+        # Known byte-level BPE profiles need no tokenizer dependency for safe operation.
+        # Qwen reserves eight tokens for backend special tokens; Nemotron inserts none.
+        self.max_input_bytes = (
+            byte_limit
+            if byte_limit is not None
+            else (
+                {"nemotron3": 4096, "qwen3": 32760}.get(self.profile, 0)
+                if self._tokenizer is None
+                else 0
+            )
+        )
+        if self.max_input_bytes < 0 or (
+            self.max_input_tokens is not None and self.max_input_tokens <= 0
+        ):
+            raise ValueError("Embedding input limits must be positive (bytes also permits 0)")
+        if self._tokenizer is None and self.max_input_tokens is not None:
+            if self.profile == "raw":
+                raise ValueError("A token limit for a raw profile requires a local tokenizer")
+            safe_bytes = self.max_input_tokens - (8 if self.profile == "qwen3" else 0)
+            if safe_bytes <= 0:
+                raise ValueError("Embedding token limit leaves no room for input")
+            self.max_input_bytes = min(self.max_input_bytes or safe_bytes, safe_bytes)
+        self._identity: EmbeddingIdentity | None = None
+        self._identity_lock = asyncio.Lock()
         self.cache_namespace = (
             cache_namespace if cache_namespace is not None else settings.embedding_cache_namespace
         )
@@ -176,7 +274,12 @@ class EmbeddingClient:
         """Context manager entry."""
         return self
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
         """Context manager exit - ensures client is closed."""
         await self.close()
 
@@ -230,7 +333,9 @@ class EmbeddingClient:
                     # Already open, extend the timeout
                     self._circuit_open_until = time.monotonic() + self._circuit_reset_time
 
-    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+    async def embed_batch(
+        self, texts: list[str], *, role: EmbeddingRole = "document"
+    ) -> list[list[float]]:
         """
         Embed a batch of texts.
 
@@ -244,14 +349,16 @@ class EmbeddingClient:
             CircuitBreakerOpenError: If service is known to be unavailable
             EmbeddingServiceError: If embedding fails after retries
         """
+        self._check_identity()
+        return await self._embed_prepared_batch(self._prepare_texts(texts, role=role))
+
+    async def _embed_prepared_batch(self, texts: list[str]) -> list[list[float]]:
+        """Send already formatted inputs; retries and fallback must not format again."""
         if not texts:
             return []
 
         # Check circuit breaker before attempting request
         self._check_circuit()
-
-        # Truncate very long texts that might cause 400 errors
-        truncated = self._truncate_texts(texts)
 
         client = await self._get_client()
 
@@ -264,7 +371,7 @@ class EmbeddingClient:
                 resp = await client.post(
                     f"{self.base_url}/v1/embeddings",
                     json={
-                        "input": truncated,
+                        "input": texts,
                         "model": self.model,
                         "encoding_format": "float",
                     },
@@ -311,9 +418,9 @@ class EmbeddingClient:
             # If batch fails, try one at a time to identify the problematic text
             if len(texts) > 1:
                 results = []
-                for i, text in enumerate(truncated):
+                for i, text in enumerate(texts):
                     try:
-                        single_result = await self.embed_batch([text])
+                        single_result = await self._embed_prepared_batch([text])
                         results.extend(single_result)
                     except EmbeddingServiceError:
                         raise  # Re-raise service errors, don't mask them
@@ -330,7 +437,7 @@ class EmbeddingClient:
                         ) from e
                 return results
             # Single text failed - include preview for debugging
-            preview = truncated[0][:100] + "..." if len(truncated[0]) > 100 else truncated[0]
+            preview = texts[0][:100] + "..." if len(texts[0]) > 100 else texts[0]
             raise EmbeddingServiceError(
                 f"Embedding failed: {batch_error}. Text preview: {preview!r}"
             ) from batch_error
@@ -394,10 +501,91 @@ class EmbeddingClient:
             self.dim = inferred_dim
         return values
 
-    @staticmethod
-    def _truncate_texts(texts: list[str]) -> list[str]:
-        max_chars = settings.embedding_max_text_chars
-        return [text[:max_chars] if len(text) > max_chars else text for text in texts]
+    def _prepare_texts(self, texts: list[str], *, role: EmbeddingRole) -> list[str]:
+        """Format raw inputs exactly once, preserving the prefix when bounding content."""
+        if role not in {"query", "document"}:
+            raise ValueError(f"Unknown embedding role: {role}")
+        prefix = self.query_prefix if role == "query" else self.document_prefix
+        char_budget = self._max_text_chars - len(prefix)
+        byte_budget = self.max_input_bytes - len(prefix.encode("utf-8"))
+        if char_budget <= 0 or (self.max_input_bytes and byte_budget <= 0):
+            raise ValueError("Embedding input limit leaves no room after the role prefix")
+        tokenizer = self._tokenizer
+        # Qwen servers may append EOS. Nemotron's contract adds no special tokens.
+        budget = (self.max_input_tokens or 0) - (8 if self.profile == "qwen3" else 0)
+
+        def fits(value: str) -> bool:
+            assert tokenizer is not None
+            return len(tokenizer.encode(prefix + value, add_special_tokens=False).ids) <= budget
+
+        prepared = []
+        for text in texts:
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError("Embedding input must be a non-blank string")
+            body = text[:char_budget]
+            if self.max_input_bytes:
+                body = body.encode("utf-8")[:byte_budget].decode("utf-8", errors="ignore")
+            if tokenizer is not None:
+                if not fits(body):
+                    low, high = 0, len(body)
+                    while low < high:
+                        middle = (low + high + 1) // 2
+                        if fits(body[:middle]):
+                            low = middle
+                        else:
+                            high = middle - 1
+                    body = body[:low]
+                if not fits(body):
+                    raise ValueError("Embedding role prefix exceeds the token budget")
+            if not body.strip():
+                raise ValueError("Embedding input limit leaves no non-blank content after prefix")
+            prepared.append(prefix + body)
+        return prepared
+
+    def _formatting_config(self) -> dict:
+        return {
+            "profile": self.profile,
+            "query_prefix": self.query_prefix,
+            "document_prefix": self.document_prefix,
+            "max_input_bytes": self.max_input_bytes,
+            "max_input_tokens": self.max_input_tokens,
+            "tokenizer_fingerprint": self.tokenizer_fingerprint,
+        }
+
+    def _configured_identity(self) -> EmbeddingIdentity:
+        return EmbeddingIdentity(
+            model=self.model,
+            namespace=self.cache_namespace,
+            endpoint=self.base_url,
+            dimension=self.dim,
+            max_text_chars=self._max_text_chars,
+            **self._formatting_config(),
+        )
+
+    def configured_identity(self) -> EmbeddingIdentity:
+        """Describe an explicitly resolved configuration without contacting the backend.
+
+        Index binding must use resolve_identity() to verify the actual output dimension.
+        """
+        self._check_identity()
+        return self._configured_identity()
+
+    def _check_identity(self) -> None:
+        if self._identity is not None and self._configured_identity() != self._identity:
+            raise EmbeddingServiceError("Embedding configuration changed on a bound client")
+
+    async def resolve_identity(self) -> EmbeddingIdentity:
+        """Probe the backend once before binding an index to this client.
+
+        The uncached request also validates an explicitly configured dimension.
+        Subsequent calls retain the same immutable identity and reject mutation.
+        """
+        async with self._identity_lock:
+            if self._identity is None:
+                await self.embed_single("Embedding dimension verification")
+                self._identity = self._configured_identity()
+            self._check_identity()
+            return self._identity
 
     async def _get_embedding_cache(self) -> EmbeddingCache | None:
         """Open the opt-in persistent cache, permanently failing open per client."""
@@ -420,7 +608,7 @@ class EmbeddingClient:
                     )
         return self._embedding_cache
 
-    async def embed_single(self, text: str) -> list[float]:
+    async def embed_single(self, text: str, *, role: EmbeddingRole = "document") -> list[float]:
         """
         Embed a single text.
 
@@ -430,7 +618,7 @@ class EmbeddingClient:
         Returns:
             Embedding vector
         """
-        results = await self.embed_batch([text])
+        results = await self.embed_batch([text], role=role)
         return results[0]
 
     async def _get_cache_lock(self) -> asyncio.Lock:
@@ -443,7 +631,9 @@ class EmbeddingClient:
                     self._cache_lock = asyncio.Lock()
         return self._cache_lock
 
-    async def embed_single_cached(self, text: str) -> list[float]:
+    async def embed_single_cached(
+        self, text: str, *, role: EmbeddingRole = "document"
+    ) -> list[float]:
         """
         Embed a single text with in-memory caching (for query use).
 
@@ -455,9 +645,11 @@ class EmbeddingClient:
         Returns:
             Embedding vector (from cache or freshly computed)
         """
+        self._check_identity()
         # Use SHA256 for better collision resistance (full 64 chars for consistency
         # with EmbeddingCache which uses vector_core.utils.hashing.hash_content)
-        cache_key = hashlib.sha256(text.encode()).hexdigest()
+        effective = self._prepare_texts([text], role=role)[0]
+        cache_key = self._memory_cache_key(effective, role=role)
 
         # Lock-free check first (common case - cache hit)
         if cache_key in self._query_cache:
@@ -467,10 +659,13 @@ class EmbeddingClient:
         lock = await self._get_cache_lock()
         async with lock:
             # Double-check after acquiring lock
+            cache_key = self._memory_cache_key(effective, role=role)
             if cache_key in self._query_cache:
                 return self._query_cache[cache_key]
 
-            result = await self.embed_single(text)
+            result = await self.embed_single(text, role=role)
+            # Auto-detection may have resolved the dimension during this request.
+            cache_key = self._memory_cache_key(effective, role=role)
 
             # LRU-style eviction
             if len(self._query_cache) >= self._cache_max_size:
@@ -481,6 +676,19 @@ class EmbeddingClient:
             self._query_cache[cache_key] = result
             return result
 
+    def _memory_cache_key(self, text: str, *, role: EmbeddingRole) -> str:
+        data = {
+            **self._formatting_config(),
+            "max_text_chars": self._max_text_chars,
+            "endpoint": self.base_url,
+            "model": self.model,
+            "namespace": self.cache_namespace,
+            "dim": self.dim,
+            "role": role,
+            "input": text,
+        }
+        return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
+
     async def _embed_batch_with_semaphore(
         self,
         batch_idx: int,
@@ -489,13 +697,15 @@ class EmbeddingClient:
     ) -> tuple[int, list[list[float]]]:
         """Embed a batch with semaphore limiting. Returns (batch_idx, embeddings)."""
         async with semaphore:
-            embeddings = await self.embed_batch(batch)
+            embeddings = await self._embed_prepared_batch(batch)
             return (batch_idx, embeddings)
 
     async def embed_all(
         self,
         texts: list[str],
         progress_cb: Callable[[int, int], None] | None = None,
+        *,
+        role: EmbeddingRole = "document",
     ) -> list[list[float]]:
         """
         Embed all texts with concurrent batching.
@@ -514,11 +724,14 @@ class EmbeddingClient:
         if not texts:
             return []
 
-        effective_texts = self._truncate_texts(texts)
+        self._check_identity()
+        effective_texts = self._prepare_texts(texts, role=role)
         cache = await self._get_embedding_cache()
         if cache is not None:
             if self.dim > 0:
-                return await self._embed_all_cached(effective_texts, cache, progress_cb=progress_cb)
+                return await self._embed_all_cached(
+                    effective_texts, cache, progress_cb=progress_cb, role=role
+                )
             unique_texts = list(dict.fromkeys(effective_texts))
             text_counts = Counter(effective_texts)
             unique_embeddings = await self._embed_all_uncached(
@@ -530,7 +743,7 @@ class EmbeddingClient:
             by_text = dict(zip(unique_texts, unique_embeddings, strict=True))
             embeddings = [by_text[text] for text in effective_texts]
             try:
-                await self._write_cache_entries(cache, unique_texts, unique_embeddings)
+                await self._write_cache_entries(cache, unique_texts, unique_embeddings, role=role)
             except Exception:
                 logger.warning(
                     "Persistent embedding cache write failed; continuing without it",
@@ -541,7 +754,7 @@ class EmbeddingClient:
                 self._embedding_cache = None
             return embeddings
 
-        return await self._embed_all_uncached(texts, progress_cb=progress_cb)
+        return await self._embed_all_uncached(effective_texts, progress_cb=progress_cb)
 
     async def _embed_all_uncached(
         self,
@@ -601,16 +814,20 @@ class EmbeddingClient:
         cache: EmbeddingCache,
         effective_texts: list[str],
         embeddings: list[list[float]],
+        *,
+        role: EmbeddingRole = "document",
     ) -> None:
         if not self.cache_namespace or self.dim <= 0:
             return
         entries = {
-            self._persistent_cache_key(text): embedding
+            self._persistent_cache_key(text, role=role): embedding
             for text, embedding in zip(effective_texts, embeddings, strict=True)
         }
         await asyncio.to_thread(cache.set_many, entries, expected_dim=self.dim)
 
-    def _persistent_cache_key(self, effective_text: str) -> str:
+    def _persistent_cache_key(
+        self, effective_text: str, *, role: EmbeddingRole = "document"
+    ) -> str:
         """Key one effective input to an explicit deployment and endpoint."""
         assert self.cache_namespace is not None
         return EmbeddingCache.make_key(
@@ -618,6 +835,8 @@ class EmbeddingClient:
             namespace=f"{self.cache_namespace}\0{self.base_url}",
             model=self.model,
             dim=self.dim,
+            role=role,
+            profile=self._configured_identity().fingerprint,
         )
 
     async def _embed_all_cached(
@@ -625,10 +844,12 @@ class EmbeddingClient:
         effective_texts: list[str],
         cache: EmbeddingCache,
         progress_cb: Callable[[int, int], None] | None = None,
+        *,
+        role: EmbeddingRole = "document",
     ) -> list[list[float]]:
         """Resolve cache hits and scatter each unique miss back to every input position."""
         assert self.cache_namespace is not None
-        keys = [self._persistent_cache_key(text) for text in effective_texts]
+        keys = [self._persistent_cache_key(text, role=role) for text in effective_texts]
         unique_keys = list(dict.fromkeys(keys))
         try:
             cached = await asyncio.to_thread(cache.get_many, unique_keys, expected_dim=self.dim)
@@ -692,7 +913,7 @@ class _SyncAsyncBridge:
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
 
-    def run(self, coro):
+    def run(self, coro: Coroutine[Any, Any, T]) -> T:
         if self._closed:
             raise RuntimeError("sync embedding bridge is closed")
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
@@ -728,6 +949,14 @@ class SyncEmbeddingClient:
         cache_path: Path | None = None,
         global_concurrency: int | None = None,
         limiter_dir: Path | None = None,
+        *,
+        profile: str | None = None,
+        query_instruction: str | None = None,
+        query_prefix: str | None = None,
+        document_prefix: str | None = None,
+        max_input_bytes: int | None = None,
+        tokenizer_path: Path | None = None,
+        max_input_tokens: int | None = None,
     ) -> None:
         self._client = EmbeddingClient(
             base_url=base_url,
@@ -740,6 +969,13 @@ class SyncEmbeddingClient:
             cache_path=cache_path,
             global_concurrency=global_concurrency,
             limiter_dir=limiter_dir,
+            profile=profile,
+            query_instruction=query_instruction,
+            query_prefix=query_prefix,
+            document_prefix=document_prefix,
+            max_input_bytes=max_input_bytes,
+            tokenizer_path=tokenizer_path,
+            max_input_tokens=max_input_tokens,
         )
         self._bridge = _SyncAsyncBridge()
 
@@ -755,18 +991,31 @@ class SyncEmbeddingClient:
     def dim(self) -> int:
         return self._client.dim
 
-    def embed_batch(self, texts: list[str]) -> list[list[float]]:
-        return self._bridge.run(self._client.embed_batch(texts))
+    def configured_identity(self) -> EmbeddingIdentity:
+        return self._client.configured_identity()
 
-    def embed_single(self, text: str) -> list[float]:
-        return self._bridge.run(self._client.embed_single(text))
+    def resolve_identity(self) -> EmbeddingIdentity:
+        return self._bridge.run(self._client.resolve_identity())
+
+    def embed_batch(
+        self, texts: list[str], *, role: EmbeddingRole = "document"
+    ) -> list[list[float]]:
+        return self._bridge.run(self._client.embed_batch(texts, role=role))
+
+    def embed_single(self, text: str, *, role: EmbeddingRole = "document") -> list[float]:
+        return self._bridge.run(self._client.embed_single(text, role=role))
+
+    def embed_single_cached(self, text: str, *, role: EmbeddingRole = "document") -> list[float]:
+        return self._bridge.run(self._client.embed_single_cached(text, role=role))
 
     def embed_all(
         self,
         texts: list[str],
         progress_cb: Callable[[int, int], None] | None = None,
+        *,
+        role: EmbeddingRole = "document",
     ) -> list[list[float]]:
-        return self._bridge.run(self._client.embed_all(texts, progress_cb=progress_cb))
+        return self._bridge.run(self._client.embed_all(texts, progress_cb=progress_cb, role=role))
 
     def close(self) -> None:
         if self._bridge._closed:
@@ -777,5 +1026,10 @@ class SyncEmbeddingClient:
     def __enter__(self) -> "SyncEmbeddingClient":
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
         self.close()

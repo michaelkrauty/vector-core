@@ -529,6 +529,17 @@ class QdrantStorage:
         """
         client = await self._get_client()
 
+        # Indexer metadata updates must never erase or replace the migration
+        # readiness/identity fence. Its only writer is the migration coordinator.
+        if collection.startswith("vcgen_"):
+            existing = await self.get_metadata(collection)
+            manifest = (existing or {}).get("embedding_generation")
+            if manifest is not None:
+                incoming = metadata.get("embedding_generation", manifest)
+                if incoming != manifest:
+                    raise ValueError("Collection generation identity cannot be overwritten")
+                metadata = {**metadata, "embedding_generation": manifest}
+
         # Serialize complex values to JSON
         payload = {"type": "__metadata__"}
         for key, value in metadata.items():

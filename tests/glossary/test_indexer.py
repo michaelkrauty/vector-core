@@ -1,12 +1,17 @@
 """Tests for glossary/indexer module."""
 
 import tempfile
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import pytest
 
+from vector_core.embeddings.global_vocab import GlobalVocabulary
+from vector_core.glossary import indexer as indexer_module
 from vector_core.glossary.indexer import (
     GLOSSARY_CODEBASE_ID,
     GLOSSARY_PAYLOAD_INDEXES,
@@ -58,7 +63,6 @@ def mock_embedder():
 @pytest.fixture
 def mock_vocab(temp_db):
     """Create mock GlobalVocabulary."""
-    from vector_core.embeddings.global_vocab import GlobalVocabulary
     vocab = GlobalVocabulary(db_path=temp_db / "vocab.db")
     return vocab
 
@@ -66,15 +70,36 @@ def mock_vocab(temp_db):
 @pytest.fixture
 def mock_hybrid_searcher():
     """Create mock HybridSearcher."""
-    from vector_core.storage.hybrid import SearchResult
-
     searcher = MagicMock()
     searcher.search = AsyncMock(return_value=[])
     return searcher
 
 
 @pytest.fixture
-def indexer(store, mock_storage, mock_embedder, mock_vocab, mock_hybrid_searcher):
+def migration(monkeypatch):
+    state = SimpleNamespace(locked=False)
+
+    @asynccontextmanager
+    async def lock(storage, logical_name):
+        assert not state.locked
+        state.locked = True
+        try:
+            yield
+        finally:
+            state.locked = False
+
+    async def ensure(*args, lock_held=False, **kwargs):
+        assert lock_held == state.locked
+        return SimpleNamespace(physical_name="test_generation", migrated=True)
+
+    state.ensure = AsyncMock(side_effect=ensure)
+    monkeypatch.setattr(indexer_module, "ensure_embedding_collection", state.ensure)
+    monkeypatch.setattr(indexer_module, "embedding_collection_lock", lock)
+    return state
+
+
+@pytest.fixture
+def indexer(store, mock_storage, mock_embedder, mock_vocab, mock_hybrid_searcher, *, migration):
     """Create a GlossaryIndexer with mocks."""
     idx = GlossaryIndexer(
         collection_name="test_collection",
@@ -93,8 +118,6 @@ class TestGenerateEmbeddingContent:
 
     def test_basic_content(self):
         """Should include term, expansion, and definition."""
-        from datetime import UTC, datetime
-
         entry = GlossaryEntry(
             id=uuid4(),
             term="USAF",
@@ -114,8 +137,6 @@ class TestGenerateEmbeddingContent:
 
     def test_includes_domain(self):
         """Should include domain if present."""
-        from datetime import UTC, datetime
-
         entry = GlossaryEntry(
             id=uuid4(),
             term="USAF",
@@ -132,8 +153,6 @@ class TestGenerateEmbeddingContent:
 
     def test_includes_aliases(self):
         """Should include aliases."""
-        from datetime import UTC, datetime
-
         entry = GlossaryEntry(
             id=uuid4(),
             term="USAF",
@@ -154,29 +173,34 @@ class TestGlossaryIndexer:
     """Tests for GlossaryIndexer."""
 
     @pytest.mark.asyncio
-    async def test_ensure_collection(self, indexer, mock_storage):
-        """Should call ensure_collection_with_indexes."""
+    async def test_ensure_collection(self, indexer, mock_storage, migration):
+        """Should resolve an embedding-compatible generation with indexes."""
         result = await indexer.ensure_collection()
 
         assert result is True
-        mock_storage.ensure_collection_with_indexes.assert_called_once_with(
-            "test_collection",
-            GLOSSARY_PAYLOAD_INDEXES,
-        )
+        assert migration.ensure.call_args.args[1] == "test_collection"
+        assert migration.ensure.call_args.kwargs["payload_indexes"] == GLOSSARY_PAYLOAD_INDEXES
 
     @pytest.mark.asyncio
-    async def test_index_all_empty(self, indexer, mock_storage):
+    async def test_index_all_empty(self, indexer, mock_storage, migration):
         """Should return 0 for empty store."""
         result = await indexer.index_all()
 
         assert result == 0
         mock_storage.upsert_batch.assert_not_called()
+        migration.ensure.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_index_all_with_entries(self, indexer, store, mock_storage, mock_embedder):
         """Should index all entries."""
-        store.create(term="API", expansion="Application Programming Interface", definition="A set of protocols")
-        store.create(term="SDK", expansion="Software Development Kit", definition="Tools for development")
+        store.create(
+            term="API",
+            expansion="Application Programming Interface",
+            definition="A set of protocols",
+        )
+        store.create(
+            term="SDK", expansion="Software Development Kit", definition="Tools for development"
+        )
 
         result = await indexer.index_all()
 
@@ -188,7 +212,11 @@ class TestGlossaryIndexer:
     @pytest.mark.asyncio
     async def test_index_entry(self, indexer, store, mock_storage, mock_embedder):
         """Should index single entry."""
-        entry = store.create(term="API", expansion="Application Programming Interface", definition="A set of protocols")
+        entry = store.create(
+            term="API",
+            expansion="Application Programming Interface",
+            definition="A set of protocols",
+        )
 
         await indexer.index_entry(entry.id)
 
@@ -198,7 +226,11 @@ class TestGlossaryIndexer:
     @pytest.mark.asyncio
     async def test_delete_entry_index(self, indexer, store, mock_storage):
         """Should delete entry from index."""
-        entry = store.create(term="API", expansion="Application Programming Interface", definition="A set of protocols")
+        entry = store.create(
+            term="API",
+            expansion="Application Programming Interface",
+            definition="A set of protocols",
+        )
 
         await indexer.delete_entry_index(entry.id)
 
@@ -209,7 +241,9 @@ class TestGlossaryIndexer:
         """Should perform hybrid semantic search."""
         await indexer.search("application interface")
 
-        mock_embedder.embed_single_cached.assert_called_once()
+        mock_embedder.embed_single_cached.assert_called_once_with(
+            "application interface", role="query"
+        )
         indexer.hybrid_searcher.search.assert_called_once()
 
     @pytest.mark.asyncio
@@ -262,6 +296,48 @@ class TestGlossaryIndexerPayload:
         payload = indexer._create_payload(entry)
 
         assert len(payload["definition"]) == 2000
+        assert payload["embedding_text"] == _generate_embedding_content(entry)
+
+
+class TestGenerationTargets:
+    async def test_mutation_pins_target_under_lock(
+        self, indexer, store, mock_storage, mock_embedder, migration
+    ):
+        entry = store.create("API", "Interface", "definition")
+
+        async def embed(text, *, role):
+            assert migration.locked
+            assert role == "document"
+            return [0.1] * 4096
+
+        mock_embedder.embed_single_cached.side_effect = embed
+        await indexer.index_entry(entry.id)
+        assert mock_storage.upsert_point.call_args.kwargs["collection"] == "test_generation"
+        assert migration.ensure.call_args.kwargs["lock_held"] is True
+        assert indexer.collection_name == "test_collection"
+        assert not migration.locked
+
+    async def test_each_read_resolves_a_fresh_target(self, indexer, migration):
+        migration.ensure.side_effect = [
+            SimpleNamespace(physical_name="first", migrated=False),
+            SimpleNamespace(physical_name="second", migrated=True),
+        ]
+        await indexer.search("query")
+        await indexer.search("query")
+        assert [
+            call.kwargs["collection"] for call in indexer.hybrid_searcher.search.call_args_list
+        ] == ["first", "second"]
+        assert indexer.collection_name == "test_collection"
+
+    async def test_injected_generation_does_not_reenter_lock(
+        self, indexer, store, mock_storage, migration
+    ):
+        entry = store.create("API", "Interface", "definition")
+        indexer._generation = SimpleNamespace(physical_name="bound", migrated=False)
+        migration.locked = True
+        await indexer.index_entry(entry.id)
+        migration.ensure.assert_not_awaited()
+        assert mock_storage.upsert_point.call_args.kwargs["collection"] == "bound"
 
 
 class TestGlossaryIndexerConstants:
