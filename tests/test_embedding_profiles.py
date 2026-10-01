@@ -7,7 +7,7 @@ from typing import Any
 
 import httpx
 import pytest
-from tokenizers import Tokenizer, models, pre_tokenizers
+from tokenizers import Tokenizer, models, pre_tokenizers, processors
 
 from vector_core.embeddings.client import (
     EmbeddingClient,
@@ -199,6 +199,36 @@ async def test_tokenizer_prefix_too_large_fails_locally(tokenizer_file):
         with pytest.raises(ValueError, match="prefix|content"):
             await client.embed_batch(["word"])
     assert requests == []
+
+
+async def test_raw_tokenizer_budget_includes_postprocessor_tokens(tokenizer_file):
+    tokenizer = Tokenizer.from_file(str(tokenizer_file))
+    tokenizer.no_truncation()
+    tokenizer.no_padding()
+    tokenizer.add_special_tokens(["[CLS]", "[SEP]"])
+    tokenizer.post_processor = processors.TemplateProcessing(
+        single="[CLS] $A [SEP]",
+        special_tokens=[
+            ("[CLS]", tokenizer.token_to_id("[CLS]")),
+            ("[SEP]", tokenizer.token_to_id("[SEP]")),
+        ],
+    )
+    tokenizer.save(str(tokenizer_file))
+    requests = []
+    async with wire(
+        EmbeddingClient(
+            model="generic",
+            profile="raw",
+            dim=2,
+            tokenizer_path=tokenizer_file,
+            max_input_tokens=4,
+        ),
+        requests,
+    ) as client:
+        await client.embed_single("word word word word")
+    sent = requests[0]["input"][0]
+    assert len(tokenizer.encode(sent, add_special_tokens=True).ids) == 4
+    assert len(tokenizer.encode(sent, add_special_tokens=False).ids) == 2
 
 
 def test_formatting_changes_identity_and_roundtrip(tokenizer_file):

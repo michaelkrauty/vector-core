@@ -17,7 +17,7 @@ from vector_core.utils.locking import file_lock
 from vector_core.utils.sqlite import SQLiteConfig, ThreadSafeSQLiteStore
 
 EMBEDDING_CACHE_SCHEMA_VERSION = "binary-f32-v1"
-EMBEDDING_PREPROCESSING_VERSION = "role-prefix-context-v2"
+EMBEDDING_PREPROCESSING_VERSION = "role-prefix-context-v3"
 logger = logging.getLogger(__name__)
 
 

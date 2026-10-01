@@ -516,7 +516,10 @@ class EmbeddingClient:
 
         def fits(value: str) -> bool:
             assert tokenizer is not None
-            return len(tokenizer.encode(prefix + value, add_special_tokens=False).ids) <= budget
+            # Generic tokenizers may insert CLS/SEP or other postprocessor
+            # tokens. Known profiles account for backend specials above.
+            tokens = tokenizer.encode(prefix + value, add_special_tokens=self.profile == "raw")
+            return len(tokens.ids) <= budget
 
         prepared = []
         for text in texts:
