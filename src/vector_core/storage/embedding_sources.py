@@ -30,6 +30,22 @@ def _legacy_note_text(payload: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+def stored_embedding_text(payload: dict[str, Any]) -> str | None:
+    """Read an explicit raw input or validated same-payload field reference."""
+    if "embedding_text" in payload:
+        text = payload["embedding_text"]
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("Invalid persisted embedding text")
+        return text
+    if "embedding_text_field" in payload:
+        field = payload["embedding_text_field"]
+        text = payload.get(field) if isinstance(field, str) else None
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("Invalid embedding text field reference")
+        return text
+    return None
+
+
 async def resolve_shared_embedding_text(
     payload: dict[str, Any], *, glossary_store: GlossaryStore | None = None
 ) -> str:
@@ -38,10 +54,8 @@ async def resolve_shared_embedding_text(
     Glossary definitions were truncated in Qdrant. Their complete SQLite row
     is usable only when every embedding-bearing field still matches the point.
     """
-    if "embedding_text" in payload:
-        text = payload["embedding_text"]
-        if not isinstance(text, str) or not text:
-            raise ValueError("Invalid persisted embedding text")
+    text = stored_embedding_text(payload)
+    if text is not None:
         return text
     if payload.get("type") == "note":
         return _legacy_note_text(payload)

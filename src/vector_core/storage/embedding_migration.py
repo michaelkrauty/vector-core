@@ -22,12 +22,14 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 from weakref import WeakKeyDictionary
 
+from qdrant_client.http.exceptions import ResponseHandlingException
 from qdrant_client.models import (
     CreateAlias,
     CreateAliasOperation,
     DeleteAlias,
     DeleteAliasOperation,
     PayloadSchemaType,
+    PointsList,
     PointStruct,
     SparseVector,
     WriteOrdering,
@@ -37,11 +39,14 @@ from vector_core.embeddings.client import EmbeddingClient
 from vector_core.embeddings.identity import EmbeddingIdentity
 from vector_core.settings import settings
 from vector_core.storage.embedding_sources import resolve_shared_embedding_text as _resolve_shared
+from vector_core.storage.embedding_sources import stored_embedding_text
 from vector_core.storage.qdrant import QdrantStorage
 from vector_core.utils.locking import async_file_lock
 
 EMBEDDING_TEXT_KEY = "embedding_text"
+EMBEDDING_TEXT_FIELD_KEY = "embedding_text_field"
 GENERATION_METADATA_KEY = "embedding_generation"
+_MAX_UPSERT_BYTES = 30 * 1024 * 1024
 TextResolver = Callable[[dict[str, Any]], Awaitable[str | None]]
 CandidateFinalizer = Callable[[str], Awaitable[None]]
 
@@ -205,26 +210,16 @@ async def _copy_points(
                 continue
             if payload.get("type") == "__metadata__":
                 raise EmbeddingMigrationError("Unexpected metadata point outside reserved ID 0")
-            text = payload.get(EMBEDDING_TEXT_KEY)
-            if text is None:
-                text = await text_resolver(payload)
-                payload["embedding_text_source"] = (
-                    "legacy-note-metadata"
-                    if payload.get("type") == "note"
-                    else "legacy-reconstruction"
-                )
+            text = await _prepare_copy_payload(payload, text_resolver)
             if text is None:
                 if not allow_skip:
                     raise EmbeddingMigrationError(
                         f"Point {record.id!r} cannot be omitted without a source finalizer"
                     )
                 continue
-            if not isinstance(text, str) or not text.strip():
-                raise EmbeddingMigrationError(f"Point {record.id!r} has no usable embedding text")
             sparse = record.vector.get("sparse") if isinstance(record.vector, dict) else None
             if not isinstance(sparse, (SparseVector, dict)):
                 raise EmbeddingMigrationError(f"Point {record.id!r} has no retained sparse vector")
-            payload[EMBEDDING_TEXT_KEY] = text
             pending.append((record.id, payload, sparse))
             texts.append(text)
         embeddings = await embedder.embed_all(texts, role="document")
@@ -233,15 +228,85 @@ async def _copy_points(
             for (point_id, payload, sparse), dense in zip(pending, embeddings, strict=True)
         ]
         if points:
-            await client.upsert(
-                generation.physical_name,
-                points,
-                wait=True,
-                ordering=WriteOrdering.STRONG,
-            )
+            await _upsert_copy_points(client, generation.physical_name, points)
         copied += len(points)
         if offset is None:
             return copied
+
+
+async def _prepare_copy_payload(payload: dict[str, Any], text_resolver: TextResolver) -> str | None:
+    text = stored_embedding_text(payload)
+    if text is not None:
+        return text
+    text = await text_resolver(payload)
+    if text is None:
+        return None
+    if not isinstance(text, str) or not text.strip():
+        raise EmbeddingMigrationError("Source point has no usable embedding text")
+    payload["embedding_text_source"] = (
+        "legacy-note-metadata" if payload.get("type") == "note" else "legacy-reconstruction"
+    )
+    # Preserve exact source input once. A retained document chunk can be larger
+    # than the embedding context; duplicating it can exceed the request limit.
+    if payload.get("content") == text:
+        payload[EMBEDDING_TEXT_FIELD_KEY] = "content"
+    else:
+        payload[EMBEDDING_TEXT_KEY] = text
+    return text
+
+
+async def _upsert_copy_points(client: Any, collection: str, points: list[PointStruct]) -> None:
+    """Bound actual UTF-8 REST bodies, retaining server-confirmed write ordering."""
+    envelope_bytes = len(
+        PointsList(points=[])
+        .model_dump_json(
+            by_alias=True,
+            exclude_none=True,
+            exclude_unset=True,
+        )
+        .encode()
+    )
+    batch: list[PointStruct] = []
+    batch_bytes = envelope_bytes
+    for point in points:
+        # Match qdrant-client's REST serializer, including escaping, omitted
+        # fields, Unicode and float representation; payload character counts
+        # and fixed point-count batches cannot bound request size.
+        point_bytes = len(
+            point.model_dump_json(
+                by_alias=True,
+                exclude_none=True,
+                exclude_unset=True,
+            ).encode()
+        )
+        if point_bytes + envelope_bytes > _MAX_UPSERT_BYTES:
+            raise EmbeddingMigrationError(
+                f"Point {point.id!r} needs {point_bytes + envelope_bytes} serialized bytes, "
+                f"exceeding the {_MAX_UPSERT_BYTES}-byte migration request budget"
+            )
+        if batch and batch_bytes + 1 + point_bytes > _MAX_UPSERT_BYTES:
+            await client.upsert(collection, batch, wait=True, ordering=WriteOrdering.STRONG)
+            batch = []
+            batch_bytes = envelope_bytes
+        batch_bytes += point_bytes + bool(batch)
+        batch.append(point)
+    if batch:
+        await client.upsert(collection, batch, wait=True, ordering=WriteOrdering.STRONG)
+
+
+def _exception_description(error: Exception) -> str:
+    """Retain wrapped transport types when their ordinary message is empty."""
+    descriptions = []
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        descriptions.append(f"{type(current).__name__}: {current!s}".rstrip(": "))
+        cause = current.__cause__ or current.__context__
+        if cause is None and isinstance(current, ResponseHandlingException):
+            cause = current.source
+        current = cause
+    return " caused by ".join(descriptions)
 
 
 async def _publish(storage: QdrantStorage, logical_name: str, physical_name: str) -> None:
@@ -402,7 +467,8 @@ async def ensure_embedding_collection(
     except Exception as error:
         raise EmbeddingMigrationError(
             f"Embedding migration did not complete; source {source!r} is retained and "
-            f"candidate {target!r} requires an active-pointer check before reuse: {error}"
+            f"candidate {target!r} requires an active-pointer check before reuse: "
+            f"{_exception_description(error)}"
         ) from error
     bindings[binding_key] = generation
     return generation

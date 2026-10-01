@@ -81,7 +81,7 @@ async def test_unknown_legacy_rebuild_preserves_points_sparse_and_original(stora
         assert after[point_id].vector["sparse"] == before[point_id].vector["sparse"]
         assert after[point_id].payload == {
             **before[point_id].payload,
-            "embedding_text": before[point_id].payload["content"],
+            "embedding_text_field": "content",
             "embedding_text_source": "legacy-reconstruction",
         }
         assert len(after[point_id].vector["dense"]) == 3

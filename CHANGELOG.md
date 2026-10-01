@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.6.1] - 2026-10-01
+
+### Fixed
+
+- Dense collection migration no longer duplicates retained document content into an additional embedding-input payload field. When the exact input already exists in `content`, a validated `embedding_text_field="content"` reference preserves source-independent reconstruction without doubling large payloads. Existing explicit embedding inputs retain precedence and are preserved unchanged.
+- Migration upserts are bounded by their serialized UTF-8 REST body size instead of the scroll page's point count. Requests use a conservative 30 MiB budget and retain server-confirmed strong ordering. An oversized individual point fails with its ID and measured size, preserving the original collection and leaving the candidate unselected.
+- Migration errors now retain exception types and wrapped causes when an upstream transport exception has an empty message.
+
 ## [1.6.0] - 2026-10-01
 
 ### Added
