@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.6.0] - 2026-10-01
+
+### Added
+
+- Embedding identities cover the configured model, deployment namespace, endpoint, resolved vector dimension, and preprocessing. Configuration changes can automatically rebuild dense indices into retained physical collection generations. An atomic discovery pointer selects a replacement only after its complete build; vector operations always use an immutable physical target. Unknown legacy identity requires rebuilding rather than backfilling an unverifiable model stamp.
+- Migration preserves original collections, point IDs, payloads, and sparse vectors. Interrupted candidates remain unselected and retries start clean. Returning to an earlier model rebuilds from the current generation rather than reusing its stale historical index. Coordinated operation locks prevent upgraded local writers from racing migration, and superseded clients cannot write to a different embedding space.
+- Glossary and fact indexers participate in automatic generation resolution and retain their full embedding input. Glossary mutations prepare the generation before changing SQLite source records. Legacy document, fact, and note-chunk vectors rebuild from retained text; legacy note summaries use a canonical metadata summary with explicit provenance. Legacy glossary definitions recover from verified SQLite records when retained payloads were truncated.
+
+### Changed
+
+- Embedding methods distinguish document and query roles, with document as the backward-compatible default. Formatting profiles and optional local-tokenizer limits are included in embedding identity and cache separation. Install the `tokenizer` extra to use a local tokenizer JSON without model downloads.
+- Collection metadata updates preserve generation identity and readiness markers. Dense-only migrations do not register duplicate sparse-vocabulary contributions.
+
+### Upgrade notes
+
+Stop legacy writers before an initial migration: older binaries do not participate in the new locking protocol. Cooperating processes must share the migration lock directory. Keep deployment namespaces immutable for a given model artifact and serving behavior; the embeddings protocol cannot independently attest model weights. Retained generations require additional storage and are not automatically deleted. Their payloads and vectors remain available for source-independent recovery; returning the configuration to an older model normally rebuilds current content instead of restoring an outdated corpus.
+
 ## [1.5.0] - 2026-09-04
 
 ### Added

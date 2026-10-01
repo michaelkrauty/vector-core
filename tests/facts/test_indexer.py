@@ -7,12 +7,15 @@ These focus on the indexer processing the COMPLETE fact corpus:
 """
 
 import tempfile
+from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from vector_core.embeddings.global_vocab import GlobalVocabulary
+from vector_core.facts import indexer as indexer_module
 from vector_core.facts.database import FactStore
 from vector_core.facts.indexer import FACTS_CODEBASE_ID, FactIndexer
 
@@ -57,7 +60,30 @@ def mock_embedder():
 
 
 @pytest.fixture
-def indexer(store, mock_storage, mock_embedder, vocab):
+def migration(monkeypatch):
+    state = SimpleNamespace(locked=False)
+
+    @asynccontextmanager
+    async def lock(storage, logical_name):
+        assert not state.locked
+        state.locked = True
+        try:
+            yield
+        finally:
+            state.locked = False
+
+    async def ensure(*args, lock_held=False, **kwargs):
+        assert lock_held == state.locked
+        return SimpleNamespace(physical_name="test_generation", migrated=True)
+
+    state.ensure = AsyncMock(side_effect=ensure)
+    monkeypatch.setattr(indexer_module, "ensure_embedding_collection", state.ensure)
+    monkeypatch.setattr(indexer_module, "embedding_collection_lock", lock)
+    return state
+
+
+@pytest.fixture
+def indexer(store, mock_storage, mock_embedder, vocab, migration):
     return FactIndexer(
         fact_store=store,
         storage=mock_storage,
@@ -195,6 +221,7 @@ class TestIndexAllRobustness:
     ):
         """A force reindex must read the corpus before clearing points, so a
         read failure leaves the existing index intact."""
+
         def boom():
             raise RuntimeError("db locked")
             yield  # pragma: no cover  (make boom a generator)
@@ -240,4 +267,49 @@ class TestIndexFactAtomic:
         # The upsert (inside _index_fact) overwrites the stable-id point; no
         # pre-delete that could strand the fact on a transient upsert failure.
         indexer._delete_fact_point.assert_not_called()
-        indexer._index_fact.assert_awaited_once_with(fact)
+        indexer._index_fact.assert_awaited_once_with(fact, "test_generation")
+
+
+class TestGenerationTargets:
+    async def test_force_rebuild_reads_deletes_and_upserts_one_generation(
+        self, indexer, store, mock_storage, mock_embedder, migration
+    ):
+        fact = store.create("subject", "relates_to", "object", context="x" * 5000)
+
+        async def embed(text, *, role):
+            assert migration.locked
+            assert role == "document"
+            return [0.1] * 4096
+
+        mock_embedder.embed_single_cached.side_effect = embed
+        await indexer.index_all(force=True)
+        assert mock_storage.delete_by_filter.call_args.args[0] == "test_generation"
+        assert mock_storage.upsert_batch.call_args.args[0] == "test_generation"
+        point = mock_storage.upsert_batch.call_args.args[1][0]
+        assert (
+            point.payload["embedding_text"] == mock_embedder.embed_single_cached.call_args.args[0]
+        )
+        assert point.payload["embedding_text"] == point.payload["content"]
+        assert fact.context in point.payload["embedding_text"]
+        assert indexer.collection_name == "test_facts"
+        assert not migration.locked
+
+    async def test_incremental_scan_uses_resolved_target(self, indexer, mock_storage):
+        await indexer.index_all()
+        assert mock_storage.scroll_points.call_args.args[0] == "test_generation"
+
+    async def test_delete_uses_resolved_target(self, indexer, store, mock_storage, migration):
+        fact = store.create("subject", "relates_to", "object")
+        await indexer.delete_fact_index(fact.id)
+        assert mock_storage.delete_by_filter.call_args.args[0] == "test_generation"
+        assert migration.ensure.call_args.kwargs["lock_held"] is True
+
+    async def test_injected_generation_does_not_reenter_lock(
+        self, indexer, store, mock_storage, migration
+    ):
+        fact = store.create("subject", "relates_to", "object")
+        indexer._generation = SimpleNamespace(physical_name="bound", migrated=False)
+        migration.locked = True
+        await indexer.index_fact(fact)
+        migration.ensure.assert_not_awaited()
+        assert mock_storage.upsert_batch.call_args.args[0] == "bound"

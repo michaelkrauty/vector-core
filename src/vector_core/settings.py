@@ -1,9 +1,10 @@
 """Centralized settings for vector-core using pydantic-settings."""
 
+import warnings
 from pathlib import Path
-from typing import Self
+from typing import Any, Literal, Self
 
-from pydantic import field_validator, model_validator
+from pydantic import ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -29,8 +30,19 @@ class VectorCoreSettings(BaseSettings):
     embedding_batch_size: int = 8
     embedding_concurrency: int = 2
     embedding_timeout: int = 120
-    # Max chars for text before truncation (~32k context -> ~8000 safe at 4 chars/token avg)
+    # Bounds apply to the complete formatted input, including its role prefix.
     embedding_max_text_chars: int = 8000
+    embedding_profile: Literal["auto", "raw", "qwen3", "nemotron3"] = "auto"
+    embedding_query_instruction: str = (
+        "Given a web search query, retrieve relevant passages that answer the query"
+    )
+    embedding_query_prefix: str | None = None
+    embedding_document_prefix: str | None = None
+    # None selects a known profile's conservative byte bound. 0 removes the extra
+    # byte bound; known profiles still enforce a safe fallback without a tokenizer.
+    embedding_max_input_bytes: int | None = None
+    embedding_tokenizer_path: Path | None = None
+    embedding_max_input_tokens: int | None = None
     # Persistent reuse is opt-in: unset namespace means no cache is opened.
     embedding_cache_namespace: str | None = None
     # Cross-process backend request capacity. 0 disables global coordination.
@@ -84,6 +96,15 @@ class VectorCoreSettings(BaseSettings):
 
     # --- Validators ---
 
+    @field_validator("embedding_max_input_bytes", "embedding_max_input_tokens")
+    @classmethod
+    def validate_optional_input_limit(cls, v: int | None, info: ValidationInfo) -> int | None:
+        if v is not None and (
+            v < 0 or (info.field_name == "embedding_max_input_tokens" and v == 0)
+        ):
+            raise ValueError(f"{info.field_name} must be positive (bytes also permits 0)")
+        return v
+
     @field_validator(
         "embedding_batch_size",
         "embedding_concurrency",
@@ -102,7 +123,7 @@ class VectorCoreSettings(BaseSettings):
         mode="after",
     )
     @classmethod
-    def validate_positive_int(cls, v: int, info) -> int:
+    def validate_positive_int(cls, v: int, info: ValidationInfo) -> int:
         """Validate that integer settings are positive."""
         if v <= 0:
             raise ValueError(f"{info.field_name} must be positive, got {v}")
@@ -126,7 +147,7 @@ class VectorCoreSettings(BaseSettings):
         mode="after",
     )
     @classmethod
-    def validate_non_negative_float(cls, v: float, info) -> float:
+    def validate_non_negative_float(cls, v: float, info: ValidationInfo) -> float:
         """Validate that float settings are non-negative."""
         if v < 0:
             raise ValueError(f"{info.field_name} must be non-negative, got {v}")
@@ -143,8 +164,6 @@ class VectorCoreSettings(BaseSettings):
         # Common embedding dimensions from popular models
         common_dims = {64, 128, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 8192}
         if v not in common_dims:
-            import warnings
-
             warnings.warn(
                 f"embedding_dim={v} is not a common value. "
                 f"Common values: {sorted(common_dims)}. "
@@ -205,6 +224,13 @@ class VectorCoreSettingsMixin:
             "embedding_concurrency",
             "embedding_timeout",
             "embedding_max_text_chars",
+            "embedding_profile",
+            "embedding_query_instruction",
+            "embedding_query_prefix",
+            "embedding_document_prefix",
+            "embedding_max_input_bytes",
+            "embedding_tokenizer_path",
+            "embedding_max_input_tokens",
             "embedding_cache_namespace",
             "embedding_global_concurrency",
             # Cache
@@ -237,7 +263,7 @@ class VectorCoreSettingsMixin:
         }
     )
 
-    def __getattr__(self, name: str):
+    def __getattr__(self, name: str) -> Any:
         """Delegate attribute access to vector-core settings for known properties."""
         if name in self._delegated_properties:
             return getattr(settings, name)

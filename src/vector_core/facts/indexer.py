@@ -6,9 +6,11 @@ provided at construction time to allow integration with existing collections.
 """
 
 import logging
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 from qdrant_client.models import (
@@ -25,6 +27,12 @@ from vector_core.embeddings.client import EmbeddingClient, EmbeddingServiceError
 from vector_core.embeddings.global_vocab import GlobalVocabulary
 from vector_core.facts.database import FactStore
 from vector_core.facts.models import Fact, SourceStatus
+from vector_core.storage.embedding_migration import (
+    CollectionGeneration,
+    embedding_collection_lock,
+    ensure_embedding_collection,
+)
+from vector_core.storage.embedding_sources import resolve_shared_embedding_text
 from vector_core.storage.qdrant import (
     QdrantConnectionError,
     QdrantStorage,
@@ -93,6 +101,9 @@ class FactIndexer:
         collection_name: str | None = None,
         base_dir: Path | str | None = None,
         collection_prefix: str = "notes",
+        generation: CollectionGeneration | None = None,
+        text_resolver: Callable[[dict[str, Any]], Awaitable[str | None]] | None = None,
+        finalize_candidate: Callable[[str], Awaitable[None]] | None = None,
     ):
         """
         Initialize indexer.
@@ -110,13 +121,21 @@ class FactIndexer:
             collection_name: Explicit Qdrant collection name
             base_dir: Base directory for collection name generation
             collection_prefix: Prefix for generated collection name
+            generation: Operation-scoped target. The caller must hold the logical
+                collection lock for this indexer's entire lifetime.
+            text_resolver: Optional resolver for all types sharing the collection.
+            finalize_candidate: Optional candidate rebuild before publication.
         """
         self.fact_store = fact_store or FactStore()
         self._storage = storage
         self._embedder = embedder
         self._global_vocab = global_vocab
+        self._generation = generation
+        self._text_resolver = text_resolver or resolve_shared_embedding_text
+        self._finalize_candidate = finalize_candidate
 
         # Determine collection name
+        self._collection_name: str | None
         if collection_name:
             self._collection_name = collection_name
         elif base_dir:
@@ -170,15 +189,27 @@ class FactIndexer:
 
     async def ensure_collection(self) -> None:
         """Ensure Qdrant collection exists with payload indexes."""
-        if not await self.storage.collection_exists(self.collection_name):
-            await self.storage.create_collection(self.collection_name)
-            logger.info(f"Created collection: {self.collection_name}")
+        await self._ensure_generation()
+
+    @property
+    def logical_name(self) -> str:
+        """Stable collection name used to resolve each operation's generation."""
+        return self.collection_name
+
+    async def _ensure_generation(self, *, lock_held: bool = False) -> CollectionGeneration:
+        if self._generation is not None:
+            return self._generation
 
         # Ensure payload indexes for efficient filtering (idempotent)
         # These match the rich payload fields for "enhanced hybrid" strategy
-        await self.storage.ensure_payload_indexes(
-            self.collection_name,
-            [
+        return await ensure_embedding_collection(
+            self.storage,
+            self.logical_name,
+            self.embedder,
+            self._text_resolver,
+            lock_held=lock_held,
+            finalize_candidate=self._finalize_candidate,
+            payload_indexes=[
                 ("type", PayloadSchemaType.KEYWORD),
                 ("fact_id", PayloadSchemaType.KEYWORD),
                 ("subject_normalized", PayloadSchemaType.KEYWORD),
@@ -194,6 +225,15 @@ class FactIndexer:
             ],
         )
 
+    @asynccontextmanager
+    async def _mutation_target(self) -> AsyncIterator[str]:
+        if self._generation is not None:
+            yield self._generation.physical_name
+        else:
+            async with embedding_collection_lock(self.storage, self.logical_name):
+                generation = await self._ensure_generation(lock_held=True)
+                yield generation.physical_name
+
     def _iter_fact_tokens(self) -> Iterator[tuple[Fact, set[str]]]:
         """Yield ``(fact, token_set)`` for every readable fact in the store.
 
@@ -206,9 +246,7 @@ class FactIndexer:
             try:
                 tokens = set(self.global_vocab.tokenize(generate_fact_text(fact)))
             except Exception:
-                logger.warning(
-                    "Skipping fact %s: tokenization failed", fact.id, exc_info=True
-                )
+                logger.warning("Skipping fact %s: tokenization failed", fact.id, exc_info=True)
                 continue
             yield fact, tokens
 
@@ -225,12 +263,15 @@ class FactIndexer:
         Returns:
             dict with indexing results
         """
+        async with self._mutation_target() as collection:
+            return await self._index_all(collection, force=force)
+
+    async def _index_all(self, collection: str, *, force: bool = False) -> dict:
         await self._ensure_global_vocab()
-        await self.ensure_collection()
 
         # Incremental mode needs the set of already-indexed facts; force mode
         # reindexes every fact.
-        indexed_ids = set() if force else await self._get_indexed_fact_ids()
+        indexed_ids = set() if force else await self._get_indexed_fact_ids(collection)
 
         # Read and tokenize the COMPLETE fact corpus BEFORE any destructive
         # delete. Two things must span every fact, not just the ones upserted:
@@ -261,7 +302,7 @@ class FactIndexer:
         # emptied) so a force rebuild never leaves deleted facts searchable, but
         # only after the read so a read failure can't empty the index.
         if force:
-            await self._delete_all_fact_points()
+            await self._delete_all_fact_points(collection)
 
         # Register the facts vocabulary from the complete corpus. This runs even
         # for an empty corpus, so deleting the last fact clears the stale facts
@@ -289,7 +330,7 @@ class FactIndexer:
         indexed_count = 0
         for fact in facts_to_index:
             try:
-                await self._index_fact(fact)
+                await self._index_fact(fact, collection)
                 indexed_count += 1
             except EmbeddingServiceError as e:
                 # Embedding service unavailable - log and continue with remaining facts
@@ -322,8 +363,11 @@ class FactIndexer:
         Args:
             fact: Fact to index
         """
+        async with self._mutation_target() as collection:
+            await self._index_single_fact(fact, collection)
+
+    async def _index_single_fact(self, fact: Fact, collection: str) -> None:
         await self._ensure_global_vocab()
-        await self.ensure_collection()
 
         # Ensure GlobalVocabulary is trained
         if self.global_vocab.get_codebase_doc_count(FACTS_CODEBASE_ID) == 0:
@@ -332,7 +376,7 @@ class FactIndexer:
         # Index. The point id is stable per fact, so the upsert overwrites any
         # existing point in place; pre-deleting first would only open a window
         # where a failed embed/upsert leaves the fact missing from search.
-        await self._index_fact(fact)
+        await self._index_fact(fact, collection)
 
     async def delete_fact_index(self, fact_id: UUID) -> None:
         """
@@ -341,9 +385,10 @@ class FactIndexer:
         Args:
             fact_id: Fact UUID to remove
         """
-        await self._delete_fact_point(fact_id)
+        async with self._mutation_target() as collection:
+            await self._delete_fact_point(fact_id, collection)
 
-    async def _index_fact(self, fact: Fact) -> None:
+    async def _index_fact(self, fact: Fact, collection: str) -> None:
         """Index a single fact."""
         if self.global_vocab.get_codebase_doc_count(FACTS_CODEBASE_ID) == 0:
             raise RuntimeError("GlobalVocabulary not initialized for facts codebase")
@@ -352,7 +397,7 @@ class FactIndexer:
         text = generate_fact_text(fact)
 
         # Get embedding
-        embedding = await self.embedder.embed_single_cached(text)
+        embedding = await self.embedder.embed_single_cached(text, role="document")
 
         # Generate sparse vector
         sparse = self.global_vocab.vectorize_document(text)
@@ -395,6 +440,7 @@ class FactIndexer:
             "created": fact.created.isoformat(),
             "modified": fact.modified.isoformat(),
             "content": text,  # For highlight extraction
+            "embedding_text": text,
         }
 
         # Create point
@@ -411,30 +457,30 @@ class FactIndexer:
         )
 
         # Upsert
-        await self.storage.upsert_batch(self.collection_name, [point])
+        await self.storage.upsert_batch(collection, [point])
         logger.debug(f"Indexed fact {fact.id}")
 
-    async def _delete_fact_point(self, fact_id: UUID) -> None:
+    async def _delete_fact_point(self, fact_id: UUID, collection: str) -> None:
         """Delete point for a fact."""
         await self.storage.delete_by_filter(
-            self.collection_name,
+            collection,
             field="fact_id",
             value=str(fact_id),
         )
 
-    async def _delete_all_fact_points(self) -> None:
+    async def _delete_all_fact_points(self, collection: str) -> None:
         """Delete all fact points from collection."""
         await self.storage.delete_by_filter(
-            self.collection_name,
+            collection,
             field="type",
             value="fact",
         )
 
-    async def _get_indexed_fact_ids(self) -> set[str]:
+    async def _get_indexed_fact_ids(self, collection: str) -> set[str]:
         """Get set of indexed fact IDs."""
         try:
             points = await self.storage.scroll_points(
-                self.collection_name,
+                collection,
                 filter_conditions=[
                     FieldCondition(key="type", match=MatchValue(value="fact")),
                 ],

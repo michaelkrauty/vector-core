@@ -139,27 +139,27 @@ async def test_embed_all_caches_effective_input_and_scatters_duplicates(
     monkeypatch.setattr("vector_core.embeddings.client.settings.embedding_max_text_chars", 3)
     path = tmp_path / "embeddings.db"
     first = EmbeddingClient(model="model-a", dim=2, cache_namespace="deployment-a", cache_path=path)
-    first.embed_batch = AsyncMock(
+    first._embed_prepared_batch = AsyncMock(
         side_effect=lambda texts: [[float(ord(text[0])), 1.0] for text in texts]
     )
 
     result = await first.embed_all(["abcdef", "z", "abc-other", "z"])
 
-    first.embed_batch.assert_awaited_once_with(["abc", "z"])
+    first._embed_prepared_batch.assert_awaited_once_with(["abc", "z"])
     assert result == [[97.0, 1.0], [122.0, 1.0], [97.0, 1.0], [122.0, 1.0]]
     await first.close()
 
     second = EmbeddingClient(
         model="model-a", dim=2, cache_namespace="deployment-a", cache_path=path
     )
-    second.embed_batch = AsyncMock(side_effect=AssertionError("cache miss"))
+    second._embed_prepared_batch = AsyncMock(side_effect=AssertionError("cache miss"))
     progress: list[tuple[int, int]] = []
     cached = await second.embed_all(
         ["abc-new suffix", "z"], progress_cb=lambda done, total: progress.append((done, total))
     )
     assert cached == [[97.0, 1.0], [122.0, 1.0]]
     assert progress == [(2, 2)]
-    second.embed_batch.assert_not_awaited()
+    second._embed_prepared_batch.assert_not_awaited()
     await second.close()
 
 
@@ -176,7 +176,7 @@ async def test_auto_dimension_deduplicates_before_first_request(tmp_path: Path) 
         client.dim = 2
         return [[float(ord(text[0])), 1.0] for text in texts]
 
-    client.embed_batch = AsyncMock(side_effect=embed_batch)
+    client._embed_prepared_batch = AsyncMock(side_effect=embed_batch)
     progress: list[tuple[int, int]] = []
 
     result = await client.embed_all(
@@ -184,7 +184,7 @@ async def test_auto_dimension_deduplicates_before_first_request(tmp_path: Path) 
         progress_cb=lambda done, total: progress.append((done, total)),
     )
 
-    client.embed_batch.assert_awaited_once_with(["alpha", "beta"])
+    client._embed_prepared_batch.assert_awaited_once_with(["alpha", "beta"])
     assert result == [[97.0, 1.0], [98.0, 1.0], [97.0, 1.0]]
     assert progress == [(3, 3)]
     await client.close()
@@ -210,7 +210,7 @@ def test_cache_entry_limit_applies_across_legacy_and_v2_tables(tmp_path: Path) -
 @pytest.mark.asyncio
 async def test_unset_namespace_never_opens_persistent_cache(tmp_path: Path) -> None:
     client = EmbeddingClient(dim=2, cache_namespace=None, cache_path=tmp_path / "bad")
-    client.embed_batch = AsyncMock(return_value=[[1.0, 2.0]])
+    client._embed_prepared_batch = AsyncMock(return_value=[[1.0, 2.0]])
 
     with patch("vector_core.embeddings.client.EmbeddingCache") as cache_type:
         assert await client.embed_all(["text"]) == [[1.0, 2.0]]
@@ -223,7 +223,7 @@ async def test_cache_read_error_fails_open(tmp_path: Path) -> None:
     cache = await client._get_embedding_cache()
     assert cache is not None
     cache.get_many = MagicMock(side_effect=sqlite3.DatabaseError("broken"))
-    client.embed_batch = AsyncMock(
+    client._embed_prepared_batch = AsyncMock(
         side_effect=lambda texts: [[float(index), 1.0] for index, _ in enumerate(texts)]
     )
 

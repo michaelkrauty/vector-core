@@ -52,7 +52,7 @@ class TestSyncEmbeddingClient:
         client = SyncEmbeddingClient(base_url="http://example.com", model="test", dim=2)
         calls = []
 
-        async def fake_embed_batch(texts):
+        async def fake_embed_batch(texts, *, role="document"):
             calls.append(list(texts))
             return [[float(len(text)), 1.0] for text in texts]
 
@@ -107,7 +107,7 @@ class TestEmbedBatch:
         }
         mock_response.raise_for_status = MagicMock()
 
-        with patch.object(client, '_get_client') as mock_get_client:
+        with patch.object(client, "_get_client") as mock_get_client:
             mock_http = AsyncMock()
             mock_http.post = AsyncMock(return_value=mock_response)
             mock_get_client.return_value = mock_http
@@ -133,7 +133,7 @@ class TestEmbedBatch:
         }
         mock_response.raise_for_status = MagicMock()
 
-        with patch.object(client, '_get_client') as mock_get_client:
+        with patch.object(client, "_get_client") as mock_get_client:
             mock_http = AsyncMock()
             mock_http.post = AsyncMock(return_value=mock_response)
             mock_get_client.return_value = mock_http
@@ -157,7 +157,7 @@ class TestEmbedBatch:
         }
         mock_response.raise_for_status = MagicMock()
 
-        with patch.object(client, '_get_client') as mock_get_client:
+        with patch.object(client, "_get_client") as mock_get_client:
             mock_http = AsyncMock()
             mock_http.post = AsyncMock(return_value=mock_response)
             mock_get_client.return_value = mock_http
@@ -174,7 +174,7 @@ class TestEmbedBatch:
         """Connection error raises EmbeddingServiceError."""
         client = EmbeddingClient()
 
-        with patch.object(client, '_get_client') as mock_get_client:
+        with patch.object(client, "_get_client") as mock_get_client:
             mock_http = AsyncMock()
             mock_http.post = AsyncMock(side_effect=httpx.ConnectError("Connection refused"))
             mock_get_client.return_value = mock_http
@@ -189,7 +189,7 @@ class TestEmbedBatch:
         """Timeout raises EmbeddingServiceError."""
         client = EmbeddingClient()
 
-        with patch.object(client, '_get_client') as mock_get_client:
+        with patch.object(client, "_get_client") as mock_get_client:
             mock_http = AsyncMock()
             mock_http.post = AsyncMock(side_effect=httpx.TimeoutException("Timeout"))
             mock_get_client.return_value = mock_http
@@ -209,7 +209,7 @@ class TestEmbedBatch:
         mock_response.status_code = 503
         mock_response.text = "Service Unavailable"
 
-        with patch.object(client, '_get_client') as mock_get_client:
+        with patch.object(client, "_get_client") as mock_get_client:
             mock_http = AsyncMock()
             mock_http.post = AsyncMock(
                 side_effect=httpx.HTTPStatusError(
@@ -232,12 +232,12 @@ class TestEmbedSingle:
         """embed_single delegates to embed_batch."""
         client = EmbeddingClient(dim=4)
 
-        with patch.object(client, 'embed_batch', new_callable=AsyncMock) as mock_batch:
+        with patch.object(client, "embed_batch", new_callable=AsyncMock) as mock_batch:
             mock_batch.return_value = [[0.1, 0.2, 0.3, 0.4]]
 
             result = await client.embed_single("hello")
 
-            mock_batch.assert_called_once_with(["hello"])
+            mock_batch.assert_called_once_with(["hello"], role="document")
             assert result == [0.1, 0.2, 0.3, 0.4]
 
 
@@ -249,7 +249,7 @@ class TestEmbedSingleCached:
         """Cached values are returned without API call."""
         client = EmbeddingClient(dim=4)
 
-        with patch.object(client, 'embed_single', new_callable=AsyncMock) as mock_single:
+        with patch.object(client, "embed_single", new_callable=AsyncMock) as mock_single:
             mock_single.return_value = [0.1, 0.2, 0.3, 0.4]
 
             # First call - not cached
@@ -268,8 +268,8 @@ class TestEmbedSingleCached:
         client = EmbeddingClient(dim=4)
         client._cache_max_size = 2
 
-        with patch.object(client, 'embed_single', new_callable=AsyncMock) as mock_single:
-            mock_single.side_effect = lambda t: [float(ord(t[0]))] * 4
+        with patch.object(client, "embed_single", new_callable=AsyncMock) as mock_single:
+            mock_single.side_effect = lambda t, **kwargs: [float(ord(t[0]))] * 4
 
             # Fill cache
             await client.embed_single_cached("a")
@@ -307,7 +307,7 @@ class TestEmbedAll:
             call_count += 1
             return [[float(i)] * 4 for i in range(len(texts))]
 
-        with patch.object(client, 'embed_batch', side_effect=mock_embed_batch):
+        with patch.object(client, "_embed_prepared_batch", side_effect=mock_embed_batch):
             result = await client.embed_all(["a", "b", "c", "d", "e"])
 
         # Should have made 3 batches: [a,b], [c,d], [e]
@@ -323,7 +323,7 @@ class TestEmbedAll:
             # Return embeddings that encode the text position
             return [[float(ord(t[0]))] * 4 for t in texts]
 
-        with patch.object(client, 'embed_batch', side_effect=mock_embed_batch):
+        with patch.object(client, "_embed_prepared_batch", side_effect=mock_embed_batch):
             result = await client.embed_all(["a", "b", "c"])
 
         assert result[0][0] == float(ord("a"))
@@ -339,10 +339,10 @@ class TestEmbedAll:
         async def mock_embed_batch(texts):
             return [[0.0] * 4 for _ in texts]
 
-        with patch.object(client, 'embed_batch', side_effect=mock_embed_batch):
+        with patch.object(client, "_embed_prepared_batch", side_effect=mock_embed_batch):
             await client.embed_all(
                 ["a", "b", "c"],
-                progress_cb=lambda completed, total: progress_calls.append((completed, total))
+                progress_cb=lambda completed, total: progress_calls.append((completed, total)),
             )
 
         assert len(progress_calls) > 0
@@ -357,7 +357,7 @@ class TestEmbedAll:
         async def mock_embed_batch(texts):
             return [[0.0] * 4 for _ in texts]
 
-        with patch.object(client, 'embed_batch', side_effect=mock_embed_batch):
+        with patch.object(client, "_embed_prepared_batch", side_effect=mock_embed_batch):
             await client.embed_all(
                 ["a", "b", "c", "d", "e"],
                 progress_cb=lambda completed, total: progress_calls.append((completed, total)),
@@ -379,7 +379,7 @@ class TestEmbedAll:
         async def mock_embed_batch(texts):
             return [[0.0] * 4 for _ in texts]
 
-        with patch.object(client, 'embed_batch', side_effect=mock_embed_batch):
+        with patch.object(client, "_embed_prepared_batch", side_effect=mock_embed_batch):
             result = await client.embed_all(["a", "b", "c"])
 
         assert len(result) == 3
@@ -392,6 +392,7 @@ class TestClientLifecycle:
     async def test_close_cleans_up(self):
         """close() cleans up HTTP client."""
         import asyncio
+
         client = EmbeddingClient()
 
         # Create the client and set the loop (simulating proper initialization)
@@ -460,7 +461,7 @@ class TestBatchRetryLogic:
         mock_response.status_code = 400
         mock_response.text = "Bad Request"
 
-        with patch.object(client, '_get_client') as mock_get_client:
+        with patch.object(client, "_get_client") as mock_get_client:
             mock_http = AsyncMock()
             mock_http.post = AsyncMock(
                 side_effect=httpx.HTTPStatusError(
@@ -501,7 +502,7 @@ class TestBatchRetryLogic:
             response.raise_for_status = MagicMock()
             return response
 
-        with patch.object(client, '_get_client') as mock_get_client:
+        with patch.object(client, "_get_client") as mock_get_client:
             mock_http = AsyncMock()
             mock_http.post = AsyncMock(side_effect=mock_post)
             mock_get_client.return_value = mock_http
@@ -517,7 +518,7 @@ class TestBatchRetryLogic:
         """Generic exception with single text raises EmbeddingServiceError."""
         client = EmbeddingClient(dim=4)
 
-        with patch.object(client, '_get_client') as mock_get_client:
+        with patch.object(client, "_get_client") as mock_get_client:
             mock_http = AsyncMock()
             mock_http.post = AsyncMock(side_effect=ValueError("Unexpected error"))
             mock_get_client.return_value = mock_http
@@ -544,7 +545,7 @@ class TestBatchRetryLogic:
             # Individual retry raises ConnectError -> EmbeddingServiceError
             raise httpx.ConnectError("Connection refused")
 
-        with patch.object(client, '_get_client') as mock_get_client:
+        with patch.object(client, "_get_client") as mock_get_client:
             mock_http = AsyncMock()
             mock_http.post = AsyncMock(side_effect=mock_post)
             mock_get_client.return_value = mock_http
@@ -583,7 +584,7 @@ class TestBatchRetryLogic:
             # Second individual retry fails with non-EmbeddingServiceError
             raise RuntimeError("Some other error")
 
-        with patch.object(client, '_get_client') as mock_get_client:
+        with patch.object(client, "_get_client") as mock_get_client:
             mock_http = AsyncMock()
             mock_http.post = AsyncMock(side_effect=mock_post)
             mock_get_client.return_value = mock_http
@@ -611,14 +612,15 @@ class TestEmbedSingleCachedRaceCondition:
         client = EmbeddingClient(dim=4)
         call_count = 0
 
-        async def mock_embed_single(text):
+        async def mock_embed_single(text, *, role="document"):
             nonlocal call_count
             call_count += 1
             return [float(call_count)] * 4
 
-        with patch.object(client, 'embed_single', side_effect=mock_embed_single):
+        with patch.object(client, "embed_single", side_effect=mock_embed_single):
             # Call twice with same text - second should use cache
             import asyncio
+
             result1, result2 = await asyncio.gather(
                 client.embed_single_cached("same_text"),
                 client.embed_single_cached("same_text"),
@@ -632,10 +634,11 @@ class TestEmbedSingleCachedRaceCondition:
     async def test_cache_hit_after_lock_returns_cached_value(self):
         """Tests that cached value found after lock acquisition is returned (line 207)."""
         import asyncio
+
         client = EmbeddingClient(dim=4)
 
         # Pre-populate the cache by calling once
-        with patch.object(client, 'embed_single', new_callable=AsyncMock) as mock:
+        with patch.object(client, "embed_single", new_callable=AsyncMock) as mock:
             mock.return_value = [1.0, 2.0, 3.0, 4.0]
             result1 = await client.embed_single_cached("test_text")
             assert mock.call_count == 1
@@ -668,7 +671,7 @@ class TestRetryExceptionPaths:
             # Individual retry also fails with non-embedding error
             raise RuntimeError("Individual text failed")
 
-        with patch.object(client, '_get_client') as mock_get_client:
+        with patch.object(client, "_get_client") as mock_get_client:
             mock_http = AsyncMock()
             mock_http.post = AsyncMock(side_effect=mock_post)
             mock_get_client.return_value = mock_http
@@ -694,7 +697,7 @@ class TestRetryExceptionPaths:
             call_count += 1
             raise ValueError("Failed")
 
-        with patch.object(client, '_get_client') as mock_get_client:
+        with patch.object(client, "_get_client") as mock_get_client:
             mock_http = AsyncMock()
             mock_http.post = AsyncMock(side_effect=mock_post)
             mock_get_client.return_value = mock_http
@@ -723,7 +726,7 @@ class TestCircuitBreaker:
         async def mock_post(*args, **kwargs):
             raise httpx.ConnectError("Connection refused")
 
-        with patch.object(client, '_get_client') as mock_get_client:
+        with patch.object(client, "_get_client") as mock_get_client:
             mock_http = AsyncMock()
             mock_http.post = AsyncMock(side_effect=mock_post)
             mock_get_client.return_value = mock_http
@@ -758,7 +761,7 @@ class TestCircuitBreaker:
             "data": [{"index": 0, "embedding": [1.0, 2.0, 3.0, 4.0]}]
         }
 
-        with patch.object(client, '_get_client') as mock_get_client:
+        with patch.object(client, "_get_client") as mock_get_client:
             mock_http = AsyncMock()
             mock_http.post = AsyncMock(return_value=mock_response)
             mock_get_client.return_value = mock_http
@@ -787,7 +790,7 @@ class TestCircuitBreaker:
             "data": [{"index": 0, "embedding": [1.0, 2.0, 3.0, 4.0]}]
         }
 
-        with patch.object(client, '_get_client') as mock_get_client:
+        with patch.object(client, "_get_client") as mock_get_client:
             mock_http = AsyncMock()
             mock_http.post = AsyncMock(return_value=mock_response)
             mock_get_client.return_value = mock_http
@@ -824,7 +827,7 @@ class TestCircuitBreaker:
         mock_response.status_code = 500
         mock_response.text = "Internal Server Error"
 
-        with patch.object(client, '_get_client') as mock_get_client:
+        with patch.object(client, "_get_client") as mock_get_client:
             mock_http = AsyncMock()
             mock_http.post = AsyncMock(
                 side_effect=httpx.HTTPStatusError(
@@ -854,7 +857,7 @@ class TestCircuitBreaker:
         mock_response.status_code = 400
         mock_response.text = "Bad Request"
 
-        with patch.object(client, '_get_client') as mock_get_client:
+        with patch.object(client, "_get_client") as mock_get_client:
             mock_http = AsyncMock()
             mock_http.post = AsyncMock(
                 side_effect=httpx.HTTPStatusError(

@@ -131,7 +131,7 @@ class QdrantStorage:
         """
         self.url = url or settings.qdrant_url
         self.api_key = api_key or settings.qdrant_api_key
-        self.embedding_dim = embedding_dim or settings.embedding_dim
+        self.embedding_dim = settings.embedding_dim if embedding_dim is None else embedding_dim
         self.timeout = timeout or settings.qdrant_operation_timeout
         self._client: AsyncQdrantClient | None = None
         self._health_check_interval = health_check_interval
@@ -203,7 +203,7 @@ class QdrantStorage:
             self._healthy = True
             self._last_health_check = time.monotonic()
             return True
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning(f"Qdrant health check timed out after {timeout}s")
             self._healthy = False
             return False
@@ -481,7 +481,7 @@ class QdrantStorage:
             payload_fields: Specific payload fields to retrieve (None = all)
             limit: Max points per scroll request
             max_results: Maximum total results to return (None = use settings.scroll_max_results).
-                         Set to 0 for truly unlimited. Prevents memory exhaustion on large collections.
+                         Set to 0 for unlimited results. Bounds memory use for large collections.
 
         Returns:
             List of point payloads (may be truncated if max_results reached)
@@ -529,6 +529,17 @@ class QdrantStorage:
         """
         client = await self._get_client()
 
+        # Indexer metadata updates must never erase or replace the migration
+        # readiness/identity fence. Its only writer is the migration coordinator.
+        if collection.startswith("vcgen_"):
+            existing = await self.get_metadata(collection)
+            manifest = (existing or {}).get("embedding_generation")
+            if manifest is not None:
+                incoming = metadata.get("embedding_generation", manifest)
+                if incoming != manifest:
+                    raise ValueError("Collection generation identity cannot be overwritten")
+                metadata = {**metadata, "embedding_generation": manifest}
+
         # Serialize complex values to JSON
         payload = {"type": "__metadata__"}
         for key, value in metadata.items():
@@ -538,16 +549,18 @@ class QdrantStorage:
                 payload[key] = value
         payload["updated_at"] = datetime.now(UTC).isoformat()
 
-        if self.embedding_dim == 0:
-            raise RuntimeError(
-                "embedding_dim not yet initialized. Call embed_batch() first or set "
-                "VECTOR_EMBEDDING_DIM before calling store_metadata()."
-            )
+        # Storage can serve several embedding spaces concurrently. The target
+        # schema, not this instance's default for new collections, owns its size.
+        info = await client.get_collection(collection)
+        vectors = info.config.params.vectors
+        dense = vectors.get("dense") if isinstance(vectors, dict) else None
+        if not isinstance(dense, VectorParams) or dense.size <= 0:
+            raise RuntimeError(f"Collection {collection!r} has no valid named dense vector schema")
 
         point = PointStruct(
             id=0,  # Reserved ID for metadata
             vector={
-                "dense": [0.0] * self.embedding_dim,  # Dummy vector
+                "dense": [0.0] * dense.size,  # Dummy vector
                 "sparse": QdrantSparseVector(indices=[], values=[]),
             },
             payload=payload,

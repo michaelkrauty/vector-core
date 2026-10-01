@@ -80,7 +80,14 @@ All settings are configured via environment variables prefixed with `VECTOR_`. M
 | `VECTOR_EMBEDDING_BATCH_SIZE` | `8` | Number of texts per embedding API request |
 | `VECTOR_EMBEDDING_CONCURRENCY` | `2` | Max concurrent embedding API requests |
 | `VECTOR_EMBEDDING_TIMEOUT` | `120` | Timeout in seconds for embedding API requests |
-| `VECTOR_EMBEDDING_MAX_TEXT_CHARS` | `8000` | Max characters before text truncation |
+| `VECTOR_EMBEDDING_MAX_TEXT_CHARS` | `8000` | Maximum complete formatted input length, including role prefix |
+| `VECTOR_EMBEDDING_PROFILE` | `auto` | `raw`, `qwen3`, or `nemotron3`; `auto` recognizes supported model names and otherwise uses `raw` |
+| `VECTOR_EMBEDDING_QUERY_INSTRUCTION` | Retrieval instruction | Instruction used by the Qwen3 query formatter |
+| `VECTOR_EMBEDDING_QUERY_PREFIX` | Profile default | Exact optional query-prefix override, including whitespace |
+| `VECTOR_EMBEDDING_DOCUMENT_PREFIX` | Profile default | Exact optional document-prefix override, including whitespace |
+| `VECTOR_EMBEDDING_TOKENIZER_PATH` | `None` | Local tokenizer JSON; requires the `tokenizer` extra and never downloads a model |
+| `VECTOR_EMBEDDING_MAX_INPUT_TOKENS` | Profile default | Complete formatted input token limit, set to the deployed backend's context limit |
+| `VECTOR_EMBEDDING_MAX_INPUT_BYTES` | Profile default | Additional UTF-8 byte bound; `0` disables the optional byte bound when exact tokenization is configured |
 | `VECTOR_EMBEDDING_CACHE_NAMESPACE` | `None` | Stable model/deployment identity. Setting a non-empty value opts `embed_all()` into persistent reuse; leave unset to disable it |
 | `VECTOR_EMBEDDING_GLOBAL_CONCURRENCY` | `0` | Max embedding HTTP attempts across all local processes sharing an endpoint/model. `0` disables cross-process limiting |
 
@@ -160,7 +167,13 @@ client = EmbeddingClient(
 vectors = await client.embed_batch(["hello world", "vector search"])
 # Or single text:
 vector = await client.embed_single("hello world")
+# Retrieval queries use the model's query formatting:
+query_vector = await client.embed_single("find a greeting", role="query")
 ```
+
+All asynchronous and synchronous embedding methods accept `role="document"` or `role="query"`. Document is the backward-compatible default. Query and document inputs remain separate in both persistent and in-memory caches. The Nemotron3 profile formats queries with `query: ` and documents with `passage: `; Qwen3 adds its retrieval instruction to queries and leaves documents unprefixed. Formatting is applied once inside the client, so callers should pass raw text. Set an explicit profile when a generic model alias hides its family.
+
+Input bounds include the prefix. The known profiles default to 4,096 tokens for Nemotron3 and 32,768 for Qwen3; configure the actual server context if it differs. Without a local tokenizer, known byte-level profiles use a conservative UTF-8 byte budget, reserving eight backend special tokens for Qwen3. With `pip install 'vector-core[tokenizer]'` or `uv sync --extra tokenizer`, a local tokenizer JSON permits exact counting and less aggressive truncation. Raw profiles include the tokenizer's postprocessor tokens, whose behavior must match the backend. Nemotron3 counts without added special tokens, while Qwen3 retains its reserved overhead. Unknown raw profiles have no inferred token limit and require a tokenizer for an explicit token limit. Character and byte limits remain additional bounds, so raise the character limit if longer token-valid inputs are desired. The tokenizer content hash, effective formatting, preprocessing version, and input limits participate in identity; changing them invalidates embedding reuse and triggers consumer migration.
 
 Persistent reuse applies to `embed_all()` indexing workloads and is deliberately
 opt-in. Configure an immutable model-artifact/deployment fingerprint as the
@@ -193,6 +206,31 @@ results = await searcher.search(
     limit=10,
 )
 ```
+
+### Automatic embedding-model migration
+
+Consumers can bind a logical index to the current embedding configuration through `ensure_embedding_collection()`. Its identity includes model, deployment namespace, endpoint, resolved dimension, and preprocessing. Endpoint authentication credentials are excluded from stored metadata; an opaque digest distinguishes authenticated deployments. A first uncached embedding request validates the configured dimension or resolves an automatic dimension. An incompatible or unidentified legacy collection is rebuilt into a new physical collection; the old collection remains intact.
+
+```python
+from vector_core.storage.embedding_migration import (
+    embedding_collection_lock,
+    ensure_embedding_collection,
+)
+
+async with embedding_collection_lock(storage, logical_name):
+    generation = await ensure_embedding_collection(
+        storage, logical_name, embedder, resolve_legacy_text, lock_held=True,
+    )
+    await storage.upsert_batch(generation.physical_name, points)
+```
+
+Hold the operation lock through all source mutations and vector writes. The helper creates a task-reentrant local process lock and checks an existing client's binding before returning a physical target. Concurrent clients wait up to at least one hour for an ongoing rebuild, rather than using the short ordinary file-lock timeout. Common loopback endpoint spellings share one lock. Reads can resolve without an outer lock, then retain the returned target throughout their operation. The `logical_name + "__active"` alias is a discovery pointer only: never query or write vectors through it. Shared collections migrate all point types together. An old client fails closed after a different identity becomes active; a fresh client can intentionally change the configured model. Returning to an earlier model copies current content rather than reusing an outdated generation.
+
+New index points should include `embedding_text`, containing the complete raw document input before role formatting and truncation. Migration reuses this field or invokes the domain resolver, preserving existing IDs, payloads, and sparse vectors. Legacy documents, facts, and note chunks retain usable text. Legacy note summaries lack their original body excerpt, so the shared resolver creates a canonical summary from retained title, tags, and category and records `embedding_text_source="legacy-note-metadata"`. Their full retained chunks remain independently searchable. Truncated glossary definitions are recovered from the corresponding verified SQLite row. Unavailable required source content fails closed without publishing a partial build.
+
+An optional `finalize_candidate` callback can reconstruct domain-owned source groups before publication; its text resolver may return `None` to omit points belonging to those groups. The callback must propagate every incomplete rebuild. Failed candidates stay unselected, retries build a fresh candidate, and originals remain available without their source files. Dense-only copying does not change global sparse vocabulary statistics. Inventory and cleanup code must distinguish active generations from preserved and incomplete collections.
+
+Generation metadata and the source lineage are retained in point ID `0`. Ordinary collection metadata updates preserve the identity marker. Collection generations and their retained data are never deleted automatically. Restore a historical corpus only after stopping writers and selecting a compatible embedding identity; simply reverting model configuration rebuilds from the current corpus. Local file locks coordinate upgraded clients sharing a cache directory, not legacy binaries or uncoordinated writers on other hosts.
 
 ### Sparse index recovery
 

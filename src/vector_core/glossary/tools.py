@@ -4,23 +4,23 @@ Servers wrap these methods with thin MCP decorators.
 All methods are async to match indexing/embedding operations.
 """
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from vector_core.errors import ErrorCode, error_response
-from vector_core.utils.sentinel import UNSET, UnsetType, is_set
 from vector_core.glossary.indexer import GlossaryIndexer
 from vector_core.glossary.models import (
     GlossaryEntry,
     TermExistsError,
 )
 from vector_core.glossary.store import GlossaryStore
+from vector_core.utils.sentinel import UNSET, UnsetType, is_set
 
 
 def _require_text(value: str, field: str) -> dict | None:
     """Return an INVALID_INPUT error dict if a text field is blank, else None."""
     if not isinstance(value, str) or not value.strip():
-        return error_response(
-            ErrorCode.INVALID_INPUT, f"{field} must be a non-empty string"
-        )
+        return error_response(ErrorCode.INVALID_INPUT, f"{field} must be a non-empty string")
     return None
 
 
@@ -35,14 +35,10 @@ def _require_alias_texts(aliases: list[str]) -> dict | None:
     seen: set[str] = set()
     for alias in aliases:
         if not isinstance(alias, str) or not alias.strip():
-            return error_response(
-                ErrorCode.INVALID_INPUT, "aliases must not contain empty strings"
-            )
+            return error_response(ErrorCode.INVALID_INPUT, "aliases must not contain empty strings")
         normalized = alias.strip().lower()
         if normalized in seen:
-            return error_response(
-                ErrorCode.INVALID_INPUT, f"duplicate alias: {alias.strip()}"
-            )
+            return error_response(ErrorCode.INVALID_INPUT, f"duplicate alias: {alias.strip()}")
         seen.add(normalized)
     return None
 
@@ -110,6 +106,14 @@ class GlossaryToolHelper:
         """Convert entry to dict for MCP response."""
         return entry.to_dict()
 
+    @asynccontextmanager
+    async def _index_operation(self) -> AsyncIterator[None]:
+        if self.indexer is None:
+            yield
+        else:
+            async with self.indexer.collection_operation():
+                yield
+
     async def add_entry(
         self,
         term: str,
@@ -151,10 +155,11 @@ class GlossaryToolHelper:
         aliases = [a.strip() for a in aliases] if aliases is not None else None
 
         try:
-            entry = self.store.create(term, expansion, definition, domain, aliases)
-            if self.indexer is not None:
-                await self.indexer.index_entry(entry.id)
-            return self._entry_to_dict(entry)
+            async with self._index_operation():
+                entry = self.store.create(term, expansion, definition, domain, aliases)
+                if self.indexer is not None:
+                    await self.indexer.index_entry(entry.id)
+                return self._entry_to_dict(entry)
         except TermExistsError as e:
             return error_response(ErrorCode.DUPLICATE, f"Term already exists: {e.term}")
 
@@ -191,7 +196,11 @@ class GlossaryToolHelper:
             List of matching entries with relevance scores, or error dict
         """
         if self.indexer is None:
-            return [error_response(ErrorCode.SERVICE_UNAVAILABLE, "Search not available: indexer not configured")]
+            return [
+                error_response(
+                    ErrorCode.SERVICE_UNAVAILABLE, "Search not available: indexer not configured"
+                )
+            ]
         limit = min(limit, 100)
         return await self.indexer.search(query, domain, limit)
 
@@ -214,7 +223,7 @@ class GlossaryToolHelper:
         entries = self.store.list_all(domain, limit)
         return [e.to_dict() for e in entries]
 
-    async def update_entry(
+    async def update_entry(  # noqa: PLR0917 - Preserve the public tool signature.
         self,
         term_or_id: str,
         term: str | None = None,
@@ -268,10 +277,11 @@ class GlossaryToolHelper:
             if aliases is not UNSET:
                 kwargs["aliases"] = aliases
 
-            updated = self.store.update(entry.id, **kwargs)
-            if self.indexer is not None:
-                await self.indexer.index_entry(updated.id)
-            return self._entry_to_dict(updated)
+            async with self._index_operation():
+                updated = self.store.update(entry.id, **kwargs)
+                if self.indexer is not None:
+                    await self.indexer.index_entry(updated.id)
+                return self._entry_to_dict(updated)
         except TermExistsError as e:
             return error_response(ErrorCode.DUPLICATE, f"Term already exists: {e.term}")
 
@@ -290,11 +300,12 @@ class GlossaryToolHelper:
         if entry is None:
             return error_response(ErrorCode.GLOSSARY_NOT_FOUND, f"Entry not found: {term_or_id}")
 
-        entry_id = entry.id
-        if self.indexer is not None:
-            await self.indexer.delete_entry_index(entry_id)
-        self.store.delete(entry_id)
-        return {"success": True, "deleted_id": str(entry_id)}
+        async with self._index_operation():
+            entry_id = entry.id
+            if self.indexer is not None:
+                await self.indexer.delete_entry_index(entry_id)
+            self.store.delete(entry_id)
+            return {"success": True, "deleted_id": str(entry_id)}
 
     async def get_domains(self) -> list[str]:
         """
