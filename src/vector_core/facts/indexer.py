@@ -17,22 +17,20 @@ from qdrant_client.models import (
     FieldCondition,
     MatchValue,
     PayloadSchemaType,
-    PointStruct,
-)
-from qdrant_client.models import (
-    SparseVector as QdrantSparseVector,
 )
 
 from vector_core.embeddings.client import EmbeddingClient, EmbeddingServiceError
 from vector_core.embeddings.global_vocab import GlobalVocabulary
 from vector_core.facts.database import FactStore
 from vector_core.facts.models import Fact, SourceStatus
+from vector_core.storage.embedding_fragments import fragment_point, upsert_fragment_group
 from vector_core.storage.embedding_migration import (
     CollectionGeneration,
     embedding_collection_lock,
     ensure_embedding_collection,
 )
 from vector_core.storage.embedding_sources import resolve_shared_embedding_text
+from vector_core.storage.fragment_recovery import FragmentGroupRecoveryError
 from vector_core.storage.qdrant import (
     QdrantConnectionError,
     QdrantStorage,
@@ -209,6 +207,7 @@ class FactIndexer:
             self._text_resolver,
             lock_held=lock_held,
             finalize_candidate=self._finalize_candidate,
+            vectorize=self.global_vocab.vectorize_document,
             payload_indexes=[
                 ("type", PayloadSchemaType.KEYWORD),
                 ("fact_id", PayloadSchemaType.KEYWORD),
@@ -339,6 +338,10 @@ class FactIndexer:
                 # Storage unavailable - abort indexing to avoid partial state
                 logger.error(f"Storage unavailable, aborting indexing: {e}")
                 raise
+            except FragmentGroupRecoveryError:
+                # The prior group is journaled, but storage requires explicit
+                # recovery. Do not bury this among per-fact indexing failures.
+                raise
             except Exception as e:
                 # Unexpected error - log with full traceback and continue
                 logger.error(
@@ -396,9 +399,6 @@ class FactIndexer:
         # Generate searchable text
         text = generate_fact_text(fact)
 
-        # Get embedding
-        embedding = await self.embedder.embed_single_cached(text, role="document")
-
         # Generate sparse vector
         sparse = self.global_vocab.vectorize_document(text)
 
@@ -440,24 +440,18 @@ class FactIndexer:
             "created": fact.created.isoformat(),
             "modified": fact.modified.isoformat(),
             "content": text,  # For highlight extraction
-            "embedding_text": text,
+            "embedding_text_field": "content",
         }
 
-        # Create point
-        point = PointStruct(
-            id=point_id,
-            vector={
-                "dense": embedding,
-                "sparse": QdrantSparseVector(
-                    indices=sparse.indices,
-                    values=sparse.values,
-                ),
-            },
+        points = await fragment_point(
+            self.embedder,
+            point_id=point_id,
             payload=payload,
+            sparse=sparse,
+            text=text,
+            vectorize=self.global_vocab.vectorize_document,
         )
-
-        # Upsert
-        await self.storage.upsert_batch(collection, [point])
+        await upsert_fragment_group(self.storage, collection, points)
         logger.debug(f"Indexed fact {fact.id}")
 
     async def _delete_fact_point(self, fact_id: UUID, collection: str) -> None:

@@ -34,13 +34,13 @@ def stored_embedding_text(payload: dict[str, Any]) -> str | None:
     """Read an explicit raw input or validated same-payload field reference."""
     if "embedding_text" in payload:
         text = payload["embedding_text"]
-        if not isinstance(text, str) or not text.strip():
+        if not isinstance(text, str) or not text:
             raise ValueError("Invalid persisted embedding text")
         return text
     if "embedding_text_field" in payload:
         field = payload["embedding_text_field"]
         text = payload.get(field) if isinstance(field, str) else None
-        if not isinstance(text, str) or not text.strip():
+        if not isinstance(text, str) or not text:
             raise ValueError("Invalid embedding text field reference")
         return text
     return None

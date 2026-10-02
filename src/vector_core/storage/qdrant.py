@@ -12,6 +12,7 @@ from typing import Any
 import httpx
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import (
+    Condition,
     Distance,
     FieldCondition,
     Filter,
@@ -467,7 +468,7 @@ class QdrantStorage:
     async def scroll_points(
         self,
         collection: str,
-        filter_conditions: Sequence[FieldCondition] | None = None,
+        filter_conditions: Sequence[Condition] | None = None,
         payload_fields: list[str] | None = None,
         limit: int = 5000,
         max_results: int | None = None,

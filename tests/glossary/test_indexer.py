@@ -10,6 +10,7 @@ from uuid import uuid4
 
 import pytest
 
+from vector_core.embeddings.client import EmbeddingClient
 from vector_core.embeddings.global_vocab import GlobalVocabulary
 from vector_core.glossary import indexer as indexer_module
 from vector_core.glossary.indexer import (
@@ -20,6 +21,7 @@ from vector_core.glossary.indexer import (
 )
 from vector_core.glossary.models import GlossaryEntry
 from vector_core.glossary.store import GlossaryStore
+from vector_core.settings import settings
 
 
 @pytest.fixture
@@ -38,9 +40,11 @@ def store(temp_db):
 
 
 @pytest.fixture
-def mock_storage():
+def mock_storage(temp_db, monkeypatch):
     """Create mock QdrantStorage."""
+    monkeypatch.setattr(settings, "cache_dir", temp_db)
     storage = MagicMock()
+    storage.url = "http://glossary-tests.invalid"
     storage.ensure_collection_with_indexes = AsyncMock(return_value=True)
     storage.upsert_batch = AsyncMock()
     storage.upsert_point = AsyncMock()
@@ -48,15 +52,26 @@ def mock_storage():
     storage.query_dense = AsyncMock(return_value=[])
     storage.create_point = MagicMock(return_value=MagicMock())
     storage.close = AsyncMock()
+    storage.get_client = AsyncMock(
+        return_value=SimpleNamespace(
+            retrieve=AsyncMock(return_value=[]),
+            upsert=storage.upsert_batch,
+            scroll=AsyncMock(return_value=([], None)),
+            delete=AsyncMock(),
+        )
+    )
     return storage
 
 
 @pytest.fixture
 def mock_embedder():
     """Create mock EmbeddingClient."""
-    embedder = MagicMock()
+    embedder = EmbeddingClient(dim=4096)
     # Return a fake 4096-dim embedding
     embedder.embed_single_cached = AsyncMock(return_value=[0.1] * 4096)
+    embedder.embed_all = AsyncMock(
+        side_effect=lambda texts, **kwargs: [[0.1] * 4096 for _ in texts]
+    )
     return embedder
 
 
@@ -208,9 +223,9 @@ class TestGlossaryIndexer:
         result = await indexer.index_all()
 
         assert result == 2
-        mock_storage.upsert_batch.assert_called_once()
+        assert mock_storage.upsert_batch.await_count == 2
         # Should have called embedder for each entry
-        assert mock_embedder.embed_single_cached.call_count == 2
+        assert mock_embedder.embed_all.await_count == 2
 
     @pytest.mark.asyncio
     async def test_index_entry(self, indexer, store, mock_storage, mock_embedder):
@@ -223,8 +238,8 @@ class TestGlossaryIndexer:
 
         await indexer.index_entry(entry.id)
 
-        mock_storage.upsert_point.assert_called_once()
-        mock_embedder.embed_single_cached.assert_called()
+        mock_storage.upsert_batch.assert_awaited_once()
+        mock_embedder.embed_all.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_delete_entry_index(self, indexer, store, mock_storage):
@@ -248,6 +263,7 @@ class TestGlossaryIndexer:
             "application interface", role="query"
         )
         indexer.hybrid_searcher.search.assert_called_once()
+        assert indexer.hybrid_searcher.search.call_args.kwargs["group_by"] == "glossary_id"
 
     @pytest.mark.asyncio
     async def test_search_with_domain_filter(self, indexer, mock_embedder):
@@ -308,14 +324,14 @@ class TestGenerationTargets:
     ):
         entry = store.create("API", "Interface", "definition")
 
-        async def embed(text, *, role):
+        async def embed(texts, *, role):
             assert migration.locked
             assert role == "document"
-            return [0.1] * 4096
+            return [[0.1] * 4096 for _ in texts]
 
-        mock_embedder.embed_single_cached.side_effect = embed
+        mock_embedder.embed_all.side_effect = embed
         await indexer.index_entry(entry.id)
-        assert mock_storage.upsert_point.call_args.kwargs["collection"] == "test_generation"
+        assert mock_storage.upsert_batch.call_args.args[0] == "test_generation"
         assert migration.ensure.call_args.kwargs["lock_held"] is True
         assert indexer.collection_name == "test_collection"
         assert not migration.locked
@@ -340,7 +356,7 @@ class TestGenerationTargets:
         migration.locked = True
         await indexer.index_entry(entry.id)
         migration.ensure.assert_not_awaited()
-        assert mock_storage.upsert_point.call_args.kwargs["collection"] == "bound"
+        assert mock_storage.upsert_batch.call_args.args[0] == "bound"
 
 
 class TestGlossaryIndexerConstants:

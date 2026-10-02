@@ -7,6 +7,7 @@ import pytest
 
 from vector_core.embeddings.client import (
     EmbeddingClient,
+    EmbeddingInputRejectedError,
     EmbeddingServiceError,
     SyncEmbeddingClient,
 )
@@ -145,11 +146,11 @@ class TestEmbedBatch:
         assert result[1] == [0.5, 0.6, 0.7, 0.8]
 
     @pytest.mark.asyncio
-    async def test_truncates_long_text(self):
-        """Very long texts are truncated to avoid API errors."""
+    async def test_preserves_long_text(self):
+        """Unset limits preserve the entire source, including the tail."""
         client = EmbeddingClient(dim=4)
 
-        long_text = "x" * 10000  # Longer than max_chars
+        long_text = "x" * 10000 + " unique tail \t\n"
 
         mock_response = MagicMock()
         mock_response.json.return_value = {
@@ -164,10 +165,9 @@ class TestEmbedBatch:
 
             await client.embed_batch([long_text])
 
-            # Verify the text was truncated
             call_args = mock_http.post.call_args
             sent_texts = call_args[1]["json"]["input"]
-            assert len(sent_texts[0]) <= 8000
+            assert sent_texts == [long_text]
 
     @pytest.mark.asyncio
     async def test_connection_error_raises_embedding_error(self):
@@ -452,8 +452,8 @@ class TestBatchRetryLogic:
     """Tests for batch retry logic (lines 122-139)."""
 
     @pytest.mark.asyncio
-    async def test_non_http_status_error_retry_individual(self):
-        """Non-HTTPStatusError triggers individual retry (lines 122-124)."""
+    async def test_backend_input_rejection_is_not_a_service_error(self):
+        """HTTP 400 remains a strict input failure rather than a service failure."""
         client = EmbeddingClient(dim=4)
 
         mock_request = MagicMock()
@@ -470,7 +470,7 @@ class TestBatchRetryLogic:
             )
             mock_get_client.return_value = mock_http
 
-            with pytest.raises(EmbeddingServiceError) as exc_info:
+            with pytest.raises(EmbeddingInputRejectedError) as exc_info:
                 await client.embed_batch(["hello"])
 
             assert "400" in str(exc_info.value)
@@ -866,7 +866,7 @@ class TestCircuitBreaker:
             )
             mock_get_client.return_value = mock_http
 
-            with pytest.raises(EmbeddingServiceError):
+            with pytest.raises(EmbeddingInputRejectedError):
                 await client.embed_batch(["test"])
 
         # 4xx errors shouldn't count as failures

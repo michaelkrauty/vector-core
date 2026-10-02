@@ -31,18 +31,21 @@ class VectorCoreSettings(BaseSettings):
     embedding_concurrency: int = 2
     embedding_timeout: int = 120
     # Bounds apply to the complete formatted input, including its role prefix.
-    embedding_max_text_chars: int = 8000
+    embedding_max_text_chars: int | None = None
     embedding_profile: Literal["auto", "raw", "qwen3", "nemotron3"] = "auto"
     embedding_query_instruction: str = (
         "Given a web search query, retrieve relevant passages that answer the query"
     )
     embedding_query_prefix: str | None = None
     embedding_document_prefix: str | None = None
-    # None selects a known profile's conservative byte bound. 0 removes the extra
-    # byte bound; known profiles still enforce a safe fallback without a tokenizer.
+    # Optional deployment limits reject oversized inputs; they never truncate.
     embedding_max_input_bytes: int | None = None
     embedding_tokenizer_path: Path | None = None
     embedding_max_input_tokens: int | None = None
+    embedding_tokenizer_add_special_tokens: bool = True
+    embedding_reserved_tokens: int = 0
+    # Serialized HTTP body budget, independent of per-input model capacity.
+    embedding_max_request_bytes: int | None = None
     # Persistent reuse is opt-in: unset namespace means no cache is opened.
     embedding_cache_namespace: str | None = None
     # Cross-process backend request capacity. 0 disables global coordination.
@@ -59,7 +62,8 @@ class VectorCoreSettings(BaseSettings):
 
     # Indexing
     max_file_size_kb: int = 500
-    max_payload_content_chars: int = 30000  # Chunk content stored in Qdrant payloads
+    # Legacy compatibility setting; full-source indexers do not cap retained content.
+    max_payload_content_chars: int = 30000
 
     # Search - Hybrid RRF weights
     dense_weight: float = 1.0
@@ -96,12 +100,15 @@ class VectorCoreSettings(BaseSettings):
 
     # --- Validators ---
 
-    @field_validator("embedding_max_input_bytes", "embedding_max_input_tokens")
+    @field_validator(
+        "embedding_max_input_bytes",
+        "embedding_max_input_tokens",
+        "embedding_max_text_chars",
+        "embedding_max_request_bytes",
+    )
     @classmethod
     def validate_optional_input_limit(cls, v: int | None, info: ValidationInfo) -> int | None:
-        if v is not None and (
-            v < 0 or (info.field_name == "embedding_max_input_tokens" and v == 0)
-        ):
+        if v is not None and (v < 0 or (info.field_name != "embedding_max_input_bytes" and v == 0)):
             raise ValueError(f"{info.field_name} must be positive (bytes also permits 0)")
         return v
 
@@ -109,7 +116,6 @@ class VectorCoreSettings(BaseSettings):
         "embedding_batch_size",
         "embedding_concurrency",
         "embedding_timeout",
-        "embedding_max_text_chars",
         "max_file_size_kb",
         "max_payload_content_chars",
         "cache_max_entries",
@@ -129,12 +135,12 @@ class VectorCoreSettings(BaseSettings):
             raise ValueError(f"{info.field_name} must be positive, got {v}")
         return v
 
-    @field_validator("embedding_global_concurrency", mode="after")
+    @field_validator("embedding_global_concurrency", "embedding_reserved_tokens", mode="after")
     @classmethod
     def validate_non_negative_int(cls, v: int) -> int:
         """Validate integer settings where zero explicitly disables a feature."""
         if v < 0:
-            raise ValueError(f"embedding_global_concurrency must be non-negative, got {v}")
+            raise ValueError(f"Setting must be non-negative, got {v}")
         return v
 
     @field_validator(
@@ -231,6 +237,9 @@ class VectorCoreSettingsMixin:
             "embedding_max_input_bytes",
             "embedding_tokenizer_path",
             "embedding_max_input_tokens",
+            "embedding_tokenizer_add_special_tokens",
+            "embedding_reserved_tokens",
+            "embedding_max_request_bytes",
             "embedding_cache_namespace",
             "embedding_global_concurrency",
             # Cache

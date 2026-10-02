@@ -11,6 +11,7 @@ from tokenizers import Tokenizer, models, pre_tokenizers, processors
 
 from vector_core.embeddings.client import (
     EmbeddingClient,
+    EmbeddingInputTooLongError,
     EmbeddingServiceError,
     SyncEmbeddingClient,
 )
@@ -78,16 +79,21 @@ async def test_explicit_raw_override_and_custom_prefixes():
     assert [p["input"] for p in requests] == [["search: same"], ["text: same"]]
 
 
-async def test_memory_cache_uses_role_and_effective_input(monkeypatch):
-    monkeypatch.setattr("vector_core.embeddings.client.settings.embedding_max_text_chars", 12)
+async def test_memory_cache_uses_role_and_full_input():
     requests = []
     async with wire(EmbeddingClient(model="Nemotron-3-Embed-1B", dim=2), requests) as client:
         query = await client.embed_single_cached("abcdef-one", role="query")
-        assert await client.embed_single_cached("abcdef-two", role="query") == query
+        other = await client.embed_single_cached("abcdef-two", role="query")
+        assert other != query
+        assert await client.embed_single_cached("abcdef-one", role="query") == query
         document = await client.embed_single_cached("abcdef-one")
         assert query != document
         assert await client.embed_single_cached("abcdef-one") == document
-    assert [p["input"] for p in requests] == [["query: abcde"], ["passage: abc"]]
+    assert [p["input"] for p in requests] == [
+        ["query: abcdef-one"],
+        ["query: abcdef-two"],
+        ["passage: abcdef-one"],
+    ]
 
 
 async def test_auto_dimension_cached_concurrent_requests(monkeypatch):
@@ -131,11 +137,11 @@ async def test_batch_fallback_never_reapplies_prefix():
     assert [p["input"] for p in requests] == [["query: a", "query: b"], ["query: a"], ["query: b"]]
 
 
-@pytest.mark.parametrize("text", ["", " \t\n", None])
-async def test_blank_inputs_fail_before_network(text):
+@pytest.mark.parametrize("text", ["", None])
+async def test_empty_or_non_string_inputs_fail_before_network(text):
     requests = []
     async with wire(EmbeddingClient(model="Nemotron-3-Embed-1B", dim=2), requests) as client:
-        with pytest.raises(ValueError, match="non-blank"):
+        with pytest.raises(ValueError, match="non-empty"):
             await client.embed_single_cached(text, role="query")
     assert requests == []
 
@@ -143,12 +149,17 @@ async def test_blank_inputs_fail_before_network(text):
 @pytest.mark.parametrize("role,prefix", [("query", "query: "), ("document", "passage: ")])
 async def test_nemotron_utf8_byte_budget_includes_prefix(role, prefix):
     requests = []
-    async with wire(EmbeddingClient(model="Nemotron-3-Embed-1B", dim=2), requests) as client:
-        await client.embed_batch(["🙂界" * 3000], role=role)
-    sent = requests[0]["input"][0]
-    assert sent.startswith(prefix)
-    assert 4092 <= len(sent.encode()) <= 4096
-    assert "�" not in sent
+    text = "🙂界"
+    async with wire(
+        EmbeddingClient(
+            model="Nemotron-3-Embed-1B", dim=2, max_input_bytes=len((prefix + text).encode())
+        ),
+        requests,
+    ) as client:
+        await client.embed_batch([text], role=role)
+        with pytest.raises(EmbeddingInputTooLongError):
+            await client.embed_batch([text + "é"], role=role)
+    assert [p["input"] for p in requests] == [[prefix + text]]
 
 
 @pytest.fixture
@@ -175,8 +186,11 @@ async def test_local_tokenizer_preserves_coverage_and_counts_prefix(tokenizer_fi
         ),
         requests,
     ) as client:
-        await client.embed_all(["word " * 2000], role="query")
-        assert client.max_input_bytes == 0
+        text = "word " * 998
+        await client.embed_all([text], role="query")
+        with pytest.raises(EmbeddingInputTooLongError):
+            await client.embed_all([text + "word "], role="query")
+        assert client.max_input_bytes in (None, 0)
         assert (
             client.tokenizer_fingerprint == hashlib.sha256(tokenizer_file.read_bytes()).hexdigest()
         )
@@ -184,8 +198,8 @@ async def test_local_tokenizer_preserves_coverage_and_counts_prefix(tokenizer_fi
         assert tokenizer is not None
     sent = requests[0]["input"][0]
     assert len(sent.encode()) > 4096
-    assert sent.startswith("query: ")
-    assert len(tokenizer.encode(sent, add_special_tokens=False).ids) == 1000
+    assert sent == "query: " + text
+    assert len(tokenizer.encode(sent, add_special_tokens=True).ids) == 1000
 
 
 async def test_tokenizer_prefix_too_large_fails_locally(tokenizer_file):
@@ -196,7 +210,7 @@ async def test_tokenizer_prefix_too_large_fails_locally(tokenizer_file):
         ),
         requests,
     ) as client:
-        with pytest.raises(ValueError, match="prefix|content"):
+        with pytest.raises(EmbeddingInputTooLongError):
             await client.embed_batch(["word"])
     assert requests == []
 
@@ -225,7 +239,9 @@ async def test_raw_tokenizer_budget_includes_postprocessor_tokens(tokenizer_file
         ),
         requests,
     ) as client:
-        await client.embed_single("word word word word")
+        await client.embed_single("word word")
+        with pytest.raises(EmbeddingInputTooLongError):
+            await client.embed_single("word word word")
     sent = requests[0]["input"][0]
     assert len(tokenizer.encode(sent, add_special_tokens=True).ids) == 4
     assert len(tokenizer.encode(sent, add_special_tokens=False).ids) == 2
@@ -252,7 +268,9 @@ async def test_token_limit_preserves_later_merged_prefix(tmp_path, kind):
         EmbeddingClient(model="generic", dim=2, tokenizer_path=path, max_input_tokens=1),
         requests,
     ) as client:
-        await client.embed_single("abcdef tail tail")
+        await client.embed_single("abcdef")
+        with pytest.raises(EmbeddingInputTooLongError):
+            await client.embed_single("abcdef tail tail")
     assert requests[0]["input"] == ["abcdef"]
 
 
@@ -263,8 +281,14 @@ def test_formatting_changes_identity_and_roundtrip(tokenizer_file):
         {"query_prefix": "query: "},
         {"document_prefix": "passage: "},
         {"max_input_bytes": 200},
-        {"profile": "nemotron3", "max_input_tokens": 100},
+        {"max_text_chars": 100},
         {"tokenizer_path": tokenizer_file, "max_input_tokens": 100},
+        {
+            "tokenizer_path": tokenizer_file,
+            "max_input_tokens": 100,
+            "tokenizer_add_special_tokens": False,
+        },
+        {"tokenizer_path": tokenizer_file, "max_input_tokens": 100, "reserved_tokens": 2},
     ]
     for changed in changes:
         identity = EmbeddingClient(model="alias", dim=2, **changed).configured_identity()
