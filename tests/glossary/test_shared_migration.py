@@ -143,7 +143,7 @@ async def test_fact_write_preserves_legacy_and_other_shared_types(resources):
     assert await points(storage, "shared") == before
     assert current[1].payload == {
         **payload,
-        "embedding_text": payload["content"],
+        "embedding_text_field": "content",
         "embedding_text_source": "legacy-reconstruction",
     }
     assert current[1].vector["sparse"] == before[1].vector["sparse"]
