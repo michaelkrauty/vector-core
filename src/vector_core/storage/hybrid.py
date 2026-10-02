@@ -10,6 +10,7 @@ from qdrant_client.models import (
     Filter,
     Fusion,
     FusionQuery,
+    PointGroup,
     Prefetch,
     ScoredPoint,
 )
@@ -110,6 +111,7 @@ class HybridSearcher:
         filter_conditions: Sequence[FieldCondition] | None = None,
         dense_weight: float | None = None,
         sparse_weight: float | None = None,
+        group_by: str | None = None,
     ) -> list[SearchResult]:
         """
         Perform hybrid search with RRF fusion.
@@ -124,6 +126,8 @@ class HybridSearcher:
             filter_conditions: Optional filter conditions
             dense_weight: Override default dense weight
             sparse_weight: Override default sparse weight
+            group_by: Optional payload field for distinct-group retrieval. Groups are
+                      fused by group ID; result IDs remain representative point IDs.
 
         Returns:
             List of SearchResult ordered by relevance
@@ -134,6 +138,20 @@ class HybridSearcher:
         sparse_weight = sparse_weight if sparse_weight is not None else self.sparse_weight
 
         query_filter = Filter(must=list(filter_conditions)) if filter_conditions else None
+
+        if group_by is not None:
+            return await self._search_grouped(
+                client,
+                collection=collection,
+                dense_query=dense_query,
+                sparse_query=sparse_query,
+                group_by=group_by,
+                limit=limit,
+                prefetch_limit=max(prefetch_limit, limit),
+                query_filter=query_filter,
+                dense_weight=dense_weight,
+                sparse_weight=sparse_weight,
+            )
 
         # Fast path: If one weight is 0, skip that search entirely
         if dense_weight <= 0 and sparse_weight > 0:
@@ -272,6 +290,86 @@ class HybridSearcher:
                 )
             )
 
+        return results
+
+    async def _search_grouped(
+        self,
+        client: Any,
+        *,
+        collection: str,
+        dense_query: list[float],
+        sparse_query: SparseVector,
+        group_by: str,
+        limit: int,
+        prefetch_limit: int,
+        query_filter: Filter | None,
+        dense_weight: float,
+        sparse_weight: float,
+    ) -> list[SearchResult]:
+        """Fuse distinct groups, retaining the strongest RRF-contributing hit.
+
+        Dense and sparse raw scores have different scales. Representative selection
+        therefore uses weighted rank contribution, with dense-first ties.
+        """
+        queries = []
+        weights = []
+        for query, using, weight in (
+            (dense_query, "dense", dense_weight),
+            (
+                QdrantSparseVector(indices=sparse_query.indices, values=sparse_query.values),
+                "sparse",
+                sparse_weight,
+            ),
+        ):
+            if weight <= 0:
+                continue
+            queries.append(
+                client.query_points_groups(
+                    collection,
+                    query=query,
+                    using=using,
+                    group_by=group_by,
+                    group_size=1,
+                    limit=prefetch_limit,
+                    query_filter=query_filter,
+                    with_payload=True,
+                )
+            )
+            weights.append(weight)
+
+        try:
+            async with asyncio.timeout(settings.search_timeout):
+                responses = await asyncio.gather(*queries)
+        except TimeoutError as e:
+            raise TimeoutError(
+                f"Grouped hybrid search timed out after {settings.search_timeout}s "
+                f"(collection={collection!r}, group_by={group_by!r}, limit={limit}, "
+                f"prefetch_limit={prefetch_limit})"
+            ) from e
+
+        ranked_groups: list[list[PointGroup]] = [response.groups for response in responses]
+        fused = reciprocal_rank_fusion(
+            ranked_groups,
+            key=lambda group: cast(int | str, group.id),
+            weights=weights,
+            k=self.rrf_k,
+            limit=limit,
+        )
+        results = []
+        for result in fused[:limit]:
+            branch = max(
+                result.ranks,
+                key=lambda index: weights[index] / (max(0, self.rrf_k) + result.ranks[index]),
+            )
+            group = ranked_groups[branch][result.ranks[branch] - 1]
+            point = group.hits[0]
+            results.append(
+                SearchResult(
+                    id=cast(int | str, point.id),
+                    score=result.score,
+                    payload=dict(point.payload) if point.payload else {},
+                )
+            )
         return results
 
     def fuse_results(

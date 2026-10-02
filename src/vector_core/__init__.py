@@ -12,14 +12,18 @@ Provides:
 - Hash registry for document tracking
 """
 
-__version__ = "1.6.1"
+__version__ = "1.7.0"
 
 # Main exports for convenience
 from vector_core.embeddings.cache import EmbeddingCache
 from vector_core.embeddings.client import (
     CircuitBreakerOpenError,
     EmbeddingClient,
+    EmbeddingInputRejectedError,
+    EmbeddingInputTooLongError,
+    EmbeddingRequestTooLargeError,
     EmbeddingServiceError,
+    EmbeddingSpan,
 )
 from vector_core.embeddings.global_vocab import GlobalVocabulary
 from vector_core.embeddings.limiter import GlobalRequestLimiter
@@ -168,6 +172,10 @@ from vector_core.mcp import (
 )
 
 __all__ = [
+    "EmbeddingInputRejectedError",
+    "EmbeddingInputTooLongError",
+    "EmbeddingRequestTooLargeError",
+    "EmbeddingSpan",
     # Version
     "__version__",
     # Embeddings

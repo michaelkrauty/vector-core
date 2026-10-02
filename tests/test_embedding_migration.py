@@ -11,6 +11,7 @@ from qdrant_client.models import PayloadIndexInfo, PointStruct, SparseVector, Te
 from vector_core.embeddings.client import EmbeddingClient, EmbeddingServiceError
 from vector_core.embeddings.identity import EmbeddingIdentity
 from vector_core.settings import settings
+from vector_core.storage.embedding_fragments import source_hash
 from vector_core.storage.embedding_migration import (
     EmbeddingMigrationError,
     _copy_indexes,
@@ -83,11 +84,20 @@ async def test_unknown_legacy_rebuild_preserves_points_sparse_and_original(stora
             **before[point_id].payload,
             "embedding_text_field": "content",
             "embedding_text_source": "legacy-reconstruction",
+            "embedding_fragment": {
+                "schema": 1,
+                "parent_id": point_id,
+                "source_hash": source_hash(before[point_id].payload["content"]),
+                "start": 0,
+                "end": len(before[point_id].payload["content"]),
+                "index": 0,
+                "count": 1,
+            },
         }
         assert len(after[point_id].vector["dense"]) == 3
     again = await ensure_embedding_collection(storage, "corpus", client, text)
     assert again == generation
-    client.embed_all.assert_awaited_once()
+    assert client.embed_all.await_count == 2
 
 
 async def test_model_namespace_and_dimension_changes_create_distinct_spaces(storage):
@@ -124,7 +134,7 @@ async def test_failure_never_publishes_partial_generation_and_retry_is_clean(sto
     before = await records(storage, "corpus")
     client = embedder()
     client.embed_all.side_effect = [
-        [[1.0, 0.0, 0.0]] * 128,
+        [[1.0, 0.0, 0.0]],
         EmbeddingServiceError("offline"),
     ]
     with pytest.raises(EmbeddingMigrationError, match="offline"):
@@ -193,7 +203,7 @@ async def test_concurrent_clients_share_one_completed_build(storage):
         ensure_embedding_collection(storage, "corpus", second, text),
     )
     assert generations[0].physical_name == generations[1].physical_name
-    assert first.embed_all.await_count + second.embed_all.await_count == 1
+    assert first.embed_all.await_count + second.embed_all.await_count == 2
 
 
 async def test_finalizer_metadata_survives_ready_transition(storage):

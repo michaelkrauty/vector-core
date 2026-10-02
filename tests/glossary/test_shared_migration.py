@@ -14,6 +14,7 @@ from vector_core.glossary.indexer import GlossaryIndexer, _generate_embedding_co
 from vector_core.glossary.store import GlossaryStore
 from vector_core.glossary.tools import GlossaryToolHelper
 from vector_core.settings import settings
+from vector_core.storage.embedding_fragments import source_hash
 from vector_core.storage.embedding_migration import (
     EmbeddingMigrationError,
     active_embedding_collection,
@@ -145,9 +146,19 @@ async def test_fact_write_preserves_legacy_and_other_shared_types(resources):
         **payload,
         "embedding_text_field": "content",
         "embedding_text_source": "legacy-reconstruction",
+        "embedding_fragment": {
+            "schema": 1,
+            "parent_id": 1,
+            "source_hash": source_hash(payload["content"]),
+            "start": 0,
+            "end": len(payload["content"]),
+            "index": 0,
+            "count": 1,
+        },
     }
     assert current[1].vector["sparse"] == before[1].vector["sparse"]
-    assert current[fact_id].payload["embedding_text"] == generate_fact_text(fact)
+    assert current[fact_id].payload["content"] == generate_fact_text(fact)
+    assert current[fact_id].payload["embedding_text_field"] == "content"
     await indexer.delete_fact_index(fact.id)
     assert fact_id not in await points(storage, target)
     assert await points(storage, "shared") == before
@@ -190,7 +201,8 @@ async def test_glossary_tool_updates_only_after_recovering_legacy_row(resources)
     assert current[point_id].payload["embedding_text"] == _generate_embedding_content(
         glossary.read(entry.id)
     )
-    client.embed_all.assert_awaited_once_with([_generate_embedding_content(entry)], role="document")
+    assert client.embed_all.await_args_list[0].args[0] == [_generate_embedding_content(entry)]
+    assert client.embed_all.await_count == 2
     assert await points(storage, "shared") == before
 
 

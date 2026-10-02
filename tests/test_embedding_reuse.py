@@ -134,9 +134,8 @@ def test_bulk_cache_ends_read_transaction_before_access_updates(tmp_path: Path) 
 
 @pytest.mark.asyncio
 async def test_embed_all_caches_effective_input_and_scatters_duplicates(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr("vector_core.embeddings.client.settings.embedding_max_text_chars", 3)
     path = tmp_path / "embeddings.db"
     first = EmbeddingClient(model="model-a", dim=2, cache_namespace="deployment-a", cache_path=path)
     first._embed_prepared_batch = AsyncMock(
@@ -145,7 +144,7 @@ async def test_embed_all_caches_effective_input_and_scatters_duplicates(
 
     result = await first.embed_all(["abcdef", "z", "abc-other", "z"])
 
-    first._embed_prepared_batch.assert_awaited_once_with(["abc", "z"])
+    first._embed_prepared_batch.assert_awaited_once_with(["abcdef", "z", "abc-other"])
     assert result == [[97.0, 1.0], [122.0, 1.0], [97.0, 1.0], [122.0, 1.0]]
     await first.close()
 
@@ -155,10 +154,10 @@ async def test_embed_all_caches_effective_input_and_scatters_duplicates(
     second._embed_prepared_batch = AsyncMock(side_effect=AssertionError("cache miss"))
     progress: list[tuple[int, int]] = []
     cached = await second.embed_all(
-        ["abc-new suffix", "z"], progress_cb=lambda done, total: progress.append((done, total))
+        ["abcdef", "z", "abc-other"], progress_cb=lambda done, total: progress.append((done, total))
     )
-    assert cached == [[97.0, 1.0], [122.0, 1.0]]
-    assert progress == [(2, 2)]
+    assert cached == [[97.0, 1.0], [122.0, 1.0], [97.0, 1.0]]
+    assert progress == [(3, 3)]
     second._embed_prepared_batch.assert_not_awaited()
     await second.close()
 

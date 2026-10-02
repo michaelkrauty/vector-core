@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.7.0] - 2026-10-02
+
+### Changed
+
+- Embedding methods now preserve complete inputs or reject them explicitly. Character, byte, and token limits are deployment settings with no model-family capacity defaults. Oversized inputs raise a typed validation error rather than silently truncating queries or documents. Local token counting has explicit special-token and backend-overhead policies.
+- Embedding identity and cache preprocessing are fenced from older truncated vectors. Raw input retention and historical collection generations remain intact.
+
+### Added
+
+- A lossless source-span splitter budgets role and optional contextual prefixes with bounded tokenizer work. Consumers can index every span independently without changing the one-vector-per-input embedding API.
+- Serialized HTTP request budgeting splits batches without shortening individual inputs. Transport limits are separate from model context and embedding identity.
+- Source-preserving fragment migration and writer helpers retain canonical IDs, full raw payloads, and original sparse vectors, while derived points independently represent later spans. Explicit lineage and coverage metadata support validated regeneration and stale-fragment retirement.
+- Optional grouped hybrid search retrieves distinct groups from each enabled branch before rank fusion, preserving entity-level coverage when one source has many matching fragments.
+- Glossary fragment results retain the canonical expansion and display definition through winner-only hydration, while matched snippets remain separate and stored children stay small.
+
+### Upgrade notes
+
+Configure the actual embedding deployment's capacity and matching tokenizer explicitly. Stop older writers before migrating to the fragment-aware representation, and upgrade every writer sharing a logical collection. Migrations retain old generations and publish only complete candidates. Query inputs exceeding configured limits now fail explicitly; applications must choose any multi-query policy themselves. Source reconstruction must exclude derived fragment records, while search should include them.
+
 ## [1.6.1] - 2026-10-01
 
 ### Fixed

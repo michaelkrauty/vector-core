@@ -13,11 +13,12 @@ writers on other machines do not participate in this local locking protocol.
 
 import asyncio
 import hashlib
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlsplit
 from uuid import uuid4
 from weakref import WeakKeyDictionary
@@ -28,9 +29,13 @@ from qdrant_client.models import (
     CreateAliasOperation,
     DeleteAlias,
     DeleteAliasOperation,
+    FieldCondition,
+    Filter,
+    MatchValue,
     PayloadSchemaType,
     PointsList,
     PointStruct,
+    Range,
     SparseVector,
     WriteOrdering,
 )
@@ -38,6 +43,15 @@ from qdrant_client.models import (
 from vector_core.embeddings.client import EmbeddingClient
 from vector_core.embeddings.identity import EmbeddingIdentity
 from vector_core.settings import settings
+from vector_core.storage.embedding_fragments import (
+    FRAGMENT_KEY,
+    ChildPayload,
+    Vectorize,
+    fragment_id,
+    fragment_marker,
+    fragment_point,
+    source_hash,
+)
 from vector_core.storage.embedding_sources import resolve_shared_embedding_text as _resolve_shared
 from vector_core.storage.embedding_sources import stored_embedding_text
 from vector_core.storage.qdrant import QdrantStorage
@@ -180,7 +194,7 @@ async def _write_manifest(
     )
 
 
-async def _copy_points(
+async def _copy_points(  # noqa: PLR0912 - source-preserving migration rejects ambiguous lineage
     storage: QdrantStorage,
     source: str,
     generation: CollectionGeneration,
@@ -188,6 +202,8 @@ async def _copy_points(
     text_resolver: TextResolver,
     *,
     allow_skip: bool,
+    child_payload: ChildPayload | None = None,
+    vectorize: Vectorize | None = None,
 ) -> int:
     client = await storage.get_client()
     offset = None
@@ -195,13 +211,18 @@ async def _copy_points(
     while True:
         records, offset = await client.scroll(
             source,
-            limit=128,
+            # A source can retain 24 MB of raw text. Do not accumulate a page
+            # of expanded sources or duplicate their raw payloads in children.
+            limit=1,
             offset=offset,
+            scroll_filter=Filter(
+                must_not=[
+                    FieldCondition(key=f"{FRAGMENT_KEY}.index", range=Range(gt=0)),
+                ]
+            ),
             with_payload=True,
             with_vectors=True,
         )
-        pending = []
-        texts = []
         for record in records:
             payload = dict(record.payload or {})
             if record.id == 0:
@@ -210,6 +231,15 @@ async def _copy_points(
                 continue
             if payload.get("type") == "__metadata__":
                 raise EmbeddingMigrationError("Unexpected metadata point outside reserved ID 0")
+            marker = fragment_marker(payload)
+            if marker is not None:
+                await _verify_fragment_group(
+                    client,
+                    source,
+                    cast(int | str, record.id),
+                    payload,
+                    marker,
+                )
             text = await _prepare_copy_payload(payload, text_resolver)
             if text is None:
                 if not allow_skip:
@@ -220,18 +250,189 @@ async def _copy_points(
             sparse = record.vector.get("sparse") if isinstance(record.vector, dict) else None
             if not isinstance(sparse, (SparseVector, dict)):
                 raise EmbeddingMigrationError(f"Point {record.id!r} has no retained sparse vector")
-            pending.append((record.id, payload, sparse))
-            texts.append(text)
-        embeddings = await embedder.embed_all(texts, role="document")
-        points = [
-            PointStruct(id=point_id, payload=payload, vector={"dense": dense, "sparse": sparse})
-            for (point_id, payload, sparse), dense in zip(pending, embeddings, strict=True)
-        ]
-        if points:
+            points = await fragment_point(
+                embedder,
+                point_id=cast(int | str, record.id),
+                payload=payload,
+                sparse=sparse,
+                text=text,
+                child_payload=child_payload,
+                vectorize=vectorize,
+            )
+            for start in range(1, len(points), 128):
+                existing = await client.retrieve(
+                    source,
+                    ids=[point.id for point in points[start : start + 128]],
+                    with_payload=[FRAGMENT_KEY],
+                    with_vectors=False,
+                )
+                for collision in existing:
+                    old_marker = fragment_marker(collision.payload or {})
+                    if old_marker is None or old_marker["index"] == 0:
+                        raise EmbeddingMigrationError(
+                            f"Derived fragment ID {collision.id!r} collides with source data"
+                        )
+                    if old_marker["parent_id"] != record.id:
+                        raise EmbeddingMigrationError("Derived fragment IDs collide across sources")
             await _upsert_copy_points(client, generation.physical_name, points)
-        copied += len(points)
+            copied += len(points)
         if offset is None:
+            await _verify_fragment_orphans(client, source)
             return copied
+
+
+async def _verify_fragment_group(
+    client: Any,
+    source: str,
+    point_id: int | str,
+    payload: dict[str, Any],
+    marker: dict[str, Any],
+) -> None:
+    """Authenticate a whole group against one loaded and hashed canonical source."""
+    raw = stored_embedding_text(payload)
+    if (
+        marker["index"] != 0
+        or marker["parent_id"] != point_id
+        or raw is None
+        or marker["source_hash"] != source_hash(raw)
+        or marker["end"] > len(raw)
+    ):
+        raise EmbeddingMigrationError("Canonical fragment source does not match lineage")
+    intervals: dict[int, tuple[int, int]] = {0: (0, marker["end"])}
+    offset = None
+    while True:
+        children, offset = await client.scroll(
+            source,
+            limit=128,
+            offset=offset,
+            with_vectors=False,
+            with_payload=[FRAGMENT_KEY, "embedding_text", "embedding_text_field", "content"],
+            scroll_filter=Filter(
+                must=[
+                    FieldCondition(
+                        key=f"{FRAGMENT_KEY}.parent_id", match=MatchValue(value=point_id)
+                    ),
+                    FieldCondition(key=f"{FRAGMENT_KEY}.index", range=Range(gt=0)),
+                ]
+            ),
+        )
+        for child in children:
+            child_payload = child.payload or {}
+            child_marker = fragment_marker(child_payload)
+            if child_marker is None or (
+                child_marker["source_hash"] != marker["source_hash"]
+                or child_marker["count"] != marker["count"]
+                or child_marker["index"] in intervals
+                or child_marker["end"] > len(raw)
+                or stored_embedding_text(child_payload)
+                != raw[child_marker["start"] : child_marker["end"]]
+                or child.id
+                != fragment_id(
+                    point_id,
+                    marker["source_hash"],
+                    child_marker["start"],
+                    child_marker["end"],
+                    child_marker["index"],
+                )
+            ):
+                raise EmbeddingMigrationError(
+                    "Derived embedding fragment has invalid parent lineage"
+                )
+            intervals[child_marker["index"]] = (child_marker["start"], child_marker["end"])
+        if offset is None:
+            break
+    if len(intervals) != marker["count"]:
+        raise EmbeddingMigrationError("Embedding fragment group is incomplete")
+    cursor = 0
+    for index in range(marker["count"]):
+        start, end = intervals[index]
+        if start != cursor:
+            raise EmbeddingMigrationError(
+                "Embedding fragment intervals overlap or leave source uncovered"
+            )
+        cursor = end
+    if cursor != len(raw):
+        raise EmbeddingMigrationError("Embedding fragment group leaves source uncovered")
+
+
+async def _verify_fragment_orphans(client: Any, source: str) -> None:
+    """Detect orphan groups with small marker-only lookups and bounded caching."""
+    parents: OrderedDict[int | str, dict[str, Any]] = OrderedDict()
+    offset = None
+    while True:
+        records, offset = await client.scroll(
+            source,
+            limit=128,
+            offset=offset,
+            with_vectors=False,
+            with_payload=[FRAGMENT_KEY],
+            scroll_filter=Filter(
+                must=[
+                    FieldCondition(key=f"{FRAGMENT_KEY}.index", range=Range(gt=0)),
+                ]
+            ),
+        )
+        for record in records:
+            marker = fragment_marker(record.payload or {})
+            if marker is None:
+                raise EmbeddingMigrationError("Malformed derived embedding fragment")
+            parent_id = marker["parent_id"]
+            parent_marker = parents.get(parent_id)
+            if parent_marker is None:
+                found = await client.retrieve(
+                    source,
+                    ids=[parent_id],
+                    with_vectors=False,
+                    with_payload=[FRAGMENT_KEY],
+                )
+                parent_marker = fragment_marker(found[0].payload or {}) if len(found) == 1 else None
+                if (
+                    parent_marker is None
+                    or parent_marker["index"] != 0
+                    or (parent_marker["parent_id"] != parent_id)
+                ):
+                    raise EmbeddingMigrationError("Orphaned derived embedding fragment")
+                parents[parent_id] = parent_marker
+                if len(parents) > 128:
+                    parents.popitem(last=False)
+            parents.move_to_end(parent_id)
+            if marker["source_hash"] != parent_marker["source_hash"] or (
+                marker["count"] != parent_marker["count"]
+            ):
+                raise EmbeddingMigrationError(
+                    "Derived embedding fragment has invalid parent lineage"
+                )
+        if offset is None:
+            return
+
+
+async def _verify_candidate_fragments(client: Any, target: str) -> None:
+    """A finalizer may replace groups, but every retained group must be complete."""
+    offset = None
+    while True:
+        records, offset = await client.scroll(
+            target,
+            limit=1,
+            offset=offset,
+            scroll_filter=Filter(
+                must_not=[
+                    FieldCondition(key=f"{FRAGMENT_KEY}.index", range=Range(gt=0)),
+                ]
+            ),
+            with_payload=True,
+            with_vectors=False,
+        )
+        for record in records:
+            payload = record.payload or {}
+            marker = fragment_marker(payload)
+            if marker is None:
+                continue
+            await _verify_fragment_group(
+                client, target, cast(int | str, record.id), payload, marker
+            )
+        if offset is None:
+            await _verify_fragment_orphans(client, target)
+            return
 
 
 async def _prepare_copy_payload(payload: dict[str, Any], text_resolver: TextResolver) -> str | None:
@@ -241,7 +442,7 @@ async def _prepare_copy_payload(payload: dict[str, Any], text_resolver: TextReso
     text = await text_resolver(payload)
     if text is None:
         return None
-    if not isinstance(text, str) or not text.strip():
+    if not isinstance(text, str) or not text:
         raise EmbeddingMigrationError("Source point has no usable embedding text")
     payload["embedding_text_source"] = (
         "legacy-note-metadata" if payload.get("type") == "note" else "legacy-reconstruction"
@@ -373,6 +574,8 @@ async def ensure_embedding_collection(
     payload_indexes: Sequence[tuple[str, PayloadSchemaType]] = (),
     lock_held: bool = False,
     finalize_candidate: CandidateFinalizer | None = None,
+    child_payload: ChildPayload | None = None,
+    vectorize: Vectorize | None = None,
 ) -> CollectionGeneration:
     """Bind to a complete compatible generation, rebuilding reversibly if needed.
 
@@ -397,6 +600,8 @@ async def ensure_embedding_collection(
                 payload_indexes=payload_indexes,
                 lock_held=True,
                 finalize_candidate=finalize_candidate,
+                child_payload=child_payload,
+                vectorize=vectorize,
             )
 
     identity = await embedder.resolve_identity()
@@ -447,18 +652,20 @@ async def ensure_embedding_collection(
                 embedder,
                 text_resolver,
                 allow_skip=finalize_candidate is not None,
+                child_payload=child_payload,
+                vectorize=vectorize,
             )
             if source
             else 0
         )
+        # Check every generated point even when a finalizer will add source-backed
+        # groups. A finalizer must never mask an incomplete transport write.
+        count = await client.count(target, exact=True)
+        if count.count != copied + 1:
+            raise EmbeddingMigrationError("Candidate point count does not match the completed copy")
         if finalize_candidate is not None:
             await finalize_candidate(target)
-        else:
-            count = await client.count(target, exact=True)
-            if count.count != copied + 1:
-                raise EmbeddingMigrationError(
-                    "Candidate point count does not match the completed copy"
-                )
+            await _verify_candidate_fragments(client, target)
         await _copy_indexes(storage, source, target, payload_indexes)
         candidate_metadata = await storage.get_metadata(target)
         await _write_manifest(storage, generation, source, candidate_metadata or {}, "ready")

@@ -23,24 +23,32 @@ class EmbeddingIdentity:
     endpoint: str
     dimension: int
     preprocessing: str = EMBEDDING_PREPROCESSING_VERSION
-    max_text_chars: int = 8000
+    max_text_chars: int | None = None
     profile: str = "raw"
     query_prefix: str = ""
     document_prefix: str = ""
     max_input_bytes: int = 0
     max_input_tokens: int | None = None
     tokenizer_fingerprint: str | None = None
+    tokenizer_add_special_tokens: bool = True
+    reserved_tokens: int = 0
     endpoint_auth_fingerprint: str | None = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self) -> None:  # noqa: PLR0912 - validate persisted identity at the boundary
         if not isinstance(self.model, str) or not isinstance(self.endpoint, str):
             raise ValueError("Embedding identity model and endpoint must be strings")
         if self.namespace is not None and not isinstance(self.namespace, str):
             raise ValueError("Embedding identity namespace must be a string or None")
         if type(self.dimension) is not int or self.dimension <= 0:
             raise ValueError("Embedding identity requires a resolved positive dimension")
-        if type(self.max_text_chars) is not int or self.max_text_chars <= 0:
+        if self.max_text_chars is not None and (
+            type(self.max_text_chars) is not int or self.max_text_chars <= 0
+        ):
             raise ValueError("Embedding identity requires a positive text limit")
+        if type(self.tokenizer_add_special_tokens) is not bool:
+            raise ValueError("Embedding tokenizer special-token policy must be a bool")
+        if type(self.reserved_tokens) is not int or self.reserved_tokens < 0:
+            raise ValueError("Embedding reserved token count must be non-negative")
         if not isinstance(self.preprocessing, str) or not self.preprocessing:
             raise ValueError("Embedding identity requires a preprocessing version")
         if self.profile not in {"raw", "qwen3", "nemotron3"}:

@@ -12,6 +12,12 @@ from vector_core.embeddings.client import EmbeddingClient
 from vector_core.embeddings.global_vocab import GlobalVocabulary
 from vector_core.glossary.models import GlossaryEntry
 from vector_core.glossary.store import GlossaryStore
+from vector_core.storage.embedding_fragments import (
+    FRAGMENT_KEY,
+    fragment_marker,
+    fragment_point,
+    upsert_fragment_group,
+)
 from vector_core.storage.embedding_migration import (
     CollectionGeneration,
     active_embedding_collection,
@@ -31,6 +37,7 @@ GLOSSARY_CODEBASE_ID = "glossary"
 # Payload indexes for glossary entries
 GLOSSARY_PAYLOAD_INDEXES = [
     ("type", PayloadSchemaType.KEYWORD),
+    ("glossary_id", PayloadSchemaType.KEYWORD),
     ("term_normalized", PayloadSchemaType.KEYWORD),
     ("domain", PayloadSchemaType.KEYWORD),
 ]
@@ -123,6 +130,7 @@ class GlossaryIndexer:
             payload_indexes=GLOSSARY_PAYLOAD_INDEXES,
             lock_held=lock_held,
             finalize_candidate=self._finalize_candidate,
+            vectorize=self.global_vocab.vectorize_document,
         )
 
     @asynccontextmanager
@@ -174,26 +182,23 @@ class GlossaryIndexer:
         self.global_vocab.register_codebase(GLOSSARY_CODEBASE_ID, tokens_per_entry)
 
         # Pass 2: Generate embeddings + sparse vectors, upsert
-        points = []
         for entry in entries:
             content = _generate_embedding_content(entry)
-            dense = await self.embedder.embed_single_cached(content, role="document")
             sparse = self.global_vocab.vectorize_document(content)
 
             point_id = generate_point_id(f"glossary:{entry.id}")
-            point = self.storage.create_point(
+            points = await fragment_point(
+                self.embedder,
                 point_id=point_id,
-                dense_vector=dense,
-                sparse_vector=sparse,
                 payload=self._create_payload(entry),
+                sparse=sparse,
+                text=content,
+                vectorize=self.global_vocab.vectorize_document,
             )
-            points.append(point)
+            await upsert_fragment_group(self.storage, collection, points)
 
-        if points:
-            await self.storage.upsert_batch(collection, points)
-
-        logger.info(f"Indexed {len(points)} glossary entries")
-        return len(points)
+        logger.info(f"Indexed {len(entries)} glossary entries")
+        return len(entries)
 
     async def index_entry(self, entry_id: UUID) -> None:
         """
@@ -221,17 +226,18 @@ class GlossaryIndexer:
 
         # Generate vectors for this entry
         content = _generate_embedding_content(entry)
-        dense = await self.embedder.embed_single_cached(content, role="document")
         sparse = self.global_vocab.vectorize_document(content)
 
         point_id = generate_point_id(f"glossary:{entry.id}")
-        await self.storage.upsert_point(
-            collection=collection,
+        points = await fragment_point(
+            self.embedder,
             point_id=point_id,
-            dense_vector=dense,
-            sparse_vector=sparse,
             payload=self._create_payload(entry),
+            sparse=sparse,
+            text=content,
+            vectorize=self.global_vocab.vectorize_document,
         )
+        await upsert_fragment_group(self.storage, collection, points)
 
     async def delete_entry_index(self, entry_id: UUID) -> None:
         """
@@ -281,15 +287,49 @@ class GlossaryIndexer:
             sparse_query=sparse_query,
             limit=limit,
             filter_conditions=filter_conditions,
+            group_by="glossary_id",
         )
 
-        return [
-            {
-                **dict(r.payload or {}),
-                "score": r.score,
-            }
-            for r in results
-        ]
+        markers = [fragment_marker(result.payload or {}) for result in results]
+        parent_ids = list(
+            dict.fromkeys(
+                marker["parent_id"] for marker in markers if marker and marker["index"] > 0
+            )
+        )
+        parents = {}
+        if parent_ids:
+            client = await self.storage.get_client()
+            # Hydrate final winners only, without fetching their complete raw
+            # embedding source or duplicating display fields onto stored children.
+            records = await client.retrieve(
+                generation.physical_name,
+                ids=parent_ids,
+                with_payload=["type", "glossary_id", "expansion", "definition", FRAGMENT_KEY],
+                with_vectors=False,
+            )
+            parents = {record.id: record.payload or {} for record in records}
+
+        output = []
+        for result, marker in zip(results, markers, strict=True):
+            payload = dict(result.payload or {})
+            if marker and marker["index"] > 0:
+                parent = parents.get(marker["parent_id"], {})
+                parent_marker = fragment_marker(parent)
+                if (
+                    parent.get("type") != "glossary"
+                    or parent.get("glossary_id") != payload.get("glossary_id")
+                    or parent_marker is None
+                    or parent_marker["index"] != 0
+                    or parent_marker["parent_id"] != marker["parent_id"]
+                    or parent_marker["source_hash"] != marker["source_hash"]
+                ):
+                    raise ValueError("Glossary fragment has no matching canonical source")
+                for field in ("expansion", "definition"):
+                    if not isinstance(parent.get(field), str):
+                        raise ValueError(f"Canonical glossary source has no {field}")
+                    payload[field] = parent[field]
+            output.append({**payload, "score": result.score})
+        return output
 
     @staticmethod
     def _create_payload(entry: GlossaryEntry) -> dict:
@@ -300,7 +340,9 @@ class GlossaryIndexer:
             "term": entry.term,
             "term_normalized": entry.term.lower(),
             "expansion": entry.expansion,
-            "definition": entry.definition[:2000],  # Truncate for storage
+            "definition": entry.definition[
+                :2000
+            ],  # Compact presentation; raw input is retained below.
             "domain": entry.domain,
             "aliases": entry.aliases,
             "embedding_text": _generate_embedding_content(entry),

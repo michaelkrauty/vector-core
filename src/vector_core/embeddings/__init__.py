@@ -3,7 +3,11 @@
 from vector_core.embeddings.cache import EmbeddingCache
 from vector_core.embeddings.client import (
     EmbeddingClient,
+    EmbeddingInputRejectedError,
+    EmbeddingInputTooLongError,
+    EmbeddingRequestTooLargeError,
     EmbeddingServiceError,
+    EmbeddingSpan,
     SyncEmbeddingClient,
 )
 from vector_core.embeddings.global_vocab import GlobalVocabulary
@@ -18,6 +22,10 @@ from vector_core.embeddings.tokenization import (
 
 __all__ = [
     "EmbeddingClient",
+    "EmbeddingInputRejectedError",
+    "EmbeddingSpan",
+    "EmbeddingInputTooLongError",
+    "EmbeddingRequestTooLargeError",
     "SyncEmbeddingClient",
     "EmbeddingServiceError",
     "EmbeddingCache",

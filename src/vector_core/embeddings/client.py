@@ -9,9 +9,10 @@ import threading
 import time
 from collections import Counter
 from collections.abc import Callable, Coroutine
+from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Literal, TypeVar
+from typing import Any, Literal, NoReturn, TypeVar
 
 import httpx
 
@@ -24,6 +25,43 @@ from vector_core.utils.retry import retry_operation
 logger = logging.getLogger(__name__)
 EmbeddingRole = Literal["query", "document"]
 T = TypeVar("T")
+
+
+@dataclass(frozen=True)
+class EmbeddingSpan:
+    """One exact half-open character range in an unmodified source string."""
+
+    start: int
+    end: int
+    text: str
+
+
+class EmbeddingInputTooLongError(ValueError):
+    """A complete formatted input exceeds an explicitly configured limit."""
+
+    def __init__(self, index: int, role: EmbeddingRole, measured: int, limit: int, unit: str):
+        self.index = index
+        self.role = role
+        self.measured = measured
+        self.limit = limit
+        self.unit = unit
+        super().__init__(
+            f"Embedding {role} input {index} needs {measured} {unit}; limit is {limit}. "
+            "Split the complete document into searchable spans or shorten the query explicitly."
+        )
+
+
+class EmbeddingRequestTooLargeError(ValueError):
+    """One complete input cannot fit the configured HTTP request body budget."""
+
+
+class EmbeddingInputRejectedError(ValueError):
+    """The backend rejected complete input; this is not a service outage."""
+
+    def __init__(self, status_code: int, reason: str):
+        self.status_code = status_code
+        self.reason = reason
+        super().__init__(f"Embedding backend rejected input ({status_code}): {reason}")
 
 
 class EmbeddingServiceError(Exception):
@@ -75,6 +113,10 @@ class EmbeddingClient:
         max_input_bytes: int | None = None,
         tokenizer_path: Path | None = None,
         max_input_tokens: int | None = None,
+        max_text_chars: int | None = None,
+        tokenizer_add_special_tokens: bool | None = None,
+        reserved_tokens: int | None = None,
+        max_request_bytes: int | None = None,
     ):
         """
         Initialize embedding client.
@@ -97,7 +139,9 @@ class EmbeddingClient:
         self.timeout = float(timeout or settings.embedding_timeout)
         self.concurrency = concurrency or settings.embedding_concurrency
         self.dim = dim if dim is not None else settings.embedding_dim
-        self._max_text_chars = settings.embedding_max_text_chars
+        self._max_text_chars = (
+            max_text_chars if max_text_chars is not None else settings.embedding_max_text_chars
+        )
         self.profile = profile if profile is not None else settings.embedding_profile
         if self.profile == "auto":
             alias = self.model.lower().replace("_", "-")
@@ -135,8 +179,19 @@ class EmbeddingClient:
             if max_input_tokens is not None
             else settings.embedding_max_input_tokens
         )
-        if self.max_input_tokens is None:
-            self.max_input_tokens = {"nemotron3": 4096, "qwen3": 32768}.get(self.profile)
+        self.tokenizer_add_special_tokens = (
+            tokenizer_add_special_tokens
+            if tokenizer_add_special_tokens is not None
+            else settings.embedding_tokenizer_add_special_tokens
+        )
+        self.reserved_tokens = (
+            reserved_tokens if reserved_tokens is not None else settings.embedding_reserved_tokens
+        )
+        self.max_request_bytes = (
+            max_request_bytes
+            if max_request_bytes is not None
+            else settings.embedding_max_request_bytes
+        )
         tokenizer_path = tokenizer_path or settings.embedding_tokenizer_path
         self._tokenizer = None
         self.tokenizer_fingerprint = None
@@ -152,33 +207,24 @@ class EmbeddingClient:
             self._tokenizer.no_truncation()
             self._tokenizer.no_padding()
             self.tokenizer_fingerprint = hashlib.sha256(tokenizer_json).hexdigest()
-            if self.max_input_tokens is None:
-                raise ValueError("A local tokenizer requires embedding_max_input_tokens")
         byte_limit = (
             max_input_bytes if max_input_bytes is not None else settings.embedding_max_input_bytes
         )
-        # Known byte-level BPE profiles need no tokenizer dependency for safe operation.
-        # Qwen reserves eight tokens for backend special tokens; Nemotron inserts none.
-        self.max_input_bytes = (
-            byte_limit
-            if byte_limit is not None
-            else (
-                {"nemotron3": 4096, "qwen3": 32760}.get(self.profile, 0)
-                if self._tokenizer is None
-                else 0
-            )
-        )
+        self.max_input_bytes = byte_limit or 0
         if self.max_input_bytes < 0 or (
             self.max_input_tokens is not None and self.max_input_tokens <= 0
         ):
             raise ValueError("Embedding input limits must be positive (bytes also permits 0)")
         if self._tokenizer is None and self.max_input_tokens is not None:
-            if self.profile == "raw":
-                raise ValueError("A token limit for a raw profile requires a local tokenizer")
-            safe_bytes = self.max_input_tokens - (8 if self.profile == "qwen3" else 0)
-            if safe_bytes <= 0:
-                raise ValueError("Embedding token limit leaves no room for input")
-            self.max_input_bytes = min(self.max_input_bytes or safe_bytes, safe_bytes)
+            raise ValueError("An embedding token limit requires a local tokenizer")
+        if self._max_text_chars is not None and self._max_text_chars <= 0:
+            raise ValueError("Embedding character limit must be positive")
+        if self.reserved_tokens < 0:
+            raise ValueError("Embedding reserved token count must be non-negative")
+        if self.max_input_tokens is not None and self.reserved_tokens >= self.max_input_tokens:
+            raise ValueError("Embedding token limit leaves no room for input")
+        if self.max_request_bytes is not None and self.max_request_bytes <= 0:
+            raise ValueError("Embedding request byte limit must be positive")
         self._identity: EmbeddingIdentity | None = None
         self._identity_lock = asyncio.Lock()
         self.cache_namespace = (
@@ -350,7 +396,64 @@ class EmbeddingClient:
             EmbeddingServiceError: If embedding fails after retries
         """
         self._check_identity()
-        return await self._embed_prepared_batch(self._prepare_texts(texts, role=role))
+        prepared = self._prepare_texts(texts, role=role)
+        results = []
+        for _, batch in self._request_batches(prepared):
+            results.extend(await self._embed_prepared_batch(batch))
+        return results
+
+    def _request_payload(self, texts: list[str]) -> dict[str, Any]:
+        return {"input": texts, "model": self.model, "encoding_format": "float"}
+
+    def _request_batches(self, texts: list[str]) -> list[tuple[int, list[str]]]:
+        """Pack complete inputs using the same JSON serializer as the HTTP transport."""
+        batches: list[tuple[int, list[str]]] = []
+        start = 0
+        batch: list[str] = []
+        for index, text in enumerate(texts):
+            candidate = [*batch, text]
+            if self.max_request_bytes is not None:
+                size = len(
+                    httpx.Request(
+                        "POST", self.base_url, json=self._request_payload(candidate)
+                    ).content
+                )
+                if size > self.max_request_bytes:
+                    if batch:
+                        batches.append((start, batch))
+                        start, batch = index, []
+                    size = len(
+                        httpx.Request(
+                            "POST", self.base_url, json=self._request_payload([text])
+                        ).content
+                    )
+                    if size > self.max_request_bytes:
+                        raise EmbeddingRequestTooLargeError(
+                            f"Embedding input {index} needs a {size}-byte HTTP body; "
+                            f"request limit is {self.max_request_bytes} bytes. "
+                            "Increase the transport budget or explicitly split the document."
+                        )
+            batch.append(text)
+            if len(batch) == self.batch_size:
+                batches.append((start, batch))
+                start, batch = index + 1, []
+        if batch:
+            batches.append((start, batch))
+        return batches
+
+    def _raise_http_error(self, error: httpx.HTTPStatusError) -> NoReturn:
+        status = error.response.status_code
+        reason = error.response.text[:200]
+        if status == 413:
+            raise EmbeddingRequestTooLargeError(
+                f"Embedding backend rejected the request body (413): {reason}. "
+                "Configure a smaller HTTP batch budget or explicitly split the document."
+            ) from error
+        if status in {400, 422}:
+            raise EmbeddingInputRejectedError(status, reason) from error
+        if status >= 500:
+            self._record_failure()
+        raise EmbeddingServiceError(f"Embedding service error: {status} - {reason}") from error
 
     async def _embed_prepared_batch(self, texts: list[str]) -> list[list[float]]:
         """Send already formatted inputs; retries and fallback must not format again."""
@@ -370,11 +473,7 @@ class EmbeddingClient:
             async with self._request_limiter.acquire():
                 resp = await client.post(
                     f"{self.base_url}/v1/embeddings",
-                    json={
-                        "input": texts,
-                        "model": self.model,
-                        "encoding_format": "float",
-                    },
+                    json=self._request_payload(texts),
                 )
             # 503 is transient - re-raise for retry
             if resp.status_code == 503:
@@ -407,13 +506,7 @@ class EmbeddingClient:
                 f"The server may be overloaded or the batch is too large."
             ) from e
         except httpx.HTTPStatusError as e:
-            # HTTP error (4xx/5xx) - may or may not be transient
-            # Only count server errors (5xx) as circuit breaker failures
-            if e.response.status_code >= 500:
-                self._record_failure()
-            raise EmbeddingServiceError(
-                f"Embedding service error: {e.response.status_code} - {e.response.text[:200]}"
-            ) from e
+            self._raise_http_error(e)
         except Exception as batch_error:
             # If batch fails, try one at a time to identify the problematic text
             if len(texts) > 1:
@@ -422,8 +515,12 @@ class EmbeddingClient:
                     try:
                         single_result = await self._embed_prepared_batch([text])
                         results.extend(single_result)
-                    except EmbeddingServiceError:
-                        raise  # Re-raise service errors, don't mask them
+                    except (
+                        EmbeddingServiceError,
+                        EmbeddingInputRejectedError,
+                        EmbeddingRequestTooLargeError,
+                    ):
+                        raise  # Preserve input rejection even in diagnostic batch fallback.
                     except Exception as e:
                         # Log and raise - don't silently use zero vectors
                         # Zero vectors corrupt search accuracy by never matching anything
@@ -502,62 +599,142 @@ class EmbeddingClient:
         return values
 
     def _prepare_texts(self, texts: list[str], *, role: EmbeddingRole) -> list[str]:
-        """Format raw inputs exactly once, preserving the prefix when bounding content."""
+        """Format and validate complete inputs. No accepted source text is discarded."""
         if role not in {"query", "document"}:
             raise ValueError(f"Unknown embedding role: {role}")
         prefix = self.query_prefix if role == "query" else self.document_prefix
-        char_budget = self._max_text_chars - len(prefix)
-        byte_budget = self.max_input_bytes - len(prefix.encode("utf-8"))
-        if char_budget <= 0 or (self.max_input_bytes and byte_budget <= 0):
-            raise ValueError("Embedding input limit leaves no room after the role prefix")
-        tokenizer = self._tokenizer
-        # Qwen servers may append EOS. Nemotron's contract adds no special tokens.
-        budget = (self.max_input_tokens or 0) - (8 if self.profile == "qwen3" else 0)
-
         prepared = []
-        for text in texts:
-            if not isinstance(text, str) or not text.strip():
-                raise ValueError("Embedding input must be a non-blank string")
-            body = text[:char_budget]
-            if self.max_input_bytes:
-                body = body.encode("utf-8")[:byte_budget].decode("utf-8", errors="ignore")
-            if tokenizer is not None:
-                body = self._truncate_by_tokens(prefix, body, budget)
-            if not body.strip():
-                raise ValueError("Embedding input limit leaves no non-blank content after prefix")
-            prepared.append(prefix + body)
+        for index, text in enumerate(texts):
+            if not isinstance(text, str) or not text:
+                raise ValueError("Embedding input must be a non-empty string")
+            formatted = prefix + text
+            self._validate_formatted(formatted, index=index, role=role)
+            prepared.append(formatted)
         return prepared
 
-    def _truncate_by_tokens(self, prefix: str, body: str, budget: int) -> str:
-        tokenizer = self._tokenizer
-        assert tokenizer is not None
-        while True:
-            # Raw postprocessors may add CLS/SEP. Known profiles separately
-            # account for their backend's special-token policy.
-            encoding = tokenizer.encode(prefix + body, add_special_tokens=self.profile == "raw")
-            if len(encoding.ids) <= budget:
-                return body
-            available = budget - sum(encoding.special_tokens_mask)
-            offsets = [
-                end
-                for (_, end), special in zip(
-                    encoding.offsets,
-                    encoding.special_tokens_mask,
-                    strict=True,
+    def _validate_formatted(self, text: str, *, index: int, role: EmbeddingRole) -> None:
+        if self._max_text_chars is not None and len(text) > self._max_text_chars:
+            raise EmbeddingInputTooLongError(
+                index, role, len(text), self._max_text_chars, "characters"
+            )
+        if self.max_input_bytes:
+            size = len(text.encode("utf-8"))
+            if size > self.max_input_bytes:
+                raise EmbeddingInputTooLongError(
+                    index, role, size, self.max_input_bytes, "UTF-8 bytes"
                 )
-                if not special
-            ]
-            # Token counts of character prefixes are not monotonic: a longer
-            # WordPiece/Unigram prefix can merge into fewer tokens. Cut at actual
-            # token boundaries instead, then re-encode to verify the boundary.
-            ends = [
-                end
-                for end in offsets[: max(available, 0)]
-                if len(prefix) < end < len(prefix) + len(body)
-            ]
-            if not ends:
-                raise ValueError("Embedding token budget leaves no content after the role prefix")
-            body = body[: max(ends) - len(prefix)]
+        if self.max_input_tokens is not None:
+            assert self._tokenizer is not None
+            size = (
+                len(
+                    self._tokenizer.encode(
+                        text,
+                        add_special_tokens=self.tokenizer_add_special_tokens,
+                    )
+                )
+                + self.reserved_tokens
+            )
+            if size > self.max_input_tokens:
+                raise EmbeddingInputTooLongError(index, role, size, self.max_input_tokens, "tokens")
+
+    @staticmethod
+    def _token_boundary(encoding: Any, prefix_length: int, body_length: int, budget: int) -> int:
+        """Locate a source boundary without allocating the complete token ID list."""
+        mask = encoding.special_tokens_mask
+        available = max(0, budget - sum(mask))
+        end = 0
+        for (_, token_end), special in zip(encoding.offsets, mask, strict=True):
+            if special:
+                continue
+            if not available:
+                break
+            available -= 1
+            if prefix_length < token_end < prefix_length + body_length:
+                end = max(end, token_end - prefix_length)
+        return end
+
+    def split_text(
+        self,
+        text: str,
+        *,
+        role: EmbeddingRole = "document",
+        context_prefix: str = "",
+    ) -> list[EmbeddingSpan]:
+        """Partition raw text into exact, independently embeddable source spans.
+
+        Embed each ``context_prefix + span.text`` with the same role. Character
+        offsets refer only to ``text``. The optional context repeats for each
+        span and is included, along with the role prefix, in every limit check.
+        Tokenization uses bounded windows; this guarantees coverage and valid
+        spans, not the globally largest possible span for every tokenizer.
+        """
+        self._check_identity()
+        if not isinstance(text, str) or not text:
+            raise ValueError("Embedding input must be a non-empty string")
+        if role not in {"query", "document"}:
+            raise ValueError(f"Unknown embedding role: {role}")
+        if not isinstance(context_prefix, str):
+            raise ValueError("Embedding context prefix must be a string")
+        prefix = (self.query_prefix if role == "query" else self.document_prefix) + context_prefix
+        char_budget = (
+            self._max_text_chars - len(prefix) if self._max_text_chars is not None else len(text)
+        )
+        byte_budget = self.max_input_bytes - len(prefix.encode("utf-8"))
+        if char_budget <= 0 or (self.max_input_bytes and byte_budget <= 0):
+            self._validate_formatted(prefix + text[:1], index=0, role=role)
+            raise ValueError("Embedding limits leave no room after the prefix")
+        # A bounded work window prevents a giant retained document from creating
+        # millions of tokenizer objects at once. It is not an acceptance limit.
+        max_window = min(
+            char_budget, (self.max_input_tokens * 8) if self.max_input_tokens else len(text)
+        )
+        window = max_window
+        prefix_tokens = 0
+        if self.max_input_tokens is not None:
+            assert self._tokenizer is not None
+            prefix_tokens = len(
+                self._tokenizer.encode(
+                    prefix,
+                    add_special_tokens=self.tokenizer_add_special_tokens,
+                )
+            )
+        spans: list[EmbeddingSpan] = []
+        start = 0
+        while start < len(text):
+            body = text[start : start + window]
+            if self.max_input_bytes:
+                body = body.encode("utf-8")[:byte_budget].decode("utf-8", errors="ignore")
+            while body and self.max_input_tokens is not None:
+                assert self._tokenizer is not None
+                encoding = self._tokenizer.encode(
+                    prefix + body,
+                    add_special_tokens=self.tokenizer_add_special_tokens,
+                )
+                budget = self.max_input_tokens - self.reserved_tokens
+                count = len(encoding)
+                if count <= budget:
+                    # Reuse this exact validation, and adapt the next work
+                    # window to observed density. Dense inputs should not pay
+                    # for eight contexts of tokenization on every emitted span.
+                    body_tokens = max(1, count - prefix_tokens)
+                    usable = max(1, budget - prefix_tokens)
+                    window = min(max_window, max(1, len(body) * usable // body_tokens))
+                    break
+                end = self._token_boundary(encoding, len(prefix), len(body), budget)
+                # Never binary-search token counts: boundary merges can make
+                # them nonmonotonic. Re-encode actual token-boundary slices.
+                body = body[:end] if end else body[: len(body) // 2]
+            if not body:
+                self._validate_formatted(
+                    prefix + text[start : start + 1], index=len(spans), role=role
+                )
+                raise ValueError("Embedding limits cannot fit a source character after the prefix")
+            # Character and byte constraints bounded the slice above; the
+            # successful encoding already checked token limits exactly.
+            end = start + len(body)
+            spans.append(EmbeddingSpan(start, end, body))
+            start = end
+        return spans
 
     def _formatting_config(self) -> dict:
         return {
@@ -567,6 +744,8 @@ class EmbeddingClient:
             "max_input_bytes": self.max_input_bytes,
             "max_input_tokens": self.max_input_tokens,
             "tokenizer_fingerprint": self.tokenizer_fingerprint,
+            "tokenizer_add_special_tokens": self.tokenizer_add_special_tokens,
+            "reserved_tokens": self.reserved_tokens,
         }
 
     def _configured_identity(self) -> EmbeddingIdentity:
@@ -599,7 +778,9 @@ class EmbeddingClient:
         """
         async with self._identity_lock:
             if self._identity is None:
-                await self.embed_single("Embedding dimension verification")
+                # A diagnostic sentence can exceed an intentionally small input
+                # limit even when ordinary short documents are perfectly valid.
+                await self.embed_single("x")
                 self._identity = self._configured_identity()
             self._check_identity()
             return self._identity
@@ -789,23 +970,19 @@ class EmbeddingClient:
         callback_total = progress_total if progress_total is not None else sum(weights)
 
         async def embed_with_progress(
-            batch_idx: int,
+            batch_start: int,
             batch: list[str],
             semaphore: asyncio.Semaphore,
         ) -> tuple[int, list[list[float]]]:
             nonlocal completed
-            result = await self._embed_batch_with_semaphore(batch_idx, batch, semaphore)
-            batch_start = batch_idx * self.batch_size
+            result = await self._embed_batch_with_semaphore(batch_start, batch, semaphore)
             completed += sum(weights[batch_start : batch_start + len(batch)])
             if progress_cb:
                 progress_cb(completed, callback_total)
             return result
 
         # Create batches with their indices
-        batches: list[tuple[int, list[str]]] = []
-        for i in range(0, total, self.batch_size):
-            batch = texts[i : i + self.batch_size]
-            batches.append((i // self.batch_size, batch))
+        batches = self._request_batches(texts)
 
         # Create semaphore for this call (not cached to avoid event loop binding issues)
         semaphore = asyncio.Semaphore(self.concurrency)
@@ -974,6 +1151,10 @@ class SyncEmbeddingClient:
         max_input_bytes: int | None = None,
         tokenizer_path: Path | None = None,
         max_input_tokens: int | None = None,
+        max_text_chars: int | None = None,
+        tokenizer_add_special_tokens: bool | None = None,
+        reserved_tokens: int | None = None,
+        max_request_bytes: int | None = None,
     ) -> None:
         self._client = EmbeddingClient(
             base_url=base_url,
@@ -993,6 +1174,10 @@ class SyncEmbeddingClient:
             max_input_bytes=max_input_bytes,
             tokenizer_path=tokenizer_path,
             max_input_tokens=max_input_tokens,
+            max_text_chars=max_text_chars,
+            tokenizer_add_special_tokens=tokenizer_add_special_tokens,
+            reserved_tokens=reserved_tokens,
+            max_request_bytes=max_request_bytes,
         )
         self._bridge = _SyncAsyncBridge()
 
@@ -1013,6 +1198,15 @@ class SyncEmbeddingClient:
 
     def resolve_identity(self) -> EmbeddingIdentity:
         return self._bridge.run(self._client.resolve_identity())
+
+    def split_text(
+        self,
+        text: str,
+        *,
+        role: EmbeddingRole = "document",
+        context_prefix: str = "",
+    ) -> list[EmbeddingSpan]:
+        return self._client.split_text(text, role=role, context_prefix=context_prefix)
 
     def embed_batch(
         self, texts: list[str], *, role: EmbeddingRole = "document"

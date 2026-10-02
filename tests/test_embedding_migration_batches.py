@@ -14,6 +14,7 @@ from qdrant_client.models import PointsList, PointStruct, SparseVector, WriteOrd
 from vector_core.embeddings.client import EmbeddingClient
 from vector_core.settings import settings
 from vector_core.storage import embedding_migration as migration
+from vector_core.storage.embedding_fragments import source_hash
 from vector_core.storage.embedding_sources import resolve_shared_embedding_text
 from vector_core.storage.qdrant import QdrantStorage
 
@@ -73,15 +74,24 @@ async def test_two_generations_restore_content_reference_without_domain_resolver
     first = await migration.ensure_embedding_collection(storage, "corpus", first_embedder, resolver)
     first_records = await records(storage, first.physical_name)
     assert resolver.await_count == len(original)
-    first_embedder.embed_all.assert_awaited_once_with(
-        [before[key].payload["content"] for key in before], role="document"
-    )
+    assert [call.args[0][0] for call in first_embedder.embed_all.await_args_list] == [
+        before[key].payload["content"] for key in before
+    ]
     for point_id, source in before.items():
         copied = first_records[point_id]
         assert copied.payload == {
             **source.payload,
             "embedding_text_field": "content",
             "embedding_text_source": "legacy-reconstruction",
+            "embedding_fragment": {
+                "schema": 1,
+                "parent_id": point_id,
+                "source_hash": source_hash(source.payload["content"]),
+                "start": 0,
+                "end": len(source.payload["content"]),
+                "index": 0,
+                "count": 1,
+            },
         }
         assert "embedding_text" not in copied.payload
         assert copied.vector["sparse"] == source.vector["sparse"]
@@ -97,9 +107,9 @@ async def test_two_generations_restore_content_reference_without_domain_resolver
     for point_id in before:
         assert after[point_id].payload == first_records[point_id].payload
         assert after[point_id].vector["sparse"] == before[point_id].vector["sparse"]
-    second_embedder.embed_all.assert_awaited_once_with(
-        [before[key].payload["content"] for key in before], role="document"
-    )
+    assert [call.args[0][0] for call in second_embedder.embed_all.await_args_list] == [
+        before[key].payload["content"] for key in before
+    ]
     assert await records(storage, "corpus") == before
     assert await records(storage, first.physical_name) == first_records
     assert await migration.active_embedding_collection(storage, "corpus") == second.physical_name
@@ -167,7 +177,9 @@ async def test_existing_reference_is_preserved_when_another_field_has_identical_
     client = embedder("preserved-reference")
     result = await migration.ensure_embedding_collection(storage, "corpus", client, resolver)
     copied = (await records(storage, result.physical_name))[7]
-    assert copied.payload == payload
+    assert {
+        key: value for key, value in copied.payload.items() if key != "embedding_fragment"
+    } == payload
     assert copied.vector["sparse"] == before[7].vector["sparse"]
     assert await records(storage, "corpus") == before
     client.embed_all.assert_awaited_once_with([payload["other"]], role="document")
@@ -201,13 +213,13 @@ async def test_shared_resolver_uses_reference_before_glossary_source_lookup():
     store.read.assert_not_called()
 
 
-@pytest.mark.parametrize("field", [None, 17, "absent", "blank"])
+@pytest.mark.parametrize("field", [None, 17, "absent", "empty"])
 async def test_shared_resolver_rejects_invalid_reference_before_legacy_note_fallback(field):
     payload = {
         "type": "note",
         "title": "otherwise valid legacy note",
         "embedding_text_field": field,
-        "blank": " \n\t",
+        "empty": "",
     }
     with pytest.raises(ValueError, match="reference"):
         await resolve_shared_embedding_text(payload)
@@ -223,7 +235,7 @@ async def test_shared_resolver_rejects_invalid_reference_before_legacy_note_fall
         {"embedding_text_field": "content"},
         {"embedding_text_field": "content", "content": 17},
         {"embedding_text_field": "content", "content": None},
-        {"embedding_text_field": "content", "content": " \n\t"},
+        {"embedding_text_field": "content", "content": ""},
     ],
 )
 async def test_invalid_explicit_reference_fails_closed_without_pointer_promotion(storage, payload):

@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from vector_core.embeddings.client import EmbeddingClient
 from vector_core.embeddings.global_vocab import GlobalVocabulary
 from vector_core.facts import indexer as indexer_module
 from vector_core.facts.database import FactStore
@@ -49,13 +50,23 @@ def mock_storage():
     storage.delete_by_filter = AsyncMock()
     storage.scroll_points = AsyncMock(return_value=[])
     storage.close = AsyncMock()
+    storage.get_client = AsyncMock(
+        return_value=SimpleNamespace(
+            retrieve=AsyncMock(return_value=[]),
+            upsert=storage.upsert_batch,
+            scroll=AsyncMock(return_value=([], None)),
+        )
+    )
     return storage
 
 
 @pytest.fixture
 def mock_embedder():
-    embedder = MagicMock()
+    embedder = EmbeddingClient(dim=4096)
     embedder.embed_single_cached = AsyncMock(return_value=[0.1] * 4096)
+    embedder.embed_all = AsyncMock(
+        side_effect=lambda texts, **kwargs: [[0.1] * 4096 for _ in texts]
+    )
     return embedder
 
 
@@ -276,21 +287,19 @@ class TestGenerationTargets:
     ):
         fact = store.create("subject", "relates_to", "object", context="x" * 5000)
 
-        async def embed(text, *, role):
+        async def embed(texts, *, role):
             assert migration.locked
             assert role == "document"
-            return [0.1] * 4096
+            return [[0.1] * 4096 for _ in texts]
 
-        mock_embedder.embed_single_cached.side_effect = embed
+        mock_embedder.embed_all.side_effect = embed
         await indexer.index_all(force=True)
         assert mock_storage.delete_by_filter.call_args.args[0] == "test_generation"
         assert mock_storage.upsert_batch.call_args.args[0] == "test_generation"
         point = mock_storage.upsert_batch.call_args.args[1][0]
-        assert (
-            point.payload["embedding_text"] == mock_embedder.embed_single_cached.call_args.args[0]
-        )
-        assert point.payload["embedding_text"] == point.payload["content"]
-        assert fact.context in point.payload["embedding_text"]
+        assert point.payload["content"] == mock_embedder.embed_all.call_args.args[0][0]
+        assert point.payload["embedding_text_field"] == "content"
+        assert fact.context in point.payload["content"]
         assert indexer.collection_name == "test_facts"
         assert not migration.locked
 
