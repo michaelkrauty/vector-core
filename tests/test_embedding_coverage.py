@@ -250,11 +250,52 @@ async def test_splitter_partitions_source_with_context_and_all_budgets(
             assert len(tokenizer.encode(value).ids) <= kwargs["max_input_tokens"]
 
 
-def test_unbounded_split_is_one_exact_span():
+@pytest.mark.parametrize("byte_limit", [None, 0])
+def test_unbounded_split_is_one_exact_span(byte_limit):
     text = " \nword " * 10000 + "tail\t"
-    spans = EmbeddingClient(model="generic").split_text(text, context_prefix="context: ")
+    spans = EmbeddingClient(model="generic", max_input_bytes=byte_limit).split_text(
+        text, context_prefix="context: "
+    )
     assert_partition(text, spans)
     assert spans == [EmbeddingSpan(start=0, end=len(text), text=text)]
+
+
+@pytest.mark.parametrize("role,prefix", [("query", "qué: "), ("document", "界: ")])
+def test_byte_only_split_has_bounded_windows_and_linear_work(role, prefix):
+    byte_limit = 256
+    context = "🙂ctx: "
+    byte_budget = byte_limit - len((prefix + context).encode("utf-8"))
+    client = EmbeddingClient(
+        model="generic",
+        query_prefix="qué: ",
+        document_prefix="界: ",
+        max_input_bytes=byte_limit,
+    )
+    assert client._max_text_chars is None
+    assert client.max_input_tokens is None
+    work = []
+    sliced_sizes = []
+
+    class CountingSource(str):
+        def __getitem__(self, key):
+            result = super().__getitem__(key)
+            sliced_sizes.append(len(result))
+            return result
+
+    for repeats in (4096, 8192):
+        sliced_sizes.clear()
+        text = "aé界🙂 \t\n" * repeats + " unique-tail\t\n"
+        spans = client.split_text(CountingSource(text), role=role, context_prefix=context)
+        # Count actual source slices before UTF-8 encoding, not wall-clock time.
+        assert max(sliced_sizes) <= byte_budget
+        work.append(sum(sliced_sizes))
+        assert work[-1] <= 4 * len(text)
+        assert_partition(text, spans)
+        assert len(spans) > 100
+        assert all(
+            len((prefix + context + span.text).encode("utf-8")) <= byte_limit for span in spans
+        )
+    assert work[1] <= 2 * work[0] + 2 * byte_budget
 
 
 async def test_identity_probe_respects_a_small_valid_explicit_limit():

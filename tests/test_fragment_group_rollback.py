@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import threading
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -15,6 +16,7 @@ from vector_core.embeddings.client import EmbeddingClient
 from vector_core.facts.indexer import FactIndexer
 from vector_core.settings import settings
 from vector_core.storage import embedding_migration as migration
+from vector_core.storage import fragment_recovery as recovery
 from vector_core.storage.embedding_fragments import (
     FRAGMENT_KEY,
     fragment_point,
@@ -254,6 +256,85 @@ async def test_cancellation_settles_inflight_write_and_rollback_inside_caller_lo
         await asyncio.gather(
             task, *([competing_task] if competing_task else []), return_exceptions=True
         )
+
+
+@pytest.mark.parametrize("phase", ["create", "remove"])
+async def test_journal_io_keeps_loop_responsive_and_settles_cancelled_workers(
+    storage, monkeypatch, phase
+):
+    _, new, before, _ = await replacement(storage, monkeypatch)
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    lock = asyncio.Lock()
+    # Block actual serialization or journal removal, rather than substituting
+    # an async mock that could conceal filesystem work on the event loop.
+    owner, name = (recovery.json, "dump") if phase == "create" else (recovery, "_remove_journal")
+    real_io = getattr(owner, name)
+
+    def blocked_io(*args, **kwargs):
+        assert threading.current_thread() is not threading.main_thread()
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(timeout=5), "event loop could not release the journal worker"
+        try:
+            return real_io(*args, **kwargs)
+        finally:
+            finished.set()
+
+    async def writer():
+        async with lock:
+            await upsert_fragment_group(storage, "corpus", new)
+
+    monkeypatch.setattr(owner, name, blocked_io)
+    task = asyncio.create_task(writer())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        # An unrelated reader stays responsive while journal I/O is blocked.
+        during_io = await asyncio.wait_for(snapshot(storage), timeout=1)
+        if phase == "create":
+            assert during_io == before
+        else:
+            assert during_io != before
+        for _ in range(2):
+            task.cancel()
+            barrier = asyncio.Event()
+            loop.call_soon(barrier.set)
+            await barrier.wait()
+            assert not task.done()
+            assert lock.locked()
+            assert not finished.is_set()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
+        assert finished.is_set()
+        assert not lock.locked()
+        assert journals() == []
+        if phase == "create":
+            assert await snapshot(storage) == before
+        else:
+            # Cleanup starts only after the replacement has committed.
+            await assert_new_coverage(storage, new, before)
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_journal_serialization_failure_prevents_mutation_and_removes_partial_file(
+    storage, monkeypatch
+):
+    _, new, before, _ = await replacement(storage, monkeypatch)
+    client = await storage.get_client()
+    upsert = AsyncMock(wraps=client.upsert)
+    monkeypatch.setattr(client, "upsert", upsert)
+    failure = OSError("journal disk failure")
+    monkeypatch.setattr(recovery.json, "dump", Mock(side_effect=failure))
+    with pytest.raises(OSError) as caught:
+        await upsert_fragment_group(storage, "corpus", new)
+    assert caught.value is failure
+    upsert.assert_not_awaited()
+    assert await snapshot(storage) == before
+    assert journals() == []
 
 
 async def test_double_failure_retains_private_complete_journal_without_replaying_later_edits(

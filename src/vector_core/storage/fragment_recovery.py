@@ -95,8 +95,8 @@ def _remove_journal(path: Path) -> None:
         )
 
 
-async def _settle(task: asyncio.Task[None]) -> bool:
-    """Finish in-flight mutations before rollback or releasing the caller's lock."""
+async def _settle(task: asyncio.Task[Any]) -> bool:
+    """Finish in-flight workers or mutations before releasing the caller's lock."""
     cancelled = False
     while True:
         try:
@@ -150,13 +150,25 @@ async def replace_fragment_group(
     current_ids = {point.id for point in points}
     introduced = [point.id for point in points if point.id not in previous_ids]
     stale = [point.id for point in previous if point.id not in current_ids]
-    journal = _save_journal(
-        _storage_scope(storage.url),
-        collection,
-        points[0].id,
-        previous,
-        introduced,
+    journal_task = asyncio.create_task(
+        asyncio.to_thread(
+            _save_journal,
+            _storage_scope(storage.url),
+            collection,
+            points[0].id,
+            previous,
+            introduced,
+        )
     )
+    cancelled = await _settle(journal_task)
+    journal = journal_task.result()
+
+    async def remove_journal() -> bool:
+        return await _settle(asyncio.create_task(asyncio.to_thread(_remove_journal, journal)))
+
+    if cancelled:
+        await remove_journal()
+        raise asyncio.CancelledError
 
     async def replace() -> None:
         await _upsert_copy_points(client, collection, points)
@@ -174,6 +186,9 @@ async def replace_fragment_group(
             await _settle(asyncio.create_task(rollback()))
         except BaseException as failure:
             raise FragmentGroupRecoveryError(journal, original, failure) from failure
-        _remove_journal(journal)
+        await remove_journal()
         raise
-    _remove_journal(journal)
+    # Replacement has committed. Finish cleanup even if cancellation arrives;
+    # never leave a filesystem worker running after releasing the writer lock.
+    if await remove_journal():
+        raise asyncio.CancelledError

@@ -400,6 +400,18 @@ async def test_fact_and_glossary_writers_keep_entity_counts_and_cover_tail(
         points = await all_points(storage, target)
         fact_id = generate_point_id(f"fact:{fact.id}")
         assert stored_embedding_text(points[fact_id].payload) == generate_fact_text(fact)
+        assert (points[fact_id].payload["object"], points[fact_id].payload["context"]) == (
+            fact.object_value,
+            fact.context,
+        )
+        fact_children = [
+            point.payload
+            for point in points.values()
+            if point.payload.get("fact_id") == str(fact.id) and is_derived_fragment(point.payload)
+        ]
+        assert fact_children and all(
+            "object" not in payload and "context" not in payload for payload in fact_children
+        )
         assert vocab.get_codebase_doc_count(FACTS_CODEBASE_ID) == 1
         assert vocab.get_codebase_doc_count(GLOSSARY_CODEBASE_ID) == 1
         for field, value in (("fact_id", str(fact.id)), ("glossary_id", str(entry.id))):

@@ -15,6 +15,8 @@
 - Optional grouped hybrid search retrieves distinct groups from each enabled branch before rank fusion, preserving entity-level coverage when one source has many matching fragments.
 - Glossary fragment results retain the canonical expansion and display definition through winner-only hydration, while matched snippets remain separate and stored children stay small.
 - Fragment group replacement durably journals the prior group and compensates partial writes, stale-child cleanup failures, and cancellation. Failed rollback retains exact recovery inputs and raises an explicit recovery-required error. This does not imply cross-request atomicity for concurrent readers or process crashes.
+- Recovery journal serialization and filesystem synchronization run off the event loop, with cancellation settling workers and cleaning unused journals before releasing writer locks.
+- Byte-only embedding limits bound source slicing before UTF-8 encoding, keeping splitter work linear for large retained inputs.
 
 ### Upgrade notes
 

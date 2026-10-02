@@ -688,6 +688,10 @@ class EmbeddingClient:
         max_window = min(
             char_budget, (self.max_input_tokens * 8) if self.max_input_tokens else len(text)
         )
+        if self.max_input_bytes:
+            # Every UTF-8 character needs at least one byte. Bound the source
+            # slice before encoding so byte-only limits also do linear work.
+            max_window = min(max_window, byte_budget)
         window = max_window
         prefix_tokens = 0
         if self.max_input_tokens is not None:
