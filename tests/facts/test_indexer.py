@@ -19,6 +19,7 @@ from vector_core.embeddings.global_vocab import GlobalVocabulary
 from vector_core.facts import indexer as indexer_module
 from vector_core.facts.database import FactStore
 from vector_core.facts.indexer import FACTS_CODEBASE_ID, FactIndexer
+from vector_core.settings import settings
 
 
 @pytest.fixture
@@ -41,8 +42,10 @@ def vocab(temp_dir):
 
 
 @pytest.fixture
-def mock_storage():
+def mock_storage(temp_dir, monkeypatch):
+    monkeypatch.setattr(settings, "cache_dir", temp_dir)
     storage = MagicMock()
+    storage.url = "http://facts-tests.invalid"
     storage.collection_exists = AsyncMock(return_value=True)
     storage.create_collection = AsyncMock()
     storage.ensure_payload_indexes = AsyncMock()
@@ -55,6 +58,7 @@ def mock_storage():
             retrieve=AsyncMock(return_value=[]),
             upsert=storage.upsert_batch,
             scroll=AsyncMock(return_value=([], None)),
+            delete=AsyncMock(),
         )
     )
     return storage

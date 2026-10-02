@@ -287,7 +287,13 @@ async def test_normal_update_uses_byte_bounded_strong_writes_then_retires_only_i
     after = await all_points(storage, "corpus")
     assert set(after) == {7, *(point.id for point in other)}
     assert after[7].payload["content"] == "alpha"
-    assert deletion.await_count == (len(old) - 1 + 127) // 128
+    deleted = []
+    for call in deletion.await_args_list:
+        selector = call.kwargs["points_selector"]
+        deleted.extend(selector.points)
+        assert call.kwargs["wait"] is True and call.kwargs["ordering"] == WriteOrdering.STRONG
+        assert len(jsonable_encoder(selector).encode()) <= budget
+    assert set(deleted) == {point.id for point in old[1:]}
     for call in upsert.await_args_list:
         assert call.kwargs["wait"] is True and call.kwargs["ordering"] == WriteOrdering.STRONG
         assert len(jsonable_encoder(PointsList(points=call.args[1])).encode()) <= budget

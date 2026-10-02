@@ -16,17 +16,16 @@ from qdrant_client.models import (
     FieldCondition,
     Filter,
     MatchValue,
-    PointIdsList,
     PointStruct,
     Range,
     SparseVector,
-    WriteOrdering,
 )
 
 from vector_core.embeddings.global_vocab import GlobalVocabulary
 from vector_core.embeddings.tokenization import default_tokenize
 from vector_core.settings import settings
 from vector_core.storage.embedding_sources import stored_embedding_text
+from vector_core.storage.fragment_recovery import replace_fragment_group
 
 if TYPE_CHECKING:
     from vector_core.embeddings.client import EmbeddingClient, EmbeddingSpan
@@ -263,8 +262,11 @@ async def fragment_point(  # noqa: PLR0912 - exact source preservation and adapt
 async def upsert_fragment_group(  # noqa: PLR0912, PLR0915 - validate before any destructive write
     storage: QdrantStorage, collection: str, points: list[PointStruct]
 ) -> None:
-    """Write a complete group before retiring stale children, under the caller's lock."""
-    from vector_core.storage.embedding_migration import _upsert_copy_points  # noqa: PLC0415
+    """Replace a group under the caller's lock, compensating failed writes or cleanup.
+
+    Concurrent readers may observe intermediate requests. A failed rollback
+    raises a recovery error retaining the prior group in a durable local journal.
+    """
 
     if not points:
         raise ValueError("Cannot upsert an empty fragment group")
@@ -330,6 +332,7 @@ async def upsert_fragment_group(  # noqa: PLR0912, PLR0915 - validate before any
     if cursor != len(raw):
         raise ValueError("Incomplete fragment group source coverage")
     client = await storage.get_client()
+    previous: dict[Any, PointStruct] = {}
     # UUID namespaces make collisions unlikely, not impossible; reject canonical
     # source IDs before a write can overwrite unrelated user data.
     for start in range(0, len(points), 128):
@@ -337,6 +340,7 @@ async def upsert_fragment_group(  # noqa: PLR0912, PLR0915 - validate before any
             collection,
             ids=[point.id for point in points[start : start + 128]],
             with_payload=True,
+            with_vectors=True,
         )
         for record in existing:
             existing_marker = fragment_marker(record.payload or {})
@@ -351,7 +355,13 @@ async def upsert_fragment_group(  # noqa: PLR0912, PLR0915 - validate before any
                 or (existing_marker["parent_id"] != parent_id)
             ):
                 raise ValueError("Derived fragment ID collides with an existing source")
-    await _upsert_copy_points(client, collection, points)
+            previous[record.id] = PointStruct.model_validate(
+                {
+                    "id": record.id,
+                    "payload": record.payload or {},
+                    "vector": record.vector,
+                }
+            )
     stale_filter = Filter(
         must=[
             FieldCondition(key=f"{FRAGMENT_KEY}.schema", match=MatchValue(value=1)),
@@ -366,16 +376,17 @@ async def upsert_fragment_group(  # noqa: PLR0912, PLR0915 - validate before any
             scroll_filter=stale_filter,
             offset=offset,
             limit=128,
-            with_payload=False,
-            with_vectors=False,
+            with_payload=True,
+            with_vectors=True,
         )
-        stale = [record.id for record in records if record.id not in keep_ids]
-        if stale:
-            await client.delete(
-                collection,
-                points_selector=PointIdsList(points=stale),
-                wait=True,
-                ordering=WriteOrdering.STRONG,
+        for record in records:
+            previous[record.id] = PointStruct.model_validate(
+                {
+                    "id": record.id,
+                    "payload": record.payload or {},
+                    "vector": record.vector,
+                }
             )
         if offset is None:
             break
+    await replace_fragment_group(storage, collection, points, list(previous.values()))

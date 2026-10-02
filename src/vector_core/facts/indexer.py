@@ -30,6 +30,7 @@ from vector_core.storage.embedding_migration import (
     ensure_embedding_collection,
 )
 from vector_core.storage.embedding_sources import resolve_shared_embedding_text
+from vector_core.storage.fragment_recovery import FragmentGroupRecoveryError
 from vector_core.storage.qdrant import (
     QdrantConnectionError,
     QdrantStorage,
@@ -336,6 +337,10 @@ class FactIndexer:
             except QdrantConnectionError as e:
                 # Storage unavailable - abort indexing to avoid partial state
                 logger.error(f"Storage unavailable, aborting indexing: {e}")
+                raise
+            except FragmentGroupRecoveryError:
+                # The prior group is journaled, but storage requires explicit
+                # recovery. Do not bury this among per-fact indexing failures.
                 raise
             except Exception as e:
                 # Unexpected error - log with full traceback and continue

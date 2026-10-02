@@ -21,6 +21,7 @@ from vector_core.glossary.indexer import (
 )
 from vector_core.glossary.models import GlossaryEntry
 from vector_core.glossary.store import GlossaryStore
+from vector_core.settings import settings
 
 
 @pytest.fixture
@@ -39,9 +40,11 @@ def store(temp_db):
 
 
 @pytest.fixture
-def mock_storage():
+def mock_storage(temp_db, monkeypatch):
     """Create mock QdrantStorage."""
+    monkeypatch.setattr(settings, "cache_dir", temp_db)
     storage = MagicMock()
+    storage.url = "http://glossary-tests.invalid"
     storage.ensure_collection_with_indexes = AsyncMock(return_value=True)
     storage.upsert_batch = AsyncMock()
     storage.upsert_point = AsyncMock()
@@ -54,6 +57,7 @@ def mock_storage():
             retrieve=AsyncMock(return_value=[]),
             upsert=storage.upsert_batch,
             scroll=AsyncMock(return_value=([], None)),
+            delete=AsyncMock(),
         )
     )
     return storage
