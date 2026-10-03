@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.8.0] - 2026-10-02
+
+### Added
+
+- Opt-in token-ID embedding transport encodes complete role-formatted inputs with the configured local tokenizer and sends OpenAI-compatible arrays of ID arrays. It preserves source strings, lossless split offsets, input validation, response ordering, and retry behavior without adding or removing special tokens beyond the configured tokenizer policy. The server must accept token IDs with the exact same vocabulary mapping.
+- Token-ID identities and cache keys include the transport mode and tokenizer implementation, version, and content hash. Text remains the default and retains its existing identity serialization and fingerprints. Serialized request budgets measure actual ID payloads independently of semantic identity.
+
 ## [1.7.0] - 2026-10-02
 
 ### Changed

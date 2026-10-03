@@ -41,6 +41,7 @@ class VectorCoreSettings(BaseSettings):
     # Optional deployment limits reject oversized inputs; they never truncate.
     embedding_max_input_bytes: int | None = None
     embedding_tokenizer_path: Path | None = None
+    embedding_input_encoding: Literal["text", "token_ids"] = "text"
     embedding_max_input_tokens: int | None = None
     embedding_tokenizer_add_special_tokens: bool = True
     embedding_reserved_tokens: int = 0
@@ -236,6 +237,7 @@ class VectorCoreSettingsMixin:
             "embedding_document_prefix",
             "embedding_max_input_bytes",
             "embedding_tokenizer_path",
+            "embedding_input_encoding",
             "embedding_max_input_tokens",
             "embedding_tokenizer_add_special_tokens",
             "embedding_reserved_tokens",

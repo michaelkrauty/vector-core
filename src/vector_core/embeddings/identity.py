@@ -33,6 +33,9 @@ class EmbeddingIdentity:
     tokenizer_add_special_tokens: bool = True
     reserved_tokens: int = 0
     endpoint_auth_fingerprint: str | None = None
+    input_encoding: str = "text"
+    tokenizer_implementation: str | None = None
+    tokenizer_version: str | None = None
 
     def __post_init__(self) -> None:  # noqa: PLR0912 - validate persisted identity at the boundary
         if not isinstance(self.model, str) or not isinstance(self.endpoint, str):
@@ -66,6 +69,26 @@ class EmbeddingIdentity:
             or re.fullmatch(r"[0-9a-f]{64}", self.endpoint_auth_fingerprint) is None
         ):
             raise ValueError("Embedding endpoint auth fingerprint must be a SHA-256 digest")
+        if not isinstance(self.input_encoding, str) or self.input_encoding not in {
+            "text",
+            "token_ids",
+        }:
+            raise ValueError("Unknown embedding input encoding")
+        if self.input_encoding == "token_ids":
+            if (
+                not isinstance(self.tokenizer_fingerprint, str)
+                or re.fullmatch(r"[0-9a-f]{64}", self.tokenizer_fingerprint) is None
+            ):
+                raise ValueError("Token-ID embedding identity requires a tokenizer SHA-256 digest")
+            if not all(
+                isinstance(value, str) and value.strip()
+                for value in (self.tokenizer_implementation, self.tokenizer_version)
+            ):
+                raise ValueError(
+                    "Token-ID embedding identity requires tokenizer implementation/version"
+                )
+        elif self.tokenizer_implementation is not None or self.tokenizer_version is not None:
+            raise ValueError("Tokenizer implementation/version identity is only used for token IDs")
         endpoint = self.endpoint.rstrip("/")
         parsed = urlsplit(endpoint)
         if "@" in parsed.netloc:
@@ -83,6 +106,10 @@ class EmbeddingIdentity:
         # Keep unauthenticated identities compatible with existing manifests and cache keys.
         if self.endpoint_auth_fingerprint is None:
             value.pop("endpoint_auth_fingerprint")
+        # Existing text-mode generations and cache entries keep their exact identity.
+        if self.input_encoding == "text":
+            for field in ("input_encoding", "tokenizer_implementation", "tokenizer_version"):
+                value.pop(field)
         return value
 
     @classmethod
