@@ -86,6 +86,7 @@ All settings are configured via environment variables prefixed with `VECTOR_`. M
 | `VECTOR_EMBEDDING_QUERY_PREFIX` | Profile default | Exact optional query-prefix override, including whitespace |
 | `VECTOR_EMBEDDING_DOCUMENT_PREFIX` | Profile default | Exact optional document-prefix override, including whitespace |
 | `VECTOR_EMBEDDING_TOKENIZER_PATH` | `None` | Local tokenizer JSON; requires the `tokenizer` extra and never downloads a model |
+| `VECTOR_EMBEDDING_INPUT_ENCODING` | `text` | `text` or `token_ids`; token IDs require a local tokenizer and a server with the identical ID vocabulary |
 | `VECTOR_EMBEDDING_MAX_INPUT_TOKENS` | `None` | Optional complete formatted input token limit; requires a matching local tokenizer |
 | `VECTOR_EMBEDDING_MAX_INPUT_BYTES` | `None` | Optional complete formatted input UTF-8 byte limit; `0` also disables it |
 | `VECTOR_EMBEDDING_TOKENIZER_ADD_SPECIAL_TOKENS` | `True` | Apply the tokenizer's special-token postprocessor; match the backend's tokenization policy |
@@ -180,6 +181,8 @@ Embedding methods preserve every input character and return exactly one vector p
 
 Install `vector-core[tokenizer]` to load a local tokenizer JSON without model downloads. Token limits require that tokenizer, and its special-token policy must match the backend. The tokenizer's own truncation and padding are disabled. `VECTOR_EMBEDDING_RESERVED_TOKENS` accounts for additional backend overhead; no model-family overhead is guessed. Without configured limits, complete inputs are forwarded and backend errors propagate. A client cannot independently verify an unconfigured backend's truncation behavior. Tokenizer content hash, special-token policy, formatting, preprocessing version, and input limits participate in identity; changes invalidate reuse and trigger consumer migration.
 
+Set `input_encoding="token_ids"` on either client, or `VECTOR_EMBEDDING_INPUT_ENCODING=token_ids`, to send a list of token-ID lists instead of strings. This requires a configured local tokenizer and a backend that accepts ID inputs with exactly the same vocabulary-to-ID mapping. Nonzero BPE dropout is rejected to keep tokenization deterministic, and inputs encoding to an empty ID sequence fail before HTTP. The complete role-formatted string is encoded with `tokenizer_add_special_tokens`; transport never adds or removes EOS or other tokens and never falls back to text. The validated IDs are reused for request budgeting, transmission, and retries. Local tokenizer normalization and literal special-token parsing may differ from the server's text tokenizer, so this mode can produce different vectors from text mode even for the same source. Source strings and split offsets remain unmodified. Token-ID mode, tokenizer implementation, package version, and JSON hash bind caches and index generations; text-mode identities remain compatible. Change the deployment namespace if server-side processing changes.
+
 Use `split_text()` explicitly when indexing documents larger than one input. It is synchronous and returns exact half-open source-character spans that partition the complete text. Every resulting input fits the configured limits, including any repeated contextual prefix:
 
 ```python
@@ -189,6 +192,8 @@ assert "".join(span.text for span in spans) == source
 ```
 
 Each span needs its own searchable representation. Tokenization uses bounded windows rather than repeatedly encoding the remaining document, and does not promise globally maximal spans for every tokenizer. Oversized queries are rejected by the ordinary embedding methods; applications wanting multi-query retrieval must explicitly split and combine searches. HTTP request budgets are independent of model capacity: whole inputs are packed by their actual serialized request size, and an oversized singleton raises `EmbeddingRequestTooLargeError` rather than reducing its model context. Transport batching does not change embedding identity.
+
+In token-ID mode, tokenless source runs are retained in adjacent spans when input limits permit. Source that cannot be partitioned into nonempty ID sequences is rejected explicitly; the splitter never drops whitespace or returns a span that fails solely because its ID sequence is empty.
 
 Persistent reuse applies to `embed_all()` indexing workloads and is deliberately
 opt-in. Configure an immutable model-artifact/deployment fingerprint as the

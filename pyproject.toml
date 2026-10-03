@@ -1,6 +1,6 @@
 [project]
 name = "vector-core"
-version = "1.7.0"
+version = "1.8.0"
 description = "Shared vector search infrastructure for MCP servers"
 readme = "README.md"
 license = "Apache-2.0"
