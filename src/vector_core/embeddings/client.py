@@ -70,6 +70,10 @@ class EmbeddingServiceError(Exception):
     pass
 
 
+class _TransientGatewayError(httpx.HTTPStatusError):
+    """A retryable gateway response retaining its HTTP request and response."""
+
+
 class CircuitBreakerOpenError(EmbeddingServiceError):
     """Raised when circuit breaker is open and requests are blocked."""
 
@@ -499,7 +503,7 @@ class EmbeddingClient:
         payload = self._request_payload(texts)
 
         # Transient errors worth retrying
-        transient_exceptions = (httpx.ConnectError, httpx.TimeoutException)
+        transient_exceptions = (httpx.ConnectError, httpx.TimeoutException, _TransientGatewayError)
 
         async def make_request() -> httpx.Response:
             """Make the embedding request (can be retried on transient errors)."""
@@ -508,9 +512,12 @@ class EmbeddingClient:
                     f"{self.base_url}/v1/embeddings",
                     json=payload,
                 )
-            # 503 is transient - re-raise for retry
-            if resp.status_code == 503:
-                raise httpx.ConnectError(f"Service unavailable (503) at {self.base_url}")
+            if resp.status_code in {502, 503, 504}:
+                raise _TransientGatewayError(
+                    f"Transient embedding gateway error ({resp.status_code})",
+                    request=resp.request,
+                    response=resp,
+                )
             resp.raise_for_status()
             return resp
 
