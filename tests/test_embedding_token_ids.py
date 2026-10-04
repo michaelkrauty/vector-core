@@ -43,8 +43,8 @@ def wire(client, requests, *, failure=None):
     def respond(request):
         requests.append(request)
         inputs = json.loads(request.content)["input"]
-        if failure == "retry" and len(requests) == 1:
-            return httpx.Response(503)
+        if failure in {502, 503, 504} and len(requests) == 1:
+            return httpx.Response(failure)
         if failure == "fallback" and len(inputs) > 1:
             raise RuntimeError("batch failed")
         if failure == "reject":
@@ -244,7 +244,7 @@ async def test_request_budget_tokenization_work_is_linear(token_limit, tokenizer
     assert len(json.loads(requests[0].content)["input"]) == 100
 
 
-@pytest.mark.parametrize("failure", ["retry", "fallback", "reject"])
+@pytest.mark.parametrize("failure", [502, 503, 504, "fallback", "reject"])
 async def test_retry_and_fallback_retain_ids_without_text_fallback(
     failure, tokenizer_path, monkeypatch
 ):
@@ -268,15 +268,17 @@ async def test_retry_and_fallback_retain_ids_without_text_fallback(
             with pytest.raises(EmbeddingInputRejectedError):
                 await client.embed_batch(["word", "[SEP]"])
         else:
-            await client.embed_batch(["word", "[SEP]"])
+            assert await client.embed_batch(["word", "[SEP]"]) == [[7.0, 4.0], [9.0, 4.0]]
     inputs = [[2, 1, 1, 3], [2, 1, 3, 3]]
     expected = {
-        "retry": [inputs, inputs],
+        502: [inputs, inputs],
+        503: [inputs, inputs],
+        504: [inputs, inputs],
         "fallback": [inputs, inputs[:1], inputs[1:]],
         "reject": [inputs],
     }[failure]
     assert [json.loads(request.content)["input"] for request in requests] == expected
-    if failure == "retry":
+    if failure in {502, 503, 504}:
         assert requests[0].content == requests[1].content
 
 

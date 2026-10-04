@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.8.1] - 2026-10-04
+
+### Fixed
+
+- Embedding HTTP 502, 503, and 504 responses now share the existing three-attempt retry budget and exponential backoff with connection failures and timeouts. Retries preserve prepared inputs and request ordering; exhaustion retains the final HTTP status, response, and cause without singleton fallback. Input rejections and other HTTP errors remain non-retryable.
+
 ## [1.8.0] - 2026-10-02
 
 ### Added
