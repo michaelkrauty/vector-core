@@ -260,12 +260,18 @@ async def fragment_point(  # noqa: PLR0912 - exact source preservation and adapt
 
 
 async def upsert_fragment_group(  # noqa: PLR0912, PLR0915 - validate before any destructive write
-    storage: QdrantStorage, collection: str, points: list[PointStruct]
+    storage: QdrantStorage,
+    collection: str,
+    points: list[PointStruct],
+    *,
+    on_commit: Callable[[], object] | None = None,
 ) -> None:
     """Replace a group under the caller's lock, compensating failed writes or cleanup.
 
     Concurrent readers may observe intermediate requests. A failed rollback
     raises a recovery error retaining the prior group in a durable local journal.
+    ``on_commit`` is passed to ``replace_fragment_group``: it runs once the new
+    group is stored, so a caller can tell a late cancellation from a lost write.
     """
 
     if not points:
@@ -389,4 +395,6 @@ async def upsert_fragment_group(  # noqa: PLR0912, PLR0915 - validate before any
             )
         if offset is None:
             break
-    await replace_fragment_group(storage, collection, points, list(previous.values()))
+    await replace_fragment_group(
+        storage, collection, points, list(previous.values()), on_commit=on_commit
+    )

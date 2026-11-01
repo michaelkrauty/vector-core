@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
@@ -134,11 +135,20 @@ async def replace_fragment_group(
     collection: str,
     points: list[PointStruct],
     previous: list[PointStruct],
+    *,
+    on_commit: Callable[[], object] | None = None,
 ) -> None:
     """Compensate failures under the caller's writer lock, not a reader transaction.
 
     The journal survives rollback failure or process death. Recovery is manual:
     another successful edit can make an old snapshot unsafe to restore.
+
+    Every failure leaves the prior group in place (or journaled for recovery),
+    except a cancellation that arrives during journal cleanup: by then the new
+    group is stored. ``on_commit`` runs exactly when the new group is stored,
+    before that cleanup, so callers keeping state alongside the write can tell
+    the two apart without the cancellation itself changing type. It must not
+    raise.
     """
     from vector_core.storage.embedding_migration import (  # noqa: PLC0415
         _storage_scope,
@@ -190,5 +200,7 @@ async def replace_fragment_group(
         raise
     # Replacement has committed. Finish cleanup even if cancellation arrives;
     # never leave a filesystem worker running after releasing the writer lock.
+    if on_commit is not None:
+        on_commit()
     if await remove_journal():
         raise asyncio.CancelledError

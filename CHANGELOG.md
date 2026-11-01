@@ -4,7 +4,12 @@
 
 ### Fixed
 
-- Single-fact writes now keep the shared sparse vocabulary in step with the indexed facts after its first training (#33). `index_fact` applies an incremental delta before vectorizing, so a term a fact introduces reaches that fact's own sparse vector, and a re-index replaces the token set read back from the fact's stored point instead of adding a duplicate document. `delete_fact_index` retires the fact's contribution only after its points are deleted. A failed embed or upsert reverts the delta, while a failed vocabulary write is logged and the fact is still indexed. Run `index_all(force=True)` once to repair counts that drifted before this release.
+- The facts vocabulary contribution now describes exactly the facts with a stored point, and single-fact writes keep it that way (#33). `index_fact` applies an incremental delta before vectorizing, so a term a fact introduces reaches that fact's own sparse vector, and a re-index replaces the token set read back from the fact's stored point instead of adding a duplicate document. An empty contribution is rebuilt from the stored facts rather than the fact store, so facts that were never written are not counted. `delete_fact_index` retires the fact's contribution only after its points are deleted. A failed embed or upsert reverts the delta, cancellation included, unless the cancellation arrives after the write was stored. A failed vocabulary write is logged and the fact is still indexed.
+- `index_all` retires every fact it registered but did not write, whether that write failed, the pass aborted, or it was cancelled. Incremental runs register facts that already have a point with the tokens that point holds. Run `index_all(force=True)` once to repair counts that drifted before this release.
+
+### Added
+
+- `upsert_fragment_group` and `replace_fragment_group` accept an optional `on_commit` callback that runs once the new group is stored. A cancellation during the journal cleanup that follows still raises a plain `CancelledError`, so callers can tell it apart from a write that never landed without any change to cancellation semantics.
 
 ## [1.8.1] - 2026-10-04
 

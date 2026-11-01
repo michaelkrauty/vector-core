@@ -1,13 +1,16 @@
-"""Tests for facts/indexer module (FactIndexer.index_all / _train_vocabulary).
+"""Tests for facts/indexer module (FactIndexer.index_all / index_fact).
 
 These focus on the indexer processing the COMPLETE fact corpus:
-- index_all / _train_vocabulary must not be capped at 50 facts.
+- index_all and the vocabulary rebuild must not be capped at 50 facts.
 - the GlobalVocabulary must be registered from every fact, not just the
   incremental batch (register_codebase replaces the whole contribution).
 """
 
+import asyncio
 import sqlite3
 import tempfile
+import threading
+from collections import Counter
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,9 +26,11 @@ from vector_core.facts import indexer as indexer_module
 from vector_core.facts.database import FactStore
 from vector_core.facts.indexer import FACTS_CODEBASE_ID, FactIndexer, generate_fact_text
 from vector_core.settings import settings
+from vector_core.storage import fragment_recovery
 from vector_core.storage.embedding_fragments import is_derived_fragment
 from vector_core.storage.embedding_migration import active_embedding_collection
-from vector_core.storage.qdrant import QdrantStorage, generate_point_id
+from vector_core.storage.fragment_recovery import FragmentGroupRecoveryError
+from vector_core.storage.qdrant import QdrantConnectionError, QdrantStorage, generate_point_id
 
 
 @pytest.fixture
@@ -197,16 +202,19 @@ class TestIncrementalVocabularyCorpus:
         assert mock_storage.upsert_batch.await_count == 2
 
 
-class TestTrainVocabularyCompleteCorpus:
-    """_train_vocabulary must tokenize every fact."""
+class TestRebuildVocabularyCompleteCorpus:
+    """An empty contribution is rebuilt from every stored fact, not a capped scan."""
 
-    @pytest.mark.asyncio
-    async def test_trains_on_more_than_fifty_facts(self, indexer, store, vocab):
-        _make_facts(store, 55)
+    async def test_rebuild_reads_past_the_scroll_result_cap(self, live, store, vocab, monkeypatch):
+        _make_facts(store, 7)
+        await live.index_all(force=True)
+        vocab.register_codebase(FACTS_CODEBASE_ID, [])
+        monkeypatch.setattr(settings, "scroll_max_results", 3)
 
-        await indexer._train_vocabulary()
+        target = await active_embedding_collection(live.storage, live.logical_name)
+        await live._rebuild_vocabulary(target)
 
-        assert vocab.get_codebase_doc_count(FACTS_CODEBASE_ID) == 55
+        assert vocab.get_codebase_doc_count(FACTS_CODEBASE_ID) == 7
 
 
 class TestIndexAllRobustness:
@@ -288,7 +296,8 @@ class TestIndexFactAtomic:
         # The upsert (inside _index_fact) overwrites the stable-id point; no
         # pre-delete that could strand the fact on a transient upsert failure.
         indexer._delete_fact_point.assert_not_called()
-        indexer._index_fact.assert_awaited_once_with(fact, "test_generation")
+        indexer._index_fact.assert_awaited_once()
+        assert indexer._index_fact.await_args.args == (fact, "test_generation")
 
 
 class TestGenerationTargets:
@@ -387,6 +396,75 @@ async def _fact_points(indexer, fact_id):
     client = await indexer.storage.get_client()
     points, _ = await client.scroll(target, limit=1000, with_payload=True, with_vectors=True)
     return [point for point in points if (point.payload or {}).get("fact_id") == str(fact_id)]
+
+
+async def _contribution_of_stored_points(indexer, vocab):
+    """``_facts_vocab`` as the stored canonical fact points call for it.
+
+    Read straight from Qdrant, independently of the indexer's own read-back.
+    """
+    target = await active_embedding_collection(indexer.storage, indexer.logical_name)
+    client = await indexer.storage.get_client()
+    points, _ = await client.scroll(target, limit=1000, with_payload=True)
+    canonical = [
+        point.payload
+        for point in points
+        if point.payload.get("type") == "fact" and not is_derived_fragment(point.payload)
+    ]
+    doc_freq = Counter(
+        token for payload in canonical for token in set(vocab.tokenize(payload["content"]))
+    )
+    return len(canonical), dict(doc_freq)
+
+
+def _fail_embedding(indexer, error, *, after=0):
+    """Let ``after`` embedding calls succeed, then raise ``error`` once."""
+    real = indexer.embedder.embed_all.side_effect
+    calls = []
+
+    def embed(texts, **kwargs):
+        calls.append(texts)
+        if len(calls) == after + 1:
+            raise error
+        return real(texts, **kwargs)
+
+    indexer.embedder.embed_all.side_effect = embed
+
+
+async def _cancel_during_post_commit_cleanup(monkeypatch, awaitable):
+    """Cancel ``awaitable`` while its first stored write removes its journal.
+
+    That is the one point where a cancellation follows a write that landed.
+    """
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+    real_remove = fragment_recovery._remove_journal
+    calls = []
+
+    def blocked_remove(path):
+        calls.append(path)
+        if len(calls) == 1:
+            loop.call_soon_threadsafe(entered.set)
+            assert release.wait(timeout=5), "journal removal was never released"
+        return real_remove(path)
+
+    monkeypatch.setattr(fragment_recovery, "_remove_journal", blocked_remove)
+    task = asyncio.ensure_future(awaitable)
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        task.cancel()
+        barrier = asyncio.Event()
+        loop.call_soon(barrier.set)
+        await barrier.wait()
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+        assert caught.type is asyncio.CancelledError
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 def _fail_first_vocab_write(monkeypatch, vocab):
@@ -617,3 +695,199 @@ class TestSingleFactVocabulary:
         assert doc_freq["decoyterm"] == 1
         assert doc_freq["alpha"] == 0
         assert doc_freq.get("beta") == 1
+
+
+class TestContributionTracksStoredFacts:
+    """The facts contribution describes the facts with stored points, not the
+    facts in the store, on every path (PR review of #33)."""
+
+    async def test_first_write_counts_only_stored_facts(self, live, store, vocab):
+        first = store.create("kestrel", "hunts", "voles")
+        second = store.create("falcon", "hunts", "mice")
+
+        await live.index_fact(first)
+        assert vocab.get_codebase_doc_count(FACTS_CODEBASE_ID) == 1
+        await live.index_fact(second)
+
+        assert vocab.get_codebase_doc_count(FACTS_CODEBASE_ID) == 2
+        assert vocab._get_doc_freq()["hunts"] == 2
+        assert _facts_vocab(vocab) == await _contribution_of_stored_points(live, vocab)
+
+    async def test_empty_contribution_is_rebuilt_from_stored_points(self, live, store, vocab):
+        fact = store.create("kestrel", "hunts", "voles", context="meadow")
+        store.create("heron", "eats", "fish")
+        await live.index_all(force=True)
+        # A failed write leaves the store ahead of the stored point, and then
+        # the vocabulary is reset.
+        fact = store.update(fact.id, context="orchard")
+        vocab.register_codebase(FACTS_CODEBASE_ID, [])
+
+        await live.index_fact(store.create("axolotl", "lives_in", "lakes"))
+        assert _facts_vocab(vocab) == await _contribution_of_stored_points(live, vocab)
+        await live.index_fact(fact)
+
+        assert _facts_vocab(vocab) == await _contribution_of_stored_points(live, vocab)
+        assert vocab.get_codebase_doc_count(FACTS_CODEBASE_ID) == 3
+        assert vocab._get_doc_freq()["orchard"] == 1
+        assert vocab._get_doc_freq()["meadow"] == 0
+
+    async def test_vocabulary_failure_on_an_empty_contribution_still_indexes(
+        self, live, store, vocab, monkeypatch
+    ):
+        fact = store.create("kestrel", "hunts", "voles")
+        locked = sqlite3.OperationalError("database is locked")
+        monkeypatch.setattr(vocab, "register_codebase", MagicMock(side_effect=locked))
+        update = _fail_first_vocab_write(monkeypatch, vocab)
+
+        await live.index_fact(fact)
+
+        assert update.call_count == 1
+        (point,) = await _fact_points(live, fact.id)
+        assert point.payload["content"] == generate_fact_text(fact)
+
+    @pytest.mark.parametrize("force", [True, False], ids=["force", "incremental"])
+    async def test_index_all_retires_a_fact_whose_write_failed(self, live, store, vocab, force):
+        store.create("kestrel", "hunts", "voles")
+        store.create("heron", "eats", "fish")
+        _fail_embedding(live, EmbeddingServiceError("embedding down"), after=1)
+
+        result = await live.index_all(force=force)
+
+        assert result["indexed"] == 1
+        assert vocab.get_codebase_doc_count(FACTS_CODEBASE_ID) == 1
+        assert _facts_vocab(vocab) == await _contribution_of_stored_points(live, vocab)
+        # The retry adds the fact once, not on top of a registration it never earned.
+        await live.index_all()
+        assert vocab.get_codebase_doc_count(FACTS_CODEBASE_ID) == 2
+        assert _facts_vocab(vocab) == await _contribution_of_stored_points(live, vocab)
+
+    async def test_index_fact_retry_after_a_failed_index_all_counts_once(self, live, store, vocab):
+        store.create("kestrel", "hunts", "voles")
+        doomed = store.create("axolotl", "lives_in", "lakes")
+        real = live.embedder.embed_all.side_effect
+
+        def embed(texts, **kwargs):
+            if any("axolotl" in text for text in texts):
+                raise EmbeddingServiceError("embedding down")
+            return real(texts, **kwargs)
+
+        live.embedder.embed_all.side_effect = embed
+        await live.index_all(force=True)
+        assert vocab.get_codebase_doc_count(FACTS_CODEBASE_ID) == 1
+        assert vocab._get_doc_freq()["axolotl"] == 0
+
+        live.embedder.embed_all.side_effect = real
+        await live.index_fact(doomed)
+
+        assert vocab.get_codebase_doc_count(FACTS_CODEBASE_ID) == 2
+        assert vocab._get_doc_freq()["axolotl"] == 1
+        assert _facts_vocab(vocab) == await _contribution_of_stored_points(live, vocab)
+
+    @pytest.mark.parametrize("abort", ["storage", "recovery"])
+    async def test_aborted_index_all_retires_every_unwritten_fact(
+        self, live, store, vocab, temp_dir, abort
+    ):
+        _make_facts(store, 4)
+        error = (
+            QdrantConnectionError("storage down")
+            if abort == "storage"
+            else FragmentGroupRecoveryError(
+                temp_dir / "recovery.json", RuntimeError("write"), RuntimeError("rollback")
+            )
+        )
+        # The first fact is written, the second aborts the pass, and the last
+        # two are never attempted; all three were registered up front.
+        _fail_embedding(live, error, after=1)
+
+        with pytest.raises(type(error)):
+            await live.index_all(force=True)
+
+        assert vocab.get_codebase_doc_count(FACTS_CODEBASE_ID) == 1
+        assert _facts_vocab(vocab) == await _contribution_of_stored_points(live, vocab)
+
+    async def test_failed_incremental_scan_reads_points_back_before_retiring(
+        self, live, store, vocab, monkeypatch
+    ):
+        store.create("kestrel", "hunts", "voles")
+        await live.index_all(force=True)
+        store.create("axolotl", "lives_in", "lakes")
+        # The scan fails, so both facts are reindexed, and both writes fail:
+        # kestrel keeps its earlier point, axolotl never had one.
+        real_scan = live._stored_fact_tokens
+        scans = []
+
+        async def flaky_scan(collection, fact_id=None):
+            scans.append(fact_id)
+            if len(scans) == 1:
+                raise RuntimeError("scroll failed")
+            return await real_scan(collection, fact_id)
+
+        monkeypatch.setattr(live, "_stored_fact_tokens", flaky_scan)
+        live.embedder.embed_all.side_effect = EmbeddingServiceError("embedding down")
+
+        result = await live.index_all()
+
+        assert result["indexed"] == 0
+        assert vocab.get_codebase_doc_count(FACTS_CODEBASE_ID) == 1
+        assert _facts_vocab(vocab) == await _contribution_of_stored_points(live, vocab)
+
+    async def test_incremental_index_all_registers_the_text_points_hold(self, live, store, vocab):
+        fact = store.create("kestrel", "hunts", "voles", context="meadow")
+        await live.index_all(force=True)
+        # A failed single write leaves the store ahead of the stored point.
+        fact = store.update(fact.id, context="orchard")
+        store.create("axolotl", "lives_in", "lakes")
+
+        await live.index_all()
+        assert _facts_vocab(vocab) == await _contribution_of_stored_points(live, vocab)
+        await live.index_fact(fact)
+
+        assert _facts_vocab(vocab) == await _contribution_of_stored_points(live, vocab)
+        assert vocab._get_doc_freq()["orchard"] == 1
+        assert vocab._get_doc_freq()["meadow"] == 0
+
+
+class TestCancellationAccounting:
+    """A cancellation is compensated unless it follows a stored write."""
+
+    @pytest.mark.parametrize("existing", [True, False], ids=["update", "new"])
+    async def test_cancellation_after_the_write_is_stored_keeps_the_delta(
+        self, live, vocab, monkeypatch, existing
+    ):
+        store = live.fact_store
+        fact = store.create("kestrel", "hunts", "voles", context="meadow")
+        await live.index_all(force=True)
+        if existing:
+            fact = store.update(fact.id, context="quokkaesque")
+        else:
+            fact = store.create("axolotl", "lives_in", "lakes", context="quokkaesque")
+
+        await _cancel_during_post_commit_cleanup(monkeypatch, live.index_fact(fact))
+
+        (point,) = await _fact_points(live, fact.id)
+        assert point.payload["content"] == generate_fact_text(fact)
+        assert vocab._get_doc_freq().get("quokkaesque") == 1
+        assert _facts_vocab(vocab) == await _contribution_of_stored_points(live, vocab)
+
+    async def test_cancellation_before_the_write_still_compensates(self, live, store, vocab):
+        store.create("kestrel", "hunts", "voles")
+        await live.index_all(force=True)
+        before = _facts_vocab(vocab)
+        live.embedder.embed_all.side_effect = asyncio.CancelledError()
+        added = store.create("axolotl", "lives_in", "lakes")
+
+        with pytest.raises(asyncio.CancelledError):
+            await live.index_fact(added)
+
+        assert _facts_vocab(vocab) == before
+        assert await _fact_points(live, added.id) == []
+
+    async def test_index_all_cancelled_after_a_stored_write_keeps_that_fact(
+        self, live, store, vocab, monkeypatch
+    ):
+        _make_facts(store, 3)
+
+        await _cancel_during_post_commit_cleanup(monkeypatch, live.index_all(force=True))
+
+        assert vocab.get_codebase_doc_count(FACTS_CODEBASE_ID) == 1
+        assert _facts_vocab(vocab) == await _contribution_of_stored_points(live, vocab)
