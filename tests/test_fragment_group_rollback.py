@@ -132,9 +132,11 @@ async def test_later_batch_failure_restores_exact_group_and_retry_covers_tail(
         return result
 
     monkeypatch.setattr(client, "upsert", fail_later_batch)
+    on_commit = Mock()
     with pytest.raises(RuntimeError) as caught:
-        await upsert_fragment_group(storage, "corpus", new)
+        await upsert_fragment_group(storage, "corpus", new, on_commit=on_commit)
     assert caught.value is failure
+    on_commit.assert_not_called()
     assert calls >= 3
     assert await snapshot(storage) == before
     assert journals() == []
@@ -143,7 +145,8 @@ async def test_later_batch_failure_restores_exact_group_and_retry_covers_tail(
     )
     assert hits.points == []
     monkeypatch.setattr(client, "upsert", real_upsert)
-    await upsert_fragment_group(storage, "corpus", new)
+    await upsert_fragment_group(storage, "corpus", new, on_commit=on_commit)
+    on_commit.assert_called_once_with()
     assert journals() == []
     await assert_new_coverage(storage, new, before)
     assert not {point.id for point in old[1:]} & set(await snapshot(storage))
@@ -320,6 +323,68 @@ async def test_journal_io_keeps_loop_responsive_and_settles_cancelled_workers(
         await asyncio.gather(task, return_exceptions=True)
 
 
+@pytest.mark.parametrize("phase", ["journal", "write", "cleanup"])
+async def test_on_commit_marks_a_stored_group_without_changing_cancellation(
+    storage, monkeypatch, phase
+):
+    """Only a cancellation during post-commit cleanup follows a stored group;
+    on_commit says so, and the cancellation itself keeps its exact type."""
+    _, new, before, _ = await replacement(storage, monkeypatch)
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+    if phase == "write":
+        client = await storage.get_client()
+        real_upsert = client.upsert
+        calls = []
+
+        async def blocked_write(*args, **kwargs):
+            calls.append(args)
+            if len(calls) == 2:
+                entered.set()
+                await asyncio.to_thread(release.wait, 5)
+            return await real_upsert(*args, **kwargs)
+
+        monkeypatch.setattr(client, "upsert", blocked_write)
+    else:
+        owner, name = (
+            (recovery.json, "dump") if phase == "journal" else (recovery, "_remove_journal")
+        )
+        real_io = getattr(owner, name)
+
+        def blocked_io(*args, **kwargs):
+            loop.call_soon_threadsafe(entered.set)
+            assert release.wait(timeout=5), "event loop could not release the journal worker"
+            return real_io(*args, **kwargs)
+
+        monkeypatch.setattr(owner, name, blocked_io)
+    on_commit = Mock()
+    task = asyncio.create_task(upsert_fragment_group(storage, "corpus", new, on_commit=on_commit))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        task.cancel()
+        barrier = asyncio.Event()
+        loop.call_soon(barrier.set)
+        await barrier.wait()
+        release.set()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await asyncio.wait_for(task, timeout=5)
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+    # asyncio.timeout and TaskGroup compare cancellation by identity on 3.11
+    # and 3.12, so a subclass would not be treated as cancellation there.
+    assert caught.type is asyncio.CancelledError
+    assert journals() == []
+    if phase == "cleanup":
+        await assert_new_coverage(storage, new, before)
+        on_commit.assert_called_once_with()
+    else:
+        assert await snapshot(storage) == before
+        on_commit.assert_not_called()
+
+
 async def test_journal_serialization_failure_prevents_mutation_and_removes_partial_file(
     storage, monkeypatch
 ):
@@ -411,7 +476,7 @@ async def test_fact_batch_propagates_recovery_required_and_stops_before_next_fac
     monkeypatch.setattr(
         indexer, "_iter_fact_tokens", lambda: iter([(first, {"first"}), (second, {"second"})])
     )
-    monkeypatch.setattr(indexer, "_get_indexed_fact_ids", AsyncMock(return_value=set()))
+    monkeypatch.setattr(indexer, "_scan_stored_facts", AsyncMock(return_value={}))
     original = RuntimeError("replacement rejected")
     failure = (
         FragmentGroupRecoveryError(tmp_path / "recovery.json", original, RuntimeError("rollback"))
@@ -424,10 +489,26 @@ async def test_fact_batch_propagates_recovery_required_and_stops_before_next_fac
         with pytest.raises(FragmentGroupRecoveryError) as caught:
             await indexer._index_all("corpus")
         assert caught.value is failure
-        write.assert_awaited_once_with(first, "corpus")
+        write.assert_awaited_once()
+        assert write.await_args is not None
+        assert write.await_args.args == (first, "corpus")
     else:
         result = await indexer._index_all("corpus")
         assert result["indexed"] == 1
         assert write.await_count == 2
         assert write.await_args is not None
         assert write.await_args.args == (second, "corpus")
+
+
+async def test_raising_commit_callback_still_removes_the_journal(storage, monkeypatch):
+    _old, new, before, _budget = await replacement(storage, monkeypatch)
+    failure = RuntimeError("callback broke its contract")
+
+    def on_commit():
+        raise failure
+
+    with pytest.raises(RuntimeError) as caught:
+        await upsert_fragment_group(storage, "corpus", new, on_commit=on_commit)
+    assert caught.value is failure
+    assert journals() == []
+    await assert_new_coverage(storage, new, before)
