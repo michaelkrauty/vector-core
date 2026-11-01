@@ -22,6 +22,7 @@ import atexit
 import logging
 import sqlite3
 import threading
+import time
 import weakref
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,7 +58,7 @@ class SQLiteConfig:
 
     Sensible defaults for concurrent access patterns:
     - WAL mode: Allows concurrent readers with single writer
-    - 5-second busy timeout: Prevents immediate lock failures
+    - 5-second busy timeout: Bounds lock waits, including connection initialization
     - NORMAL synchronous: Good balance of safety and performance
     """
 
@@ -69,9 +70,24 @@ class SQLiteConfig:
     check_same_thread: bool = False
 
     def apply(self, conn: sqlite3.Connection) -> None:
-        """Apply configuration PRAGMAs to connection."""
-        conn.execute(f"PRAGMA journal_mode={self.journal_mode}")
-        conn.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
+        """Apply PRAGMAs, retrying busy journal-mode changes within the busy timeout."""
+        deadline = time.monotonic() + max(0, self.busy_timeout_ms) / 1000
+        try:
+            while True:
+                remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+                conn.execute(f"PRAGMA busy_timeout={remaining_ms}")
+                try:
+                    conn.execute(f"PRAGMA journal_mode={self.journal_mode}").fetchone()
+                    break
+                except sqlite3.OperationalError as error:
+                    remaining = deadline - time.monotonic()
+                    if error.sqlite_errorcode & 0xFF != sqlite3.SQLITE_BUSY or remaining <= 0:
+                        raise
+                    # SQLite can skip its busy handler on a read-to-write lock
+                    # upgrade. Retry initialization without extending its budget.
+                    time.sleep(min(0.01, remaining))
+        finally:
+            conn.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
         conn.execute(f"PRAGMA synchronous={self.synchronous}")
         if self.foreign_keys:
             conn.execute("PRAGMA foreign_keys=ON")
@@ -158,7 +174,11 @@ class ThreadSafeSQLiteStore:
                     check_same_thread=self._config.check_same_thread,
                     timeout=self._config.connect_timeout,
                 )
-                self._config.apply(conn)
+                try:
+                    self._config.apply(conn)
+                except BaseException:
+                    conn.close()
+                    raise
                 self._local.conn = conn
                 self._all_conns[threading.get_ident()] = conn
                 logger.debug(
