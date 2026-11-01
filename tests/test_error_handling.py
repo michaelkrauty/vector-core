@@ -486,8 +486,9 @@ class TestConcurrentErrors:
         errors = []
 
         def create_entries(start, count):
-            store = GlossaryStore(db_path=db_path)
+            store = None
             try:
+                store = GlossaryStore(db_path=db_path)
                 for i in range(start, start + count):
                     try:
                         store.create(
@@ -497,8 +498,14 @@ class TestConcurrentErrors:
                         )
                     except Exception as e:
                         errors.append(e)
+            except Exception as e:
+                errors.append(e)
             finally:
-                store.close()
+                if store is not None:
+                    try:
+                        store.close()
+                    except Exception as e:
+                        errors.append(e)
 
         threads = [
             threading.Thread(target=create_entries, args=(i * 10, 10))
@@ -510,13 +517,13 @@ class TestConcurrentErrors:
         for t in threads:
             t.join()
 
-        # Should complete without deadlock
-        # Some duplicates are expected if terms overlap
+        assert not errors
+
         store = GlossaryStore(db_path=db_path)
         entries = store.list_all()
         store.close()
 
-        assert len(entries) > 0  # At least some succeeded
+        assert len(entries) == 30
 
     def test_concurrent_fact_access(self, tmp_path):
         """FactStore handles concurrent access safely."""

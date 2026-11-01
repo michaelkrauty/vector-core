@@ -196,18 +196,19 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
         if row is None:
             # New database - set schema version
             conn.execute(
-                "INSERT INTO metadata (key, value) VALUES ('schema_version', ?)",
+                "INSERT INTO metadata (key, value) VALUES ('schema_version', ?) "
+                "ON CONFLICT(key) DO NOTHING",
                 (str(SCHEMA_VERSION),),
             )
             conn.commit()
-        else:
-            db_version = int(row[0])
-            if db_version > SCHEMA_VERSION:
-                raise ValueError(
-                    f"Database schema version ({db_version}) is newer than supported "
-                    f"({SCHEMA_VERSION}). Please update vector-core."
-                )
-            # Future: add migration logic here if db_version < SCHEMA_VERSION
+            row = conn.execute("SELECT value FROM metadata WHERE key = 'schema_version'").fetchone()
+        db_version = int(row[0])
+        if db_version > SCHEMA_VERSION:
+            raise ValueError(
+                f"Database schema version ({db_version}) is newer than supported "
+                f"({SCHEMA_VERSION}). Please update vector-core."
+            )
+        # Future: add migration logic here if db_version < SCHEMA_VERSION
 
     def _invalidate_cache(self) -> None:
         """Invalidate all in-memory caches."""

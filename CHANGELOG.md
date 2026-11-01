@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.10.1] - 2026-11-01
+
+### Fixed
+
+- Opening an SQLite store no longer fails with `database is locked` when several threads or processes open the same new database at once (#36). Switching a fresh database to WAL needs a lock upgrade, and SQLite returns `SQLITE_BUSY` immediately for that upgrade, without waiting, when waiting could deadlock, so the configured busy timeout never applied. The journal-mode step now retries within that same timeout budget, and nothing else is retried. This affects every store built on `ThreadSafeSQLiteStore` (glossary, facts, vocabulary, embedding cache, hash registry), which several servers open at the same time on startup.
+- Two processes initializing a new vocabulary database at once could both try to insert its schema version and one would fail with a unique-constraint error. The insert is now conflict-safe and the stored version is read back and validated.
+
 ## [1.10.0] - 2026-10-31
 
 ### Added
