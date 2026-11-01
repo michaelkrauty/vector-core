@@ -198,9 +198,12 @@ async def replace_fragment_group(
             raise FragmentGroupRecoveryError(journal, original, failure) from failure
         await remove_journal()
         raise
-    # Replacement has committed. Finish cleanup even if cancellation arrives;
-    # never leave a filesystem worker running after releasing the writer lock.
-    if on_commit is not None:
-        on_commit()
-    if await remove_journal():
-        raise asyncio.CancelledError
+    # Replacement has committed. Finish cleanup even if cancellation arrives,
+    # or the commit callback breaks its contract and raises; never leave a
+    # stale journal or a filesystem worker behind after releasing the writer lock.
+    try:
+        if on_commit is not None:
+            on_commit()
+    finally:
+        if await remove_journal():
+            raise asyncio.CancelledError

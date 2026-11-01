@@ -498,3 +498,17 @@ async def test_fact_batch_propagates_recovery_required_and_stops_before_next_fac
         assert write.await_count == 2
         assert write.await_args is not None
         assert write.await_args.args == (second, "corpus")
+
+
+async def test_raising_commit_callback_still_removes_the_journal(storage, monkeypatch):
+    _old, new, before, _budget = await replacement(storage, monkeypatch)
+    failure = RuntimeError("callback broke its contract")
+
+    def on_commit():
+        raise failure
+
+    with pytest.raises(RuntimeError) as caught:
+        await upsert_fragment_group(storage, "corpus", new, on_commit=on_commit)
+    assert caught.value is failure
+    assert journals() == []
+    await assert_new_coverage(storage, new, before)
