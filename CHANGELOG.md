@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.8.2] - 2026-10-31
+
+### Fixed
+
+- Single-fact writes now keep the shared sparse vocabulary in step with the indexed facts after its first training (#33). `index_fact` applies an incremental delta before vectorizing, so a term a fact introduces reaches that fact's own sparse vector, and a re-index replaces the token set read back from the fact's stored point instead of adding a duplicate document. `delete_fact_index` retires the fact's contribution only after its points are deleted. A failed embed or upsert reverts the delta, while a failed vocabulary write is logged and the fact is still indexed. Run `index_all(force=True)` once to repair counts that drifted before this release.
+
 ## [1.8.1] - 2026-10-04
 
 ### Fixed

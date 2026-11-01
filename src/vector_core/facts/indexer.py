@@ -23,7 +23,12 @@ from vector_core.embeddings.client import EmbeddingClient, EmbeddingServiceError
 from vector_core.embeddings.global_vocab import GlobalVocabulary
 from vector_core.facts.database import FactStore
 from vector_core.facts.models import Fact, SourceStatus
-from vector_core.storage.embedding_fragments import fragment_point, upsert_fragment_group
+from vector_core.storage.embedding_fragments import (
+    FRAGMENT_KEY,
+    fragment_point,
+    is_derived_fragment,
+    upsert_fragment_group,
+)
 from vector_core.storage.embedding_migration import (
     CollectionGeneration,
     embedding_collection_lock,
@@ -357,11 +362,95 @@ class FactIndexer:
             "last_indexed": datetime.now(UTC).isoformat(),
         }
 
+    # ------------------------------------------------------------------
+    # Sparse vocabulary accounting
+    #
+    # Single-fact writes keep the facts contribution to GlobalVocabulary
+    # current with incremental deltas instead of re-registering the whole
+    # corpus on every write. Two invariants keep sparse retrieval honest:
+    #
+    # 1. A fact's terms are in the vocabulary before the fact is vectorized.
+    #    ``vectorize_document`` silently drops unknown tokens, so a term
+    #    registered late never reaches the sparse vector of the fact that
+    #    introduced it.
+    # 2. The contribution describes exactly the indexed facts. Its document
+    #    count and document frequencies feed the IDF weights of every codebase
+    #    sharing the vocabulary database.
+    #
+    # Each fact is one vocabulary document, tokenized from
+    # ``generate_fact_text(fact)``: the text ``_index_fact`` stores in the
+    # canonical point's ``content``. The removal side reads that stored text
+    # back, so adding and retiring a fact tokenize the same text and repeated
+    # edits cannot leak document frequency. Derived fragments are dense slices
+    # of the same fact, not further documents.
+    # ------------------------------------------------------------------
+
+    async def _indexed_token_set(self, fact_id: UUID, collection: str) -> tuple[bool, set[str]]:
+        """Tokens currently registered for a fact, read back from its stored point.
+
+        Returns ``(is_indexed, tokens)``. An unindexed fact has no points and
+        contributes nothing, which is distinct from an indexed fact whose point
+        predates the current payload layout and holds no usable text: that one
+        still counts as a document, just one without tokens.
+        """
+        payloads = await self.storage.scroll_points(
+            collection,
+            filter_conditions=[
+                FieldCondition(key="fact_id", match=MatchValue(value=str(fact_id))),
+            ],
+            # fact_id keeps the projection non-empty for a point without
+            # content; scroll_points drops points whose payload comes back empty.
+            payload_fields=["fact_id", "content", FRAGMENT_KEY],
+            max_results=0,
+        )
+        tokens: set[str] = set()
+        for payload in payloads:
+            if is_derived_fragment(payload):
+                continue
+            text = payload.get("content")
+            if isinstance(text, str):
+                tokens.update(self.global_vocab.tokenize(text))
+        return bool(payloads), tokens
+
+    def _update_vocabulary(
+        self,
+        added_tokens: list[set[str]],
+        removed_tokens: list[set[str]],
+        net_doc_change: int,
+    ) -> bool:
+        """Apply a facts vocabulary delta, logging rather than raising on failure.
+
+        Returns whether the delta reached the database. Callers must not
+        compensate for a delta that was never applied: inverting one that
+        failed would subtract tokens and a document that were never added.
+
+        A fact write must not fail because the shared vocabulary database was
+        busy: a missed delta degrades sparse ranking, while a raised error would
+        lose the fact. ``index_all(force=True)`` rebuilds the contribution from
+        scratch and repairs any drift.
+        """
+        try:
+            self.global_vocab.update_codebase_incremental(
+                FACTS_CODEBASE_ID,
+                added_tokens=added_tokens,
+                removed_tokens=removed_tokens,
+                net_doc_change=net_doc_change,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to update the facts vocabulary contribution: {e}")
+            return False
+        return True
+
     async def index_fact(self, fact: Fact) -> None:
         """
         Index a single fact.
 
-        Ensures GlobalVocabulary is trained before indexing.
+        The facts vocabulary contribution is updated before the fact is
+        vectorized, so terms it introduces reach its own sparse vector. A
+        re-index swaps the fact's stored token set for its new one; a new fact
+        adds one document. While the contribution is still empty it is trained
+        from the whole store instead. A failed vocabulary write is logged and
+        indexing continues; a failed embed or upsert reverts the delta.
 
         Args:
             fact: Fact to index
@@ -372,24 +461,63 @@ class FactIndexer:
     async def _index_single_fact(self, fact: Fact, collection: str) -> None:
         await self._ensure_global_vocab()
 
-        # Ensure GlobalVocabulary is trained
         if self.global_vocab.get_codebase_doc_count(FACTS_CODEBASE_ID) == 0:
+            # Training registers the complete store, which already holds this
+            # fact, so a delta on top would count it twice.
             await self._train_vocabulary()
+            await self._index_fact(fact, collection)
+            return
+
+        # Register the delta before _index_fact vectorizes (invariant 1).
+        added = set(self.global_vocab.tokenize(generate_fact_text(fact)))
+        was_indexed, previous = await self._indexed_token_set(fact.id, collection)
+        removed = [previous] if was_indexed else []
+        doc_change = 0 if was_indexed else 1
+        applied = self._update_vocabulary([added], removed, doc_change)
 
         # Index. The point id is stable per fact, so the upsert overwrites any
         # existing point in place; pre-deleting first would only open a window
         # where a failed embed/upsert leaves the fact missing from search.
-        await self._index_fact(fact, collection)
+        try:
+            await self._index_fact(fact, collection)
+        except BaseException:
+            # A failed embed writes nothing, and a failed upsert restores (or
+            # journals for recovery) the previous group, so the stored fact is
+            # unchanged and its contribution must be too. Cancellation counts:
+            # it most likely lands mid-embed, before anything was written.
+            if applied:
+                self._update_vocabulary(removed, [added], -doc_change)
+            raise
 
     async def delete_fact_index(self, fact_id: UUID) -> None:
         """
         Remove a fact from the index.
 
+        The fact's vocabulary contribution is retired only once its points are
+        gone. Subtracting after a failed delete would leave the fact searchable
+        while its terms had been written off.
+
         Args:
             fact_id: Fact UUID to remove
         """
         async with self._mutation_target() as collection:
-            await self._delete_fact_point(fact_id, collection)
+            await self._delete_single_fact(fact_id, collection)
+
+    async def _delete_single_fact(self, fact_id: UUID, collection: str) -> None:
+        await self._ensure_global_vocab()
+        try:
+            was_indexed, tokens = await self._indexed_token_set(fact_id, collection)
+        except Exception as e:
+            # Deletion must proceed even if the stored text cannot be read; the
+            # cost is a stale contribution that the next force rebuild repairs.
+            logger.warning(
+                f"Could not read fact {fact_id} back before deleting it from the "
+                f"index; its vocabulary contribution is left in place: {e}"
+            )
+            was_indexed, tokens = False, set()
+        await self._delete_fact_point(fact_id, collection)
+        if was_indexed:
+            self._update_vocabulary([], [tokens], -1)
 
     async def _index_fact(self, fact: Fact, collection: str) -> None:
         """Index a single fact."""
