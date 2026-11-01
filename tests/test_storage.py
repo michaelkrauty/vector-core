@@ -9,9 +9,13 @@ import pytest
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import (
     Distance,
+    PayloadSchemaType,
     PointIdsList,
     PointStruct,
     ScoredPoint,
+    TextIndexParams,
+    TextIndexType,
+    TokenizerType,
     VectorParams,
     WriteOrdering,
 )
@@ -191,6 +195,41 @@ class TestCollectionManagement:
             assert call_kwargs["collection_name"] == "test_collection"
             assert "dense" in call_kwargs["vectors_config"]
             assert "sparse" in call_kwargs["sparse_vectors_config"]
+
+    @pytest.mark.asyncio
+    async def test_ensure_payload_indexes_forwards_full_index_params(self):
+        """A full-text index declaration reaches Qdrant with its parameters intact."""
+        storage = QdrantStorage(embedding_dim=384)
+        text = TextIndexParams(
+            type=TextIndexType.TEXT,
+            tokenizer=TokenizerType.WORD,
+            lowercase=True,
+            phrase_matching=True,
+        )
+
+        with patch.object(storage, "_get_client") as mock_get_client:
+            mock_client = AsyncMock()
+            mock_get_client.return_value = mock_client
+
+            await storage.ensure_payload_indexes(
+                "test_collection",
+                [("type", PayloadSchemaType.KEYWORD), ("content", text)],
+            )
+
+            assert [call.kwargs for call in mock_client.create_payload_index.await_args_list] == [
+                {
+                    "collection_name": "test_collection",
+                    "field_name": "type",
+                    "field_schema": PayloadSchemaType.KEYWORD,
+                    "wait": True,
+                },
+                {
+                    "collection_name": "test_collection",
+                    "field_name": "content",
+                    "field_schema": text,
+                    "wait": True,
+                },
+            ]
 
     @pytest.mark.asyncio
     async def test_delete_collection(self):

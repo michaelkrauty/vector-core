@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.10.0] - 2026-10-31
+
+### Added
+
+- Payload index declarations accept full index parameters as well as bare schema types. `QdrantStorage.ensure_payload_indexes`, `QdrantStorage.ensure_collection_with_indexes` and `ensure_embedding_collection(payload_indexes=...)` take `(field, schema)` pairs typed as the new exported `PayloadIndexSchema` (`PayloadSchemaType` or Qdrant's index parameter models), so a consumer can declare a tokenized full-text index with `TextIndexParams`, for example for case-insensitive keyword matching. Existing declarations behave exactly as before.
+
+### Fixed
+
+- An embedding migration builds each declared payload index from its declaration instead of from the source generation's schema for the same field. A changed declaration was previously built with the stale parameters first and only corrected by the next bind. Indexes that exist only on the source are still carried over unchanged.
+
 ## [1.9.0] - 2026-10-31
 
 ### Added

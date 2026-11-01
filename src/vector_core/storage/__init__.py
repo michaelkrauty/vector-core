@@ -5,6 +5,7 @@ from qdrant_client.models import PayloadSchemaType
 from vector_core.storage.hash_registry import HashRegistry, RegistryEntry
 from vector_core.storage.hybrid import HybridSearcher, SearchResult
 from vector_core.storage.qdrant import (
+    PayloadIndexSchema,
     PointId,
     QdrantConnectionError,
     QdrantStorage,
@@ -23,4 +24,5 @@ __all__ = [
     "HashRegistry",
     "RegistryEntry",
     "PayloadSchemaType",
+    "PayloadIndexSchema",
 ]

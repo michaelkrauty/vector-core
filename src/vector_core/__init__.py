@@ -12,7 +12,7 @@ Provides:
 - Hash registry for document tracking
 """
 
-__version__ = "1.9.0"
+__version__ = "1.10.0"
 
 # Main exports for convenience
 from vector_core.embeddings.cache import EmbeddingCache
@@ -71,6 +71,7 @@ from vector_core.settings import VectorCoreSettings, VectorCoreSettingsMixin, se
 from vector_core.storage import (
     HashRegistry,
     HybridSearcher,
+    PayloadIndexSchema,
     PayloadSchemaType,
     PointId,
     QdrantConnectionError,
@@ -214,6 +215,7 @@ __all__ = [
     "HashRegistry",
     "RegistryEntry",
     "PayloadSchemaType",
+    "PayloadIndexSchema",
     # Glossary
     "GlossaryStore",
     "GlossaryIndexer",

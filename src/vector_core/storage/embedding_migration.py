@@ -32,7 +32,6 @@ from qdrant_client.models import (
     FieldCondition,
     Filter,
     MatchValue,
-    PayloadSchemaType,
     PointsList,
     PointStruct,
     Range,
@@ -54,7 +53,7 @@ from vector_core.storage.embedding_fragments import (
 )
 from vector_core.storage.embedding_sources import resolve_shared_embedding_text as _resolve_shared
 from vector_core.storage.embedding_sources import stored_embedding_text
-from vector_core.storage.qdrant import QdrantStorage
+from vector_core.storage.qdrant import PayloadIndexSchema, QdrantStorage
 from vector_core.utils.locking import async_file_lock
 
 EMBEDDING_TEXT_KEY = "embedding_text"
@@ -548,14 +547,18 @@ async def _copy_indexes(
     storage: QdrantStorage,
     source: str | None,
     target: str,
-    payload_indexes: Sequence[tuple[str, PayloadSchemaType]],
+    payload_indexes: Sequence[tuple[str, PayloadIndexSchema]],
 ) -> None:
-    indexes: dict[str, Any] = dict(payload_indexes)
+    indexes: dict[str, Any] = {}
     client = await storage.get_client()
     if source:
         info = await client.get_collection(source)
         for key, schema in info.payload_schema.items():
             indexes[key] = schema.params or schema.data_type
+    # Declared indexes win over the source's schema for the same field, so a
+    # changed declaration is not built from stale parameters and then rebuilt
+    # on the next bind. Indexes only the source has are carried over as-is.
+    indexes.update(payload_indexes)
     for key, schema in indexes.items():
         await client.create_payload_index(
             collection_name=target,
@@ -571,7 +574,7 @@ async def ensure_embedding_collection(
     embedder: EmbeddingClient,
     text_resolver: TextResolver,
     *,
-    payload_indexes: Sequence[tuple[str, PayloadSchemaType]] = (),
+    payload_indexes: Sequence[tuple[str, PayloadIndexSchema]] = (),
     lock_held: bool = False,
     finalize_candidate: CandidateFinalizer | None = None,
     child_payload: ChildPayload | None = None,

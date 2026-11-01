@@ -6,7 +6,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 from qdrant_client import AsyncQdrantClient
-from qdrant_client.models import PayloadIndexInfo, PointStruct, SparseVector, TextIndexParams
+from qdrant_client.models import (
+    PayloadIndexInfo,
+    PayloadSchemaType,
+    PointStruct,
+    SparseVector,
+    TextIndexParams,
+)
 
 from vector_core.embeddings.client import EmbeddingClient, EmbeddingServiceError
 from vector_core.embeddings.identity import EmbeddingIdentity
@@ -267,6 +273,66 @@ async def test_copy_indexes_preserves_custom_payload_schema(storage, monkeypatch
         field_schema=params,
         wait=True,
     )
+
+
+async def test_copy_indexes_prefers_declared_schema_over_source(storage, monkeypatch):
+    raw = await storage.get_client()
+    stale = TextIndexParams(type="text", tokenizer="word", lowercase=True)
+    declared = TextIndexParams(type="text", tokenizer="word", lowercase=True, phrase_matching=True)
+    monkeypatch.setattr(
+        raw,
+        "get_collection",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                payload_schema={
+                    "content": PayloadIndexInfo(data_type="text", params=stale, points=2),
+                    "source_only": PayloadIndexInfo(data_type="keyword", points=2),
+                },
+            )
+        ),
+    )
+    create_index = AsyncMock()
+    monkeypatch.setattr(raw, "create_payload_index", create_index)
+    await _copy_indexes(
+        storage, "source", "target", [("content", declared), ("type", PayloadSchemaType.KEYWORD)]
+    )
+    created = {
+        call.kwargs["field_name"]: call.kwargs["field_schema"]
+        for call in create_index.await_args_list
+    }
+    assert created == {
+        "content": declared,
+        "source_only": PayloadSchemaType.KEYWORD,
+        "type": PayloadSchemaType.KEYWORD,
+    }
+
+
+async def test_full_text_index_declaration_reaches_every_bound_generation(storage, monkeypatch):
+    await seed(storage)
+    params = TextIndexParams(type="text", tokenizer="word", lowercase=True, phrase_matching=True)
+    declared = [("type", PayloadSchemaType.KEYWORD), ("content", params)]
+    ensured = []
+
+    async def record(collection, indexes):
+        ensured.append((collection, list(indexes)))
+
+    monkeypatch.setattr(storage, "ensure_payload_indexes", record)
+    copied = AsyncMock()
+    monkeypatch.setattr("vector_core.storage.embedding_migration._copy_indexes", copied)
+    client = embedder()
+    generation = await ensure_embedding_collection(
+        storage, "corpus", client, text, payload_indexes=declared
+    )
+    assert copied.await_args.args[2:] == (generation.physical_name, declared)
+    again = await ensure_embedding_collection(
+        storage, "corpus", client, text, payload_indexes=declared
+    )
+    assert again == generation
+    fresh = await ensure_embedding_collection(
+        storage, "corpus", embedder(), text, payload_indexes=declared
+    )
+    assert fresh.physical_name == generation.physical_name
+    assert ensured == [(generation.physical_name, declared)] * 2
 
 
 async def test_lock_is_task_reentrant_but_not_inherited_by_child(storage):
