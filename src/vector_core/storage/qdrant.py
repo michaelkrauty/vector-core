@@ -17,6 +17,7 @@ from qdrant_client.models import (
     FieldCondition,
     Filter,
     MatchValue,
+    PayloadSchemaParams,
     PayloadSchemaType,
     PointIdsList,
     PointStruct,
@@ -36,6 +37,10 @@ logger = logging.getLogger(__name__)
 
 # Type alias for point IDs - Qdrant accepts both int and str
 PointId = int | str
+
+# Schema for one payload index: a bare type such as PayloadSchemaType.KEYWORD, or
+# full parameters such as TextIndexParams for a tokenized full-text index
+PayloadIndexSchema = PayloadSchemaType | PayloadSchemaParams
 
 
 class QdrantConnectionError(Exception):
@@ -752,37 +757,45 @@ class QdrantStorage:
     async def ensure_payload_indexes(
         self,
         collection: str,
-        indexes: list[tuple[str, PayloadSchemaType]],
+        indexes: list[tuple[str, PayloadIndexSchema]],
     ) -> None:
         """
         Create payload indexes (idempotent).
 
-        Qdrant silently ignores requests to create indexes that already exist,
-        so this is safe to call on every startup.
+        Qdrant treats a request for an index that already exists with the same
+        schema as a no-op, so this is safe to call on every startup. A request
+        whose schema differs from the existing index rebuilds that index.
 
         Args:
             collection: Collection name
-            indexes: List of (field_name, schema_type) tuples
+            indexes: List of (field_name, schema) tuples. The schema is a
+                PayloadSchemaType or full index parameters such as
+                TextIndexParams.
 
         Example:
             await storage.ensure_payload_indexes("my_collection", [
                 ("type", PayloadSchemaType.KEYWORD),
                 ("confidence", PayloadSchemaType.FLOAT),
+                ("content", TextIndexParams(
+                    type=TextIndexType.TEXT,
+                    tokenizer=TokenizerType.WORD,
+                    lowercase=True,
+                )),
             ])
         """
         client = await self._get_client()
-        for field_name, schema_type in indexes:
+        for field_name, schema in indexes:
             await client.create_payload_index(
                 collection_name=collection,
                 field_name=field_name,
-                field_schema=schema_type,
+                field_schema=schema,
                 wait=True,
             )
 
     async def ensure_collection_with_indexes(
         self,
         collection_name: str,
-        payload_indexes: list[tuple[str, PayloadSchemaType]] | None = None,
+        payload_indexes: list[tuple[str, PayloadIndexSchema]] | None = None,
         dense_dim: int | None = None,
     ) -> bool:
         """
@@ -793,7 +806,7 @@ class QdrantStorage:
 
         Args:
             collection_name: Collection name
-            payload_indexes: Optional list of (field_name, schema_type) tuples
+            payload_indexes: Optional list of (field_name, schema) tuples
             dense_dim: Dense vector dimension (default from settings)
 
         Returns:
