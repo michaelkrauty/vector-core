@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
+from vector_core.embeddings import client as client_module
 from vector_core.embeddings import limiter as limiter_module
 from vector_core.embeddings.client import EmbeddingClient
 from vector_core.embeddings.limiter import GlobalRequestLimiter
@@ -312,14 +313,16 @@ def _embedding_response() -> httpx.Response:
     )
 
 
-def _recording_client(tmp_path: Path) -> tuple[EmbeddingClient, list[bool]]:
+def _recording_client(
+    tmp_path: Path, cache_namespace: str = ""
+) -> tuple[EmbeddingClient, list[bool]]:
     client = EmbeddingClient(
         dim=2,
         batch_size=1,
         global_concurrency=0,
         limiter_dir=tmp_path / "locks",
         cache_path=tmp_path / "cache.db",
-        cache_namespace="",
+        cache_namespace=cache_namespace,
     )
     priorities: list[bool] = []
 
@@ -361,6 +364,62 @@ async def test_identity_probe_takes_query_priority_without_leaking_it(tmp_path: 
     await client.embed_batch(["document"])
 
     assert priorities == [True, False]
+    await client.close()
+
+
+@pytest.mark.parametrize(
+    "method", ["embed_batch", "embed_all", "embed_single", "embed_single_cached"]
+)
+async def test_each_call_takes_priority_from_its_own_role_not_its_context(
+    tmp_path: Path, method: str
+) -> None:
+    client, priorities = _recording_client(tmp_path)
+    call = getattr(client, method)
+    texts = iter(["a", "b", "c", "d"])
+
+    for inherited in (True, False):
+        token = client_module._query_priority.set(inherited)
+        try:
+            for role in ("document", "query"):
+                text = next(texts)
+                await call([text] if method in {"embed_batch", "embed_all"} else text, role=role)
+        finally:
+            client_module._query_priority.reset(token)
+
+    assert priorities == [False, True, False, True]
+    await client.close()
+
+
+@pytest.mark.parametrize("cached", [False, True], ids=["uncached", "cache-hit"])
+async def test_document_work_started_from_query_progress_callback_runs_as_document(
+    tmp_path: Path, cached: bool
+) -> None:
+    client, priorities = _recording_client(tmp_path, cache_namespace="deployment" if cached else "")
+    if cached:
+        await client.embed_all(["a", "b"], role="query")
+        priorities.clear()
+    query_done = asyncio.Event()
+    started: list[asyncio.Task] = []
+    callback_priorities: list[bool] = []
+
+    async def background_indexing() -> None:
+        await query_done.wait()
+        await client.embed_batch(["document batch"])
+        await client.embed_all(["document all"])
+
+    def progress(completed: int, total: int) -> None:
+        callback_priorities.append(client_module._query_priority.get())
+        started.append(asyncio.create_task(background_indexing()))
+
+    await client.embed_all(["a", "b"], progress_cb=progress, role="query")
+    query_requests = len(priorities)
+    query_done.set()
+    await asyncio.gather(*started)
+
+    assert started
+    assert callback_priorities == [False] * len(started)
+    assert query_requests == (0 if cached else 2)
+    assert priorities == [True] * query_requests + [False] * (2 * len(started))
     await client.close()
 
 
@@ -420,6 +479,81 @@ def test_unexpected_flock_error_closes_every_descriptor(
     for fd in opened:
         with pytest.raises(OSError):
             os.fstat(fd)
+    assert limiter_module._held_fds == held_before
+
+
+class _PollClock:
+    """The limiter's ``asyncio``, where a full poll interval passes only on ``tick()``."""
+
+    def __init__(self) -> None:
+        self.polling = asyncio.Event()
+        self._tick = asyncio.Event()
+
+    async def sleep(self, delay: float) -> None:
+        if delay < limiter_module._POLL_INTERVAL:
+            await asyncio.sleep(delay)
+            return
+        self.polling.set()
+        await self._tick.wait()
+        self._tick.clear()
+
+    def tick(self) -> None:
+        self._tick.set()
+
+    def __getattr__(self, name: str):
+        return getattr(asyncio, name)
+
+
+async def test_query_whose_first_claim_meets_a_document_scan_still_goes_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    held_before = set(limiter_module._held_fds)
+    monkeypatch.setattr(limiter_module, "_POLL_INTERVAL", 0.05)
+    clock = _PollClock()
+    monkeypatch.setattr(limiter_module, "asyncio", clock)
+    holder = GlobalRequestLimiter(1, "scope", tmp_path)
+    query = GlobalRequestLimiter(1, "scope", tmp_path)
+    document = GlobalRequestLimiter(1, "scope", tmp_path)
+    claims: list[int | None] = []
+    claim = query._try_claim
+
+    def counted_claim() -> int | None:
+        claims.append(fd := claim())
+        return fd
+
+    query._try_claim = counted_claim  # type: ignore[method-assign]
+    entered = asyncio.Event()
+    leave = asyncio.Event()
+
+    async def wait_as_query() -> None:
+        async with query.acquire(interactive=True):
+            entered.set()
+            await leave.wait()
+
+    slot = holder._try_acquire()
+    assert slot is not None
+    # Another document request is in the middle of its scan, holding the gate.
+    gate = os.open(holder._scope_dir / "interactive.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(gate, fcntl.LOCK_EX)
+    waiter = asyncio.create_task(wait_as_query())
+    try:
+        await _until(lambda: bool(claims))
+        assert claims[0] is None
+    finally:
+        os.close(gate)
+
+    # The query's next full poll waits for tick(); meanwhile the slot frees up
+    # and a polling document request tries for it.
+    await asyncio.wait_for(clock.polling.wait(), timeout=10)
+    GlobalRequestLimiter._release(slot)
+    taken = document._try_acquire()
+    if taken is not None:
+        GlobalRequestLimiter._release(taken)
+    assert taken is None
+    clock.tick()
+    await asyncio.wait_for(entered.wait(), timeout=10)
+    leave.set()
+    await waiter
     assert limiter_module._held_fds == held_before
 
 

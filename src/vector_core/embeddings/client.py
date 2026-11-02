@@ -28,26 +28,51 @@ logger = logging.getLogger(__name__)
 EmbeddingRole = Literal["query", "document"]
 T = TypeVar("T")
 
-# True while a search-facing call runs in this context. Every HTTP attempt reads
-# it so the cross-process limiter serves those requests before document batches.
-# A context variable keeps _embed_prepared_batch(texts) unchanged for callers and
-# test doubles, and carries over into the batch tasks that embed_all() starts.
+# Priority of the embedding requests made in this context: True serves them
+# before document requests at the cross-process limiter. embed_batch() and
+# embed_all(), which every public embedding call goes through, set it from their
+# own role for their duration, so a call never inherits it from the context it
+# was started in. A context variable keeps _embed_prepared_batch(texts)
+# unchanged for callers and test doubles, and reaches the batch tasks that
+# embed_all() starts.
 _query_priority: ContextVar[bool] = ContextVar(
     "vector_core_embedding_query_priority", default=False
+)
+# Set only by resolve_identity() around its probe: the next embed_batch() or
+# embed_all() runs at query priority whatever its role, and clears the grant
+# for everything it calls or starts.
+_identity_probe: ContextVar[bool] = ContextVar(
+    "vector_core_embedding_identity_probe", default=False
 )
 
 
 @contextmanager
-def _prioritize_queries(enabled: bool) -> Iterator[None]:
-    """Give requests made inside the block query priority; otherwise inherit it."""
-    if not enabled:
-        yield
-        return
-    token = _query_priority.set(True)
+def _request_priority(role: EmbeddingRole) -> Iterator[None]:
+    """Run one embedding call at the priority of its own role or of the identity probe."""
+    priority = _query_priority.set(role == "query" or _identity_probe.get())
+    probe = _identity_probe.set(False)
     try:
         yield
     finally:
-        _query_priority.reset(token)
+        _identity_probe.reset(probe)
+        _query_priority.reset(priority)
+
+
+def _without_priority(
+    callback: Callable[[int, int], None] | None,
+) -> Callable[[int, int], None] | None:
+    """Run a caller's progress callback, and any task it starts, outside query priority."""
+    if callback is None:
+        return None
+
+    def call(completed: int, total: int) -> None:
+        token = _query_priority.set(False)
+        try:
+            callback(completed, total)
+        finally:
+            _query_priority.reset(token)
+
+    return call
 
 
 @dataclass(frozen=True)
@@ -444,7 +469,7 @@ class EmbeddingClient:
         self._check_identity()
         prepared = self._prepare_texts(texts, role=role)
         results = []
-        with _prioritize_queries(role == "query"):
+        with _request_priority(role):
             for _, batch in self._request_batches(prepared, role=role):
                 results.extend(await self._embed_prepared_batch(batch))
         return results
@@ -930,8 +955,11 @@ class EmbeddingClient:
             if self._identity is None:
                 # A diagnostic sentence can exceed an intentionally small input
                 # limit even when ordinary short documents are perfectly valid.
-                with _prioritize_queries(True):
+                token = _identity_probe.set(True)
+                try:
                     await self.embed_single("x")
+                finally:
+                    _identity_probe.reset(token)
                 self._identity = self._configured_identity()
             self._check_identity()
             return self._identity
@@ -1077,8 +1105,10 @@ class EmbeddingClient:
 
         self._check_identity()
         effective_texts = self._prepare_texts(texts, role=role)
-        with _prioritize_queries(role == "query"):
-            return await self._embed_all_effective(effective_texts, progress_cb, role=role)
+        with _request_priority(role):
+            return await self._embed_all_effective(
+                effective_texts, _without_priority(progress_cb), role=role
+            )
 
     async def _embed_all_effective(
         self,

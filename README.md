@@ -111,7 +111,8 @@ the queued batches of a bulk re-index in another process. In-flight requests are
 never interrupted and the limit is never exceeded. Document requests can be held
 back while queries keep arriving and resume as soon as none is waiting. The
 limiter uses `flock` lock files, so the cache directory must be on a local
-filesystem.
+filesystem, and these guarantees hold only while the lock files stay in place:
+never delete the limiter directory or its files while any process uses them.
 
 ### Cache
 

@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 _POLL_INTERVAL = 0.05
+_CLAIM_RETRY_INTERVAL = 0.001
 _INTERACTIVE_LOCK = "interactive.lock"
 
 _held_fds: set[int] = set()
@@ -48,13 +49,15 @@ class GlobalRequestLimiter:
     holds an exclusive ``flock`` on one slot for the duration of one HTTP
     attempt, and waiters poll without blocking the event loop.
 
-    Interactive (query) requests go ahead of document requests. A waiting
-    interactive request in any process holds a shared ``flock`` on the scope's
-    ``interactive.lock``; a document request tries for a slot only while it can
-    take that file exclusively, so a slot freed while a query waits goes to the
-    query. Requests already holding a slot are never interrupted and capacity
-    is never exceeded. Document requests can starve while interactive requests
-    keep arriving, and resume as soon as none is waiting.
+    Interactive (query) requests go ahead of document requests. An interactive
+    request that finds no free slot claims priority with a shared ``flock`` on
+    the scope's ``interactive.lock`` before it polls for a slot, retrying within
+    about a millisecond while a document scan holds that file. A document
+    request tries for a slot only while it can take that file exclusively, so a
+    slot freed while a query waits goes to the query. Requests already holding
+    a slot are never interrupted and capacity is never exceeded. Document
+    requests can starve while interactive requests keep arriving, and resume as
+    soon as none is waiting.
 
     Every lock lives on an open file description, which the kernel releases
     when its last descriptor closes, so a process that exits or is killed while
@@ -63,6 +66,11 @@ class GlobalRequestLimiter:
     file conflict even inside a single process. The lock directory must be on
     a local filesystem: Linux emulates ``flock`` on NFS with per-process POSIX
     record locks, which would not separate waiters within one process.
+
+    These guarantees hold only while the lock files stay in place. Deleting the
+    scope directory or a lock file while any process uses it lets later
+    requests lock a fresh file, so the limit can be exceeded and priority
+    claims are lost; stop every process using the scope before removing it.
     """
 
     def __init__(self, capacity: int, scope: str, lock_dir: Path) -> None:
@@ -186,18 +194,22 @@ class GlobalRequestLimiter:
         claim_fd: int | None = None
         owner_pid = os.getpid()
         try:
+            fd = self._try_acquire(interactive=interactive)
             while fd is None:
+                if interactive and claim_fd is None:
+                    claim_fd = self._try_claim()
+                # An unregistered query retries almost at once: a document scan
+                # holds the gate only briefly, and the query has no priority
+                # until its claim succeeds.
+                unclaimed = interactive and claim_fd is None
+                await asyncio.sleep(_CLAIM_RETRY_INTERVAL if unclaimed else _POLL_INTERVAL)
+                if os.getpid() != owner_pid:
+                    # Resumed in a child forked from this event loop: the
+                    # at-fork hook closed the inherited claim, so forget its
+                    # number and keep waiting as the child's own request.
+                    claim_fd = None
+                    owner_pid = os.getpid()
                 fd = self._try_acquire(interactive=interactive)
-                if fd is None:
-                    if interactive and claim_fd is None:
-                        claim_fd = self._try_claim()
-                    await asyncio.sleep(_POLL_INTERVAL)
-                    if os.getpid() != owner_pid:
-                        # Resumed in a child forked from this event loop: the
-                        # at-fork hook closed the inherited claim, so forget its
-                        # number and keep waiting as the child's own request.
-                        claim_fd = None
-                        owner_pid = os.getpid()
             if claim_fd is not None:
                 claim, claim_fd = claim_fd, None
                 self._release(claim)
