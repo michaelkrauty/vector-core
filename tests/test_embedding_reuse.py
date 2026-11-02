@@ -427,7 +427,8 @@ async def test_limiter_wraps_each_retry_attempt_not_retry_sleep() -> None:
     attempts: list[str] = []
 
     @asynccontextmanager
-    async def acquire():
+    async def acquire(*, interactive: bool = False):
+        assert interactive is False
         attempts.append("enter")
         try:
             yield

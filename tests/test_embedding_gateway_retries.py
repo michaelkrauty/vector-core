@@ -46,7 +46,8 @@ async def test_gateway_retry_budget_payload_limiter_and_final_error(
     events: list[str | float] = []
 
     @asynccontextmanager
-    async def acquire():
+    async def acquire(*, interactive: bool = False):
+        assert interactive is False
         events.append("enter")
         try:
             yield
