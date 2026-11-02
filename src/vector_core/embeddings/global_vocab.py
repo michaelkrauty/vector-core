@@ -22,7 +22,7 @@ from vector_core.embeddings.tokenization import (
     CAMEL_CASE_PATTERN,
     DEFAULT_STOP_TOKENS,
     IDENTIFIER_PATTERN,
-    levenshtein_similarity,
+    FuzzyCandidateIndex,
 )
 from vector_core.settings import settings
 from vector_core.utils.locking import file_lock
@@ -135,6 +135,11 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
         self._vocab_cache: dict[str, int] | None = None
         self._doc_freq_cache: dict[str, int] | None = None
         self._total_docs_cache: int | None = None
+        # Fuzzy-match candidates (live tokens grouped by length) together with
+        # the vocab and doc_freq snapshot objects they were built from.
+        self._fuzzy_index_cache: (
+            tuple[dict[str, int], dict[str, int], FuzzyCandidateIndex] | None
+        ) = None
         self._cache_lock = threading.Lock()
         # Cache TTL for multi-server consistency (configurable via settings)
         self._cache_ttl = cache_ttl if cache_ttl is not None else settings.global_vocab_cache_ttl
@@ -210,13 +215,18 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
             )
         # Future: add migration logic here if db_version < SCHEMA_VERSION
 
+    def _clear_caches_locked(self) -> None:
+        """Drop every in-memory cache. The caller must hold _cache_lock."""
+        self._vocab_cache = None
+        self._doc_freq_cache = None
+        self._total_docs_cache = None
+        self._fuzzy_index_cache = None
+        self._cache_timestamp = 0.0
+
     def _invalidate_cache(self) -> None:
         """Invalidate all in-memory caches."""
         with self._cache_lock:
-            self._vocab_cache = None
-            self._doc_freq_cache = None
-            self._total_docs_cache = None
-            self._cache_timestamp = 0.0
+            self._clear_caches_locked()
 
     def invalidate_cache(self) -> None:
         """Discard process-local vocabulary snapshots before a coordinated read."""
@@ -243,10 +253,7 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
             with self._cache_lock:
                 # Double-check after acquiring lock
                 if self._is_cache_expired():
-                    self._vocab_cache = None
-                    self._doc_freq_cache = None
-                    self._total_docs_cache = None
-                    self._cache_timestamp = 0.0
+                    self._clear_caches_locked()
 
     def _get_vocab(self) -> dict[str, int]:
         """Get vocabulary mapping (token -> index), using cache with TTL."""
@@ -967,6 +974,11 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
         Query vectors use IDF weights computed from global corpus statistics.
         This enables comparable scoring across all indexed codebases.
 
+        A query token found in the vocabulary is used as is, even when no
+        stored document contains it any more. With fuzzy enabled, any other
+        token is matched to the closest token that stored documents contain
+        (see _find_fuzzy_match), and its weight is discounted by the similarity.
+
         Args:
             query: Query text
             fuzzy: Whether to use fuzzy matching for unknown tokens
@@ -988,6 +1000,8 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
         seen_indices: set[int] = set()
         indices: list[int] = []
         values: list[float] = []
+        # Fetched on the first unknown token and reused for the rest of the query.
+        fuzzy_candidates: FuzzyCandidateIndex | None = None
 
         for token in tokens:
             if token in seen_tokens:
@@ -1000,7 +1014,9 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
             if token in vocab:
                 matched_token = token
             elif fuzzy:
-                matched_token, similarity = self._find_fuzzy_match(token, vocab, fuzzy_threshold)
+                if fuzzy_candidates is None:
+                    fuzzy_candidates = self._fuzzy_candidates(vocab, doc_freq)
+                matched_token, similarity = fuzzy_candidates.best_match(token, fuzzy_threshold)
 
             if matched_token:
                 idx = vocab[matched_token]
@@ -1025,45 +1041,59 @@ class GlobalVocabulary(ThreadSafeSQLiteStore):
 
         return SparseVector(indices=indices, values=values)
 
+    def _fuzzy_candidates(
+        self,
+        vocab: dict[str, int],
+        doc_freq: dict[str, int],
+    ) -> FuzzyCandidateIndex:
+        """Return the fuzzy-match candidates for one vocab/doc_freq snapshot.
+
+        Candidates are the vocabulary tokens with a positive aggregate document
+        frequency, in vocabulary iteration order. Token IDs are append-only, so
+        a token that no stored document contains any more stays in the
+        vocabulary with doc_freq 0; matching a query to it would add a
+        dimension that matches nothing.
+
+        The index is built on the first fuzzy lookup for a snapshot and reused
+        while the same vocab and doc_freq objects are in use. It is published
+        under _cache_lock only while both objects are still the current caches,
+        so it is cleared with them and never outlives or mixes snapshots.
+        """
+        with self._cache_lock:
+            cached = self._fuzzy_index_cache
+            if cached is not None and cached[0] is vocab and cached[1] is doc_freq:
+                return cached[2]
+            index = FuzzyCandidateIndex(token for token in vocab if doc_freq.get(token, 0) > 0)
+            if self._vocab_cache is vocab and self._doc_freq_cache is doc_freq:
+                self._fuzzy_index_cache = (vocab, doc_freq, index)
+            return index
+
     def _find_fuzzy_match(
         self,
         token: str,
         vocab: dict[str, int],
+        doc_freq: dict[str, int],
         threshold: float = 0.75,
     ) -> tuple[str | None, float]:
         """
-        Find closest vocabulary token using Levenshtein similarity.
+        Find the closest live vocabulary token using Levenshtein similarity.
+
+        Only tokens with doc_freq > 0 are candidates. Every candidate within
+        two characters of the token's length is scored with
+        levenshtein_similarity; the highest similarity that is at least
+        threshold wins, and ties go to the candidate that comes first in
+        vocab's iteration order.
 
         Args:
             token: Token to match
-            vocab: Vocabulary mapping
+            vocab: Vocabulary snapshot (token -> index)
+            doc_freq: Document frequency snapshot (token -> count)
             threshold: Minimum similarity threshold (0-1)
 
         Returns:
             Tuple of (best_match, similarity) or (None, 0.0) if no match
         """
-        if not vocab:
-            return None, 0.0
-
-        target_len = len(token)
-        best_match = None
-        best_score = 0.0
-
-        # Score every token within a small length window. |len(a) - len(b)| is a
-        # lower bound on edit distance, so tokens far apart in length cannot be
-        # close matches; this window prunes most of the vocabulary cheaply. The
-        # survivors are NOT capped: any fixed cap can drop the genuinely closest
-        # match, e.g. an insertion/deletion typo whose length differs by one
-        # could be crowded out by unrelated same-length tokens.
-        for candidate in vocab:
-            if abs(len(candidate) - target_len) > 2:
-                continue
-            score = levenshtein_similarity(token, candidate)
-            if score > best_score and score >= threshold:
-                best_score = score
-                best_match = candidate
-
-        return best_match, best_score
+        return self._fuzzy_candidates(vocab, doc_freq).best_match(token, threshold)
 
     def get_codebase_ids(self) -> list[str]:
         """Get every ID holding either a document count or token contribution."""

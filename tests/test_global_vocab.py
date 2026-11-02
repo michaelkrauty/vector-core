@@ -1,6 +1,7 @@
 """Tests for GlobalVocabulary (cross-codebase sparse vector search)."""
 
 import concurrent.futures
+import random
 import sqlite3
 import tempfile
 import threading
@@ -9,9 +10,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from vector_core.embeddings import global_vocab as global_vocab_module
 from vector_core.embeddings.global_vocab import GlobalVocabulary
 from vector_core.embeddings.sparse import SparseVector
 from vector_core.embeddings.tokenization import (
+    FuzzyCandidateIndex,
     levenshtein_distance,
     levenshtein_similarity,
 )
@@ -1179,7 +1182,7 @@ class TestEdgeCases:
         """Fuzzy matching with empty vocab returns None."""
         vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
 
-        match, sim = vocab._find_fuzzy_match("test", {}, 0.75)
+        match, sim = vocab._find_fuzzy_match("test", {}, {}, 0.75)
 
         assert match is None
         assert sim == 0.0
@@ -1293,6 +1296,22 @@ class TestLevenshteinDistance:
         # max_len = 3, distance = 3, similarity = 0
         assert sim == 0.0
 
+    def test_distance_matches_reference_dp_on_random_strings(self):
+        """levenshtein_distance equals a dynamic-programming reference."""
+        rng = random.Random(20261101)
+        for _ in range(3000):
+            s1 = _random_word(rng, 0, 14)
+            s2 = _mutate(rng, s1) if rng.random() < 0.5 else _random_word(rng, 0, 14)
+            assert levenshtein_distance(s1, s2) == _reference_levenshtein(s1, s2), (s1, s2)
+
+    def test_similarity_matches_reference_on_random_strings(self):
+        """levenshtein_similarity returns the reference's exact float, 0.0 for empty input."""
+        rng = random.Random(20261102)
+        for _ in range(3000):
+            s1 = _random_word(rng, 0, 14)
+            s2 = _mutate(rng, s1) if rng.random() < 0.5 else _random_word(rng, 0, 14)
+            assert levenshtein_similarity(s1, s2) == _reference_similarity(s1, s2), (s1, s2)
+
 
 class TestContextManagerAndCleanup:
     """Tests for context manager and cleanup (lines 780-791)."""
@@ -1399,7 +1418,7 @@ class TestFuzzyMatching:
 
         # Get vocabulary dict for testing private method
         vocab_dict = vocab._get_vocab()
-        match, score = vocab._find_fuzzy_match("hello", vocab_dict)
+        match, score = vocab._find_fuzzy_match("hello", vocab_dict, vocab._get_doc_freq())
 
         assert match == "hello"
         assert score == 1.0
@@ -1411,7 +1430,9 @@ class TestFuzzyMatching:
         vocab.register_codebase("test", [{"hello", "hallo", "world"}])
 
         vocab_dict = vocab._get_vocab()
-        match, score = vocab._find_fuzzy_match("helo", vocab_dict, threshold=0.6)
+        match, score = vocab._find_fuzzy_match(
+            "helo", vocab_dict, vocab._get_doc_freq(), threshold=0.6
+        )
 
         # "helo" is close to both "hello" and "hallo"
         assert match in ["hello", "hallo"]
@@ -1424,7 +1445,9 @@ class TestFuzzyMatching:
         vocab.register_codebase("test", [{"abcdefgh"}])
 
         vocab_dict = vocab._get_vocab()
-        match, score = vocab._find_fuzzy_match("xyz", vocab_dict, threshold=0.8)
+        match, score = vocab._find_fuzzy_match(
+            "xyz", vocab_dict, vocab._get_doc_freq(), threshold=0.8
+        )
 
         assert match is None
         assert score == 0.0
@@ -1434,7 +1457,7 @@ class TestFuzzyMatching:
         """Empty vocabulary returns None."""
         vocab = GlobalVocabulary(db_path=tmp_path / "test.db")
 
-        match, score = vocab._find_fuzzy_match("anything", {})
+        match, score = vocab._find_fuzzy_match("anything", {}, {})
 
         assert match is None
         assert score == 0.0
@@ -1448,7 +1471,9 @@ class TestFuzzyMatching:
 
         vocab_dict = vocab._get_vocab()
         # Looking for 4-char token, should only match similar lengths
-        match, score = vocab._find_fuzzy_match("abce", vocab_dict, threshold=0.5)
+        match, score = vocab._find_fuzzy_match(
+            "abce", vocab_dict, vocab._get_doc_freq(), threshold=0.5
+        )
 
         # Should match "abcd" (length 4), not the very long or very short ones
         if match is not None:
@@ -1463,7 +1488,9 @@ class TestFuzzyMatching:
 
         vocab_dict = vocab._get_vocab()
         # Find best match among similar tokens
-        match, score = vocab._find_fuzzy_match("testy", vocab_dict, threshold=0.6)
+        match, score = vocab._find_fuzzy_match(
+            "testy", vocab_dict, vocab._get_doc_freq(), threshold=0.6
+        )
 
         # Should find one of the similar tokens
         assert match is not None
@@ -1483,6 +1510,445 @@ class TestFuzzyMatchCandidateOrdering:
         # then the true match "hello" (length 5, one deletion from "helllo").
         vocab = {f"qqq{i:03d}": i for i in range(600)}
         vocab["hello"] = 600
-        match, sim = vocab_obj._find_fuzzy_match("helllo", vocab, 0.7)
+        doc_freq = dict.fromkeys(vocab, 1)
+        match, sim = vocab_obj._find_fuzzy_match("helllo", vocab, doc_freq, 0.7)
         assert match == "hello"
         assert sim >= 0.7
+
+
+# Reference implementation of fuzzy matching: a plain dynamic-programming edit
+# distance and the scan over every vocabulary token that GlobalVocabulary used
+# before candidates were indexed, restricted to tokens with doc_freq > 0.
+
+
+def _reference_levenshtein(s1: str, s2: str) -> int:
+    if len(s1) < len(s2):
+        s1, s2 = s2, s1
+    if len(s2) == 0:
+        return len(s1)
+    previous_row = list(range(len(s2) + 1))
+    for i, c1 in enumerate(s1):
+        current_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            insertions = previous_row[j + 1] + 1
+            deletions = current_row[j] + 1
+            substitutions = previous_row[j] + (c1 != c2)
+            current_row.append(min(insertions, deletions, substitutions))
+        previous_row = current_row
+    return previous_row[-1]
+
+
+def _reference_similarity(s1: str, s2: str) -> float:
+    if not s1 or not s2:
+        return 0.0
+    return 1.0 - (_reference_levenshtein(s1, s2) / max(len(s1), len(s2)))
+
+
+def _reference_fuzzy_match(
+    token: str, vocab: dict[str, int], doc_freq: dict[str, int], threshold: float
+) -> tuple[str | None, float]:
+    best_match = None
+    best_score = 0.0
+    for candidate in vocab:
+        if doc_freq.get(candidate, 0) <= 0:
+            continue
+        if abs(len(candidate) - len(token)) > 2:
+            continue
+        score = _reference_similarity(token, candidate)
+        if score > best_score and score >= threshold:
+            best_score = score
+            best_match = candidate
+    return best_match, best_score
+
+
+# A small alphabet makes near-duplicates and equal scores common; the non-ASCII
+# characters (two-byte, CJK, astral) check that matching works on code points.
+_FUZZ_ALPHABET = "abcdeé字🙂"
+
+
+def _random_word(rng: random.Random, min_len: int = 1, max_len: int = 10) -> str:
+    return "".join(rng.choice(_FUZZ_ALPHABET) for _ in range(rng.randint(min_len, max_len)))
+
+
+def _mutate(rng: random.Random, word: str) -> str:
+    """Apply one to three random single-character edits."""
+    chars = list(word)
+    for _ in range(rng.randint(1, 3)):
+        op = rng.choice(("insert", "delete", "substitute"))
+        if op == "insert" or not chars:
+            chars.insert(rng.randint(0, len(chars)), rng.choice(_FUZZ_ALPHABET))
+        elif op == "delete":
+            del chars[rng.randrange(len(chars))]
+        else:
+            chars[rng.randrange(len(chars))] = rng.choice(_FUZZ_ALPHABET)
+    return "".join(chars)
+
+
+def _random_vocabulary(rng: random.Random, size: int) -> tuple[dict[str, int], dict[str, int]]:
+    """Vocabulary in generation order, about a third of it with doc_freq 0."""
+    vocab: dict[str, int] = {}
+    while len(vocab) < size:
+        if vocab and rng.random() < 0.6:
+            word = _mutate(rng, rng.choice(list(vocab)))
+        else:
+            word = _random_word(rng)
+        if word and word not in vocab:
+            vocab[word] = len(vocab)
+    doc_freq = {token: 0 if rng.random() < 0.35 else rng.randint(1, 5) for token in vocab}
+    return vocab, doc_freq
+
+
+def _random_query_token(rng: random.Random, vocab: dict[str, int]) -> str:
+    roll = rng.random()
+    if roll < 0.6:
+        return _mutate(rng, rng.choice(list(vocab)))
+    if roll < 0.75:
+        return rng.choice(list(vocab))
+    if roll < 0.98:
+        return _random_word(rng)
+    return ""
+
+
+_THRESHOLDS = (0.0, 0.3, 0.5, 0.6, 2 / 3, 0.7, 0.75, 0.8, 0.875, 0.9, 1.0)
+
+
+class _CoverageCounts:
+    """How often generated cases hit the situations the differential test targets."""
+
+    def __init__(self) -> None:
+        self.matches = 0
+        self.ties = 0
+        self.cross_length_ties = 0
+        self.closer_zero_frequency = 0
+
+    def record(
+        self,
+        token: str,
+        vocab: dict[str, int],
+        doc_freq: dict[str, int],
+        threshold: float,
+        expected: tuple[str | None, float],
+    ) -> None:
+        match, score = expected
+        if match is None:
+            return
+        self.matches += 1
+        tied = [
+            candidate
+            for candidate in vocab
+            if doc_freq.get(candidate, 0) > 0
+            and abs(len(candidate) - len(token)) <= 2
+            and _reference_similarity(token, candidate) == score
+        ]
+        if len(tied) > 1:
+            self.ties += 1
+            if len({len(candidate) for candidate in tied}) > 1:
+                self.cross_length_ties += 1
+        if any(
+            doc_freq.get(candidate, 0) <= 0
+            and abs(len(candidate) - len(token)) <= 2
+            and _reference_similarity(token, candidate) > score
+            for candidate in vocab
+        ):
+            self.closer_zero_frequency += 1
+
+
+class TestFuzzyMatchDifferential:
+    """_find_fuzzy_match returns exactly what the reference scan over live
+    tokens returns: the same token and the identical similarity float."""
+
+    def test_matches_reference_on_random_vocabularies(self, tmp_path):
+        vocab_obj = GlobalVocabulary(db_path=tmp_path / "diff.db")
+        rng = random.Random(1101)
+        counts = _CoverageCounts()
+        for _ in range(25):
+            vocab, doc_freq = _random_vocabulary(rng, rng.randint(20, 160))
+            for _ in range(60):
+                token = _random_query_token(rng, vocab)
+                threshold = rng.choice((*_THRESHOLDS, rng.random()))
+                expected = _reference_fuzzy_match(token, vocab, doc_freq, threshold)
+                actual = vocab_obj._find_fuzzy_match(token, vocab, doc_freq, threshold)
+                assert actual == expected, (token, threshold)
+                counts.record(token, vocab, doc_freq, threshold, expected)
+        vocab_obj.close()
+
+        # The generated cases must exercise ties (including ties between
+        # candidates of different lengths) and zero-frequency tokens that would
+        # have won, or the comparison above proves little.
+        assert counts.matches >= 300
+        assert counts.ties >= 50
+        assert counts.cross_length_ties >= 20
+        assert counts.closer_zero_frequency >= 20
+
+    def test_matches_reference_on_registered_vocabulary(self, tmp_path):
+        """Same comparison on snapshots read from SQLite after a codebase is removed."""
+        vocab_obj = GlobalVocabulary(db_path=tmp_path / "diff.db")
+        rng = random.Random(1102)
+        vocab, _ = _random_vocabulary(rng, 400)
+        tokens = list(vocab)
+        kept = [set(rng.sample(tokens, 40)) for _ in range(10)]
+        removed = [set(rng.sample(tokens, 40)) for _ in range(10)]
+        vocab_obj.register_codebase("kept", kept)
+        vocab_obj.register_codebase("removed", removed)
+        vocab_obj.unregister_codebase("removed")
+
+        snapshot = vocab_obj._get_vocab()
+        doc_freq = vocab_obj._get_doc_freq()
+        assert any(doc_freq[token] == 0 for token in snapshot)
+        for _ in range(400):
+            token = _random_query_token(rng, snapshot)
+            threshold = rng.choice(_THRESHOLDS)
+            expected = _reference_fuzzy_match(token, snapshot, doc_freq, threshold)
+            assert vocab_obj._find_fuzzy_match(token, snapshot, doc_freq, threshold) == (
+                expected
+            ), (token, threshold)
+        vocab_obj.close()
+
+
+class TestFuzzyMatchSemantics:
+    """Boundary, tie and length-window rules of _find_fuzzy_match."""
+
+    def test_score_equal_to_threshold_matches(self, tmp_path):
+        """Distance 2 at length 8 scores exactly 0.75, which meets threshold 0.75."""
+        vocab_obj = GlobalVocabulary(db_path=tmp_path / "fz.db")
+        vocab = {"abcdefxy": 0}
+        doc_freq = {"abcdefxy": 1}
+
+        assert vocab_obj._find_fuzzy_match("abcdefgh", vocab, doc_freq, 0.75) == (
+            "abcdefxy",
+            0.75,
+        )
+        assert vocab_obj._find_fuzzy_match("abcdefgh", vocab, doc_freq, 0.7500001) == (None, 0.0)
+        vocab_obj.close()
+
+    def test_tie_goes_to_first_token_in_iteration_order(self, tmp_path):
+        vocab_obj = GlobalVocabulary(db_path=tmp_path / "fz.db")
+        forward = {"abcx": 0, "abcy": 1}
+        backward = {"abcy": 0, "abcx": 1}
+        doc_freq = {"abcx": 1, "abcy": 1}
+
+        assert vocab_obj._find_fuzzy_match("abcz", forward, doc_freq, 0.7) == ("abcx", 0.75)
+        assert vocab_obj._find_fuzzy_match("abcz", backward, doc_freq, 0.7) == ("abcy", 0.75)
+        vocab_obj.close()
+
+    def test_tie_between_lengths_goes_to_first_token_in_iteration_order(self, tmp_path):
+        """A deletion and a substitution both score 1 - 1/8; order decides, not length."""
+        vocab_obj = GlobalVocabulary(db_path=tmp_path / "fz.db")
+        doc_freq = {"abcdefgx": 1, "abcdefg": 1}
+
+        longer_first = {"abcdefgx": 0, "abcdefg": 1}
+        shorter_first = {"abcdefg": 0, "abcdefgx": 1}
+
+        assert vocab_obj._find_fuzzy_match("abcdefgh", longer_first, doc_freq, 0.75) == (
+            "abcdefgx",
+            0.875,
+        )
+        assert vocab_obj._find_fuzzy_match("abcdefgh", shorter_first, doc_freq, 0.75) == (
+            "abcdefg",
+            0.875,
+        )
+        vocab_obj.close()
+
+    def test_length_window_excludes_three_character_difference(self, tmp_path):
+        """A 3-character length gap is excluded even though its score would pass."""
+        vocab_obj = GlobalVocabulary(db_path=tmp_path / "fz.db")
+        token = "abcdefghijkl"
+        too_short = "abcdefghi"
+        assert levenshtein_similarity(token, too_short) == 0.75
+
+        vocab = {too_short: 0}
+        assert vocab_obj._find_fuzzy_match(token, vocab, {too_short: 1}, 0.7) == (None, 0.0)
+
+        vocab = {too_short: 0, "abcdefghij": 1}
+        doc_freq = {too_short: 1, "abcdefghij": 1}
+        match, score = vocab_obj._find_fuzzy_match(token, vocab, doc_freq, 0.7)
+        assert match == "abcdefghij"
+        assert score == levenshtein_similarity(token, "abcdefghij")
+        vocab_obj.close()
+
+    def test_zero_frequency_and_missing_tokens_are_not_candidates(self, tmp_path):
+        vocab_obj = GlobalVocabulary(db_path=tmp_path / "fz.db")
+        vocab = {"parser": 0, "parses": 1, "parsers": 2}
+        doc_freq = {"parser": 0, "parsers": 1}
+
+        assert vocab_obj._find_fuzzy_match("parsr", vocab, doc_freq, 0.7) == (
+            "parsers",
+            levenshtein_similarity("parsr", "parsers"),
+        )
+        vocab_obj.close()
+
+
+class TestFuzzyMatchSkipsRemovedTokens:
+    """Tokens that no stored document contains are not fuzzy-match targets.
+
+    "parsr" is one edit from "parser" (similarity 5/6) and two from "parsers"
+    (similarity 5/7).
+    """
+
+    def test_zero_frequency_token_not_chosen_after_unregister(self, tmp_path):
+        vocab = GlobalVocabulary(db_path=tmp_path / "fz.db")
+        vocab.register_codebase("live", [{"parsers", "other"}])
+        vocab.register_codebase("gone", [{"parser"}])
+        indices = vocab._get_vocab()
+
+        before = vocab.vectorize_query("parsr", fuzzy_threshold=0.7)
+        assert before.indices == [indices["parser"]]
+
+        vocab.unregister_codebase("gone")
+        assert vocab._get_vocab()["parser"] == indices["parser"]
+        assert vocab._get_doc_freq()["parser"] == 0
+
+        after = vocab.vectorize_query("parsr", fuzzy_threshold=0.7)
+        assert after.indices == [indices["parsers"]]
+        total = vocab.total_docs
+        idf = global_vocab_module.math.log((total + 1) / (1 + 1)) + 1
+        assert after.values == [idf * levenshtein_similarity("parsr", "parsers")]
+        vocab.close()
+
+    def test_no_fuzzy_match_without_live_candidate(self, tmp_path):
+        vocab = GlobalVocabulary(db_path=tmp_path / "fz.db")
+        vocab.register_codebase("live", [{"unrelated"}])
+        vocab.register_codebase("gone", [{"parser"}])
+        vocab.unregister_codebase("gone")
+
+        assert vocab.vectorize_query("parsr", fuzzy_threshold=0.7).indices == []
+        assert vocab._find_fuzzy_match("parsr", vocab._get_vocab(), vocab._get_doc_freq(), 0.7) == (
+            None,
+            0.0,
+        )
+        vocab.close()
+
+    def test_exact_match_on_zero_frequency_token_unchanged(self, tmp_path):
+        vocab = GlobalVocabulary(db_path=tmp_path / "fz.db")
+        vocab.register_codebase("live", [{"unrelated"}])
+        vocab.register_codebase("gone", [{"parser"}])
+        vocab.unregister_codebase("gone")
+
+        result = vocab.vectorize_query("parser")
+        assert result.indices == [vocab._get_vocab()["parser"]]
+        total = vocab.total_docs
+        assert result.values == [global_vocab_module.math.log((total + 1) / 1) + 1]
+        vocab.close()
+
+
+@pytest.fixture
+def index_builds(monkeypatch):
+    """Record every FuzzyCandidateIndex that GlobalVocabulary builds."""
+    builds: list[FuzzyCandidateIndex] = []
+
+    class RecordingIndex(FuzzyCandidateIndex):
+        def __init__(self, tokens):
+            super().__init__(tokens)
+            builds.append(self)
+
+    monkeypatch.setattr(global_vocab_module, "FuzzyCandidateIndex", RecordingIndex)
+    return builds
+
+
+class TestFuzzyCandidateIndexLifecycle:
+    """The candidate index is built lazily per vocab/doc_freq snapshot, reused
+    for that snapshot, and dropped with the other caches."""
+
+    def test_not_rebuilt_between_lookups_on_same_snapshot(self, tmp_path, index_builds):
+        vocab = GlobalVocabulary(db_path=tmp_path / "fz.db", cache_ttl=3600)
+        vocab.register_codebase("cb", [{"parsers", "alpha"}])
+
+        vocab.vectorize_query("alpha parsers")
+        vocab.vectorize_query("parsr", fuzzy=False)
+        assert index_builds == []
+
+        vocab.vectorize_query("parsr alpah betta", fuzzy_threshold=0.7)
+        vocab.vectorize_query("parsr", fuzzy_threshold=0.7)
+        vocab._find_fuzzy_match("alpah", vocab._get_vocab(), vocab._get_doc_freq(), 0.6)
+
+        assert len(index_builds) == 1
+        assert vocab._fuzzy_index_cache is not None
+        assert vocab._fuzzy_index_cache[2] is index_builds[0]
+        vocab.close()
+
+    def test_rebuilt_after_invalidation(self, tmp_path, index_builds):
+        vocab = GlobalVocabulary(db_path=tmp_path / "fz.db", cache_ttl=3600)
+        vocab.register_codebase("cb", [{"parsers"}])
+        vocab.vectorize_query("parsr", fuzzy_threshold=0.7)
+        assert len(index_builds) == 1
+
+        vocab.invalidate_cache()
+        assert vocab._fuzzy_index_cache is None
+
+        vocab.vectorize_query("parsr", fuzzy_threshold=0.7)
+        assert len(index_builds) == 2
+        assert vocab._fuzzy_index_cache is not None
+        assert vocab._fuzzy_index_cache[0] is vocab._vocab_cache
+        assert vocab._fuzzy_index_cache[1] is vocab._doc_freq_cache
+        vocab.close()
+
+    def test_rebuilt_after_ttl_expiry(self, tmp_path, index_builds):
+        vocab = GlobalVocabulary(db_path=tmp_path / "fz.db", cache_ttl=3600)
+        vocab.register_codebase("cb", [{"parsers"}])
+        vocab.vectorize_query("parsr", fuzzy_threshold=0.7)
+        first_snapshot = vocab._vocab_cache
+        assert len(index_builds) == 1
+
+        # Age the cache past its TTL instead of waiting for it.
+        vocab._cache_timestamp -= 7200
+        vocab.vectorize_query("parsr", fuzzy_threshold=0.7)
+
+        assert vocab._vocab_cache is not first_snapshot
+        assert len(index_builds) == 2
+        assert vocab._fuzzy_index_cache is not None
+        assert vocab._fuzzy_index_cache[2] is index_builds[1]
+        vocab.close()
+
+    def test_token_live_after_register_is_found(self, tmp_path):
+        vocab = GlobalVocabulary(db_path=tmp_path / "fz.db", cache_ttl=3600)
+        vocab.register_codebase("base", [{"alpha"}])
+        assert vocab.vectorize_query("parsr", fuzzy_threshold=0.7).indices == []
+
+        vocab.register_codebase("new", [{"parser"}])
+
+        assert vocab.vectorize_query("parsr", fuzzy_threshold=0.7).indices == [
+            vocab._get_vocab()["parser"]
+        ]
+        vocab.close()
+
+    def test_token_live_after_incremental_update_is_found(self, tmp_path):
+        vocab = GlobalVocabulary(db_path=tmp_path / "fz.db", cache_ttl=3600)
+        vocab.register_codebase("cb", [{"alpha"}, {"parser"}])
+        vocab.update_codebase_incremental(
+            "cb", added_tokens=[], removed_tokens=[{"parser"}], net_doc_change=-1
+        )
+        assert vocab._get_doc_freq()["parser"] == 0
+        assert vocab.vectorize_query("parsr", fuzzy_threshold=0.7).indices == []
+
+        vocab.update_codebase_incremental(
+            "cb", added_tokens=[{"parser"}], removed_tokens=[], net_doc_change=1
+        )
+
+        assert vocab.vectorize_query("parsr", fuzzy_threshold=0.7).indices == [
+            vocab._get_vocab()["parser"]
+        ]
+        vocab.close()
+
+    def test_index_tied_to_both_snapshot_objects(self, tmp_path):
+        """A cached index is not used with a doc_freq snapshot it was not built from."""
+        vocab = GlobalVocabulary(db_path=tmp_path / "fz.db", cache_ttl=3600)
+        vocab.register_codebase("cb", [{"parser", "parsers"}])
+        snapshot = vocab._get_vocab()
+        doc_freq = vocab._get_doc_freq()
+        assert vocab._find_fuzzy_match("parsr", snapshot, doc_freq, 0.7)[0] == "parser"
+
+        newer_doc_freq = {**doc_freq, "parser": 0}
+        assert vocab._find_fuzzy_match("parsr", snapshot, newer_doc_freq, 0.7)[0] == "parsers"
+        vocab.close()
+
+    def test_index_for_superseded_snapshot_is_not_published(self, tmp_path):
+        """A lookup on a snapshot that was invalidated meanwhile does not repopulate the cache."""
+        vocab = GlobalVocabulary(db_path=tmp_path / "fz.db", cache_ttl=3600)
+        vocab.register_codebase("cb", [{"parser"}])
+        snapshot = vocab._get_vocab()
+        doc_freq = vocab._get_doc_freq()
+        vocab.invalidate_cache()
+
+        assert vocab._find_fuzzy_match("parsr", snapshot, doc_freq, 0.7)[0] == "parser"
+        assert vocab._fuzzy_index_cache is None
+        vocab.close()

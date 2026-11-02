@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.10.2] - 2026-11-01
+
+### Fixed
+
+- Fuzzy query-token matching is about a hundred times faster (#58). `vectorize_query` matches each query token that is not in the vocabulary to its closest vocabulary token, and that search scored every candidate with a pure-Python edit distance, which cost about half a second per unknown token on a 160k-token vocabulary. Consumers that build query vectors on the event loop stalled for seconds on a query with a few misspellings. Candidates are now grouped by length once per vocabulary snapshot and scored with rapidfuzz, which takes a few milliseconds per token. Matches and similarities are unchanged: the same length window, threshold, normalization and tie order apply.
+- Fuzzy matching no longer resolves a query token to a vocabulary token that no stored document contains. Token IDs are append-only, so a token whose last document was removed stays in the vocabulary with a document frequency of zero, and a misspelling could match it in place of a live term. Exact matches are unchanged.
+
+### Changed
+
+- New runtime dependency on `rapidfuzz` (`>=3.9,<4`). `levenshtein_distance` and `levenshtein_similarity` now use it and return the same values as before.
+
 ## [1.10.1] - 2026-11-01
 
 ### Fixed

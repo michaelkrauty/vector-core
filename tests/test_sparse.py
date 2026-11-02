@@ -1,10 +1,12 @@
 """Tests for SparseVectorizer (TF-IDF sparse vectors for hybrid search)."""
 
 import math
+import random
 
 import pytest
 
 from vector_core.embeddings.sparse import SparseVector, SparseVectorizer
+from vector_core.embeddings.tokenization import FuzzyCandidateIndex, levenshtein_similarity
 
 
 class TestSparseVector:
@@ -537,3 +539,66 @@ class TestFuzzyMatchCandidateOrdering:
         match, sim = vectorizer._find_fuzzy_match("helllo", 0.7)
         assert match == "hello"
         assert sim >= 0.7
+
+
+def _reference_fuzzy_match(
+    token: str, vocab: dict[str, int], threshold: float
+) -> tuple[str | None, float]:
+    """Scan of every vocabulary token, as SparseVectorizer matched before indexing."""
+    best_match = None
+    best_score = 0.0
+    for candidate in vocab:
+        if abs(len(candidate) - len(token)) > 2:
+            continue
+        score = levenshtein_similarity(token, candidate)
+        if score > best_score and score >= threshold:
+            best_score = score
+            best_match = candidate
+    return best_match, best_score
+
+
+class TestFuzzyMatchSemantics:
+    """SparseVectorizer matches with the shared FuzzyCandidateIndex rules."""
+
+    def test_tie_goes_to_first_token_in_vocabulary_order(self):
+        vectorizer = SparseVectorizer()
+        vectorizer._vocab = {"abcdefgx": 0, "abcdefg": 1}
+        assert vectorizer._find_fuzzy_match("abcdefgh", 0.75) == ("abcdefgx", 0.875)
+
+        vectorizer._vocab = {"abcdefg": 0, "abcdefgx": 1}
+        assert vectorizer._find_fuzzy_match("abcdefgh", 0.75) == ("abcdefg", 0.875)
+
+    def test_score_equal_to_threshold_matches(self):
+        vectorizer = SparseVectorizer()
+        vectorizer._vocab = {"abcdefxy": 0}
+        assert vectorizer._find_fuzzy_match("abcdefgh", 0.75) == ("abcdefxy", 0.75)
+
+    def test_prebuilt_candidates_give_same_result(self):
+        vectorizer = SparseVectorizer()
+        vectorizer.fit(["parser parsers handler handle", "parse token tokens"])
+        candidates = FuzzyCandidateIndex(vectorizer._vocab)
+        for token in ("parsr", "handel", "tokn", "zzzz"):
+            assert vectorizer._find_fuzzy_match(token, 0.7, candidates) == (
+                vectorizer._find_fuzzy_match(token, 0.7)
+            )
+
+    def test_matches_reference_on_random_vocabularies(self):
+        rng = random.Random(2201)
+        alphabet = "abcdeé字"
+        thresholds = (0.0, 0.5, 2 / 3, 0.7, 0.75, 0.8, 0.875, 1.0)
+        vectorizer = SparseVectorizer()
+        for _ in range(20):
+            vocab: dict[str, int] = {}
+            for _ in range(rng.randint(10, 120)):
+                word = "".join(rng.choice(alphabet) for _ in range(rng.randint(1, 9)))
+                vocab.setdefault(word, len(vocab))
+            vectorizer._vocab = vocab
+            for _ in range(50):
+                base = rng.choice(list(vocab))
+                token = "".join(
+                    rng.choice(alphabet) if rng.random() < 0.2 else ch for ch in base
+                ) + ("" if rng.random() < 0.5 else rng.choice(alphabet))
+                threshold = rng.choice(thresholds)
+                assert vectorizer._find_fuzzy_match(token, threshold) == (
+                    _reference_fuzzy_match(token, vocab, threshold)
+                ), (token, threshold)
