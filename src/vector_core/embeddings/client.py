@@ -943,6 +943,16 @@ class EmbeddingClient:
         if self._identity is not None and self._configured_identity() != self._identity:
             raise EmbeddingServiceError("Embedding configuration changed on a bound client")
 
+    def resolved_identity(self) -> EmbeddingIdentity | None:
+        """Return the identity resolve_identity() fixed, without contacting the backend.
+
+        None means it has not been resolved yet or the configuration has changed
+        since, so only resolve_identity() can decide (and reject a mutation).
+        """
+        if self._identity is None or self._configured_identity() != self._identity:
+            return None
+        return self._identity
+
     async def resolve_identity(self) -> EmbeddingIdentity:
         """Probe the backend once before binding an index to this client.
 

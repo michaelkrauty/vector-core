@@ -1,6 +1,8 @@
 """Migration contracts exercised against an isolated in-memory Qdrant instance."""
 
 import asyncio
+import sys
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -17,11 +19,14 @@ from qdrant_client.models import (
 from vector_core.embeddings.client import EmbeddingClient, EmbeddingServiceError
 from vector_core.embeddings.identity import EmbeddingIdentity
 from vector_core.settings import settings
+from vector_core.storage import embedding_migration as migration
 from vector_core.storage.embedding_fragments import source_hash
 from vector_core.storage.embedding_migration import (
+    CollectionGeneration,
     EmbeddingMigrationError,
     _copy_indexes,
     active_embedding_collection,
+    current_embedding_binding,
     embedding_collection_lock,
     ensure_embedding_collection,
 )
@@ -435,3 +440,301 @@ def test_identity_is_stable_complete_and_normalizes_optional_namespace():
     assert EmbeddingIdentity.from_dict(base.to_dict()) == base
     assert base.fingerprint == same.fingerprint
     assert base.fingerprint != EmbeddingIdentity("model", "revision", base.endpoint, 3).fingerprint
+
+
+async def test_resolved_identity_is_reported_without_probing():
+    client = embedder()
+    assert client.resolved_identity() is None
+    client.embed_single.assert_not_awaited()
+    identity = await client.resolve_identity()
+    assert client.resolved_identity() == identity
+    client.model = "changed"
+    assert client.resolved_identity() is None
+    client.embed_single.assert_awaited_once()
+
+
+@pytest.fixture
+def lock_entries(monkeypatch):
+    """Record each entry into the collection lock by ensure_embedding_collection()."""
+    entries = []
+    original = migration.embedding_collection_lock
+
+    @asynccontextmanager
+    async def recording(storage, logical_name):
+        entries.append(logical_name)
+        async with original(storage, logical_name):
+            yield
+
+    monkeypatch.setattr(migration, "embedding_collection_lock", recording)
+    return entries
+
+
+async def test_bound_client_resolves_while_another_task_holds_the_lock(storage, lock_entries):
+    await seed(storage)
+    client = embedder()
+    generation = await ensure_embedding_collection(storage, "corpus", client, text)
+    held, release = asyncio.Event(), asyncio.Event()
+
+    async def writer():
+        async with embedding_collection_lock(storage, "corpus"):
+            held.set()
+            await release.wait()
+
+    task = asyncio.create_task(writer())
+    try:
+        await held.wait()
+        lock_entries.clear()
+        # Deadlock guard only: without the lock-free path this waits for release.
+        bound = await asyncio.wait_for(
+            ensure_embedding_collection(storage, "corpus", client, text), timeout=10
+        )
+        assert bound == generation
+        assert lock_entries == []
+    finally:
+        release.set()
+        await task
+
+
+_HOLD_LOCK_IN_ANOTHER_PROCESS = """
+import asyncio
+import sys
+from pathlib import Path
+
+from vector_core.settings import settings
+from vector_core.storage.embedding_migration import embedding_collection_lock
+from vector_core.storage.qdrant import QdrantStorage
+
+
+async def main():
+    settings.cache_dir = Path(sys.argv[1])
+    async with embedding_collection_lock(QdrantStorage(url=sys.argv[2]), "corpus"):
+        print("locked", flush=True)
+        await asyncio.to_thread(sys.stdin.readline)
+
+
+asyncio.run(main())
+"""
+
+
+async def test_bound_client_resolves_while_another_process_holds_the_lock(
+    storage, tmp_path, lock_entries
+):
+    await seed(storage)
+    client = embedder()
+    generation = await ensure_embedding_collection(storage, "corpus", client, text)
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        _HOLD_LOCK_IN_ANOTHER_PROCESS,
+        str(tmp_path),
+        storage.url,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+    )
+    assert process.stdin is not None and process.stdout is not None
+    try:
+        assert await asyncio.wait_for(process.stdout.readline(), timeout=60) == b"locked\n"
+        lock_entries.clear()
+        bound = await asyncio.wait_for(
+            ensure_embedding_collection(storage, "corpus", client, text), timeout=10
+        )
+        assert bound == generation
+        assert lock_entries == []
+    finally:
+        process.stdin.write(b"\n")
+        await process.stdin.drain()
+        assert await asyncio.wait_for(process.wait(), timeout=60) == 0
+
+
+async def test_unbound_client_takes_the_lock_and_binds_as_before(storage, lock_entries):
+    await seed(storage)
+    generation = await ensure_embedding_collection(storage, "corpus", embedder(), text)
+    client = embedder()
+    await client.resolve_identity()
+    assert await current_embedding_binding(storage, "corpus", client) is None
+    lock_entries.clear()
+    bound = await ensure_embedding_collection(storage, "corpus", client, text)
+    assert bound == CollectionGeneration(
+        "corpus", generation.physical_name, generation.identity, False
+    )
+    assert lock_entries == ["corpus"]
+    assert await ensure_embedding_collection(storage, "corpus", client, text) == bound
+    assert lock_entries == ["corpus"]
+
+
+async def test_unresolved_identity_takes_the_lock_without_probing(storage, lock_entries):
+    await seed(storage)
+    client = embedder()
+    # A replaced probe binds without resolving the client, as consumer fixtures do.
+    client.resolve_identity = AsyncMock(return_value=client.configured_identity())
+    generation = await ensure_embedding_collection(storage, "corpus", client, text)
+    assert client.resolved_identity() is None
+    client.resolve_identity.reset_mock()
+    client.embed_single.reset_mock()
+    assert await current_embedding_binding(storage, "corpus", client) is None
+    client.resolve_identity.assert_not_awaited()
+    client.embed_single.assert_not_awaited()
+    lock_entries.clear()
+    assert await ensure_embedding_collection(storage, "corpus", client, text) == generation
+    assert lock_entries == ["corpus"]
+    client.resolve_identity.assert_awaited_once()
+
+
+async def test_payload_index_request_not_yet_ensured_takes_the_lock(
+    storage, monkeypatch, lock_entries
+):
+    await seed(storage)
+    ensured = []
+
+    async def record(collection, indexes):
+        ensured.append((collection, list(indexes)))
+
+    monkeypatch.setattr(storage, "ensure_payload_indexes", record)
+    client = embedder()
+    generation = await ensure_embedding_collection(storage, "corpus", client, text)
+    keyword = ("type", PayloadSchemaType.KEYWORD)
+    plain = ("content", TextIndexParams(type="text", tokenizer="word", lowercase=True))
+    phrase = (
+        "content",
+        TextIndexParams(type="text", tokenizer="word", lowercase=True, phrase_matching=True),
+    )
+    requests = [
+        ([keyword], True),
+        ([keyword], False),
+        ([], False),
+        ([plain], True),
+        ([plain, keyword], False),
+        ([phrase], True),
+        ([plain], True),
+        ([keyword, plain], False),
+    ]
+    for indexes, locked in requests:
+        lock_entries.clear()
+        ensured.clear()
+        bound = await ensure_embedding_collection(
+            storage, "corpus", client, text, payload_indexes=indexes
+        )
+        assert bound == generation
+        assert lock_entries == (["corpus"] if locked else []), indexes
+        assert ensured == ([(generation.physical_name, indexes)] if locked else []), indexes
+
+
+async def test_superseded_binding_takes_the_lock_and_fails_closed_or_rebinds(storage, lock_entries):
+    await seed(storage)
+    client = embedder(model="A")
+    first = await ensure_embedding_collection(storage, "corpus", client, text)
+    await ensure_embedding_collection(storage, "corpus", embedder(model="B"), text)
+    assert await current_embedding_binding(storage, "corpus", client) is None
+    lock_entries.clear()
+    with pytest.raises(EmbeddingMigrationError, match="superseded"):
+        await ensure_embedding_collection(storage, "corpus", client, text)
+    assert lock_entries == ["corpus"]
+    current = await ensure_embedding_collection(storage, "corpus", embedder(model="A"), text)
+    assert await current_embedding_binding(storage, "corpus", client) is None
+    lock_entries.clear()
+    rebound = await ensure_embedding_collection(storage, "corpus", client, text)
+    assert rebound == CollectionGeneration("corpus", current.physical_name, first.identity, False)
+    assert lock_entries == ["corpus"]
+    assert await current_embedding_binding(storage, "corpus", client) == rebound
+
+
+async def test_changed_client_configuration_takes_the_lock_and_is_rejected(storage, lock_entries):
+    await seed(storage)
+    client = embedder()
+    await ensure_embedding_collection(storage, "corpus", client, text)
+    client.model = "changed"
+    assert await current_embedding_binding(storage, "corpus", client) is None
+    lock_entries.clear()
+    with pytest.raises(EmbeddingServiceError, match="configuration changed"):
+        await ensure_embedding_collection(storage, "corpus", client, text)
+    assert lock_entries == ["corpus"]
+
+
+_QDRANT_WRITES = (
+    "upsert",
+    "upload_points",
+    "upload_collection",
+    "delete",
+    "set_payload",
+    "overwrite_payload",
+    "delete_payload",
+    "clear_payload",
+    "update_vectors",
+    "delete_vectors",
+    "batch_update_points",
+    "create_collection",
+    "recreate_collection",
+    "update_collection",
+    "delete_collection",
+    "update_collection_aliases",
+    "create_payload_index",
+    "delete_payload_index",
+)
+
+
+def _recording(calls, name, original):
+    async def recording(*args, **kwargs):
+        calls.append(name)
+        return await original(*args, **kwargs)
+
+    return recording
+
+
+async def test_binding_check_never_embeds_or_writes(storage, monkeypatch, lock_entries):
+    await seed(storage)
+    raw = await storage.get_client()
+    writes = []
+    for name in _QDRANT_WRITES:
+        monkeypatch.setattr(raw, name, _recording(writes, name, getattr(raw, name)))
+    ensured = []
+
+    async def record(collection, indexes):
+        ensured.append(collection)
+
+    monkeypatch.setattr(storage, "ensure_payload_indexes", record)
+    indexes = [("type", PayloadSchemaType.KEYWORD)]
+    client = embedder(model="A")
+    generation = await ensure_embedding_collection(storage, "corpus", client, text)
+    await ensure_embedding_collection(storage, "corpus", client, text, payload_indexes=indexes)
+    assert writes and ensured
+    monkeypatch.setattr(client, "resolve_identity", AsyncMock(side_effect=AssertionError))
+    client.embed_single.reset_mock()
+    client.embed_all.reset_mock()
+    writes.clear()
+    ensured.clear()
+    lock_entries.clear()
+
+    assert await current_embedding_binding(storage, "corpus", client) == generation
+    reused = await ensure_embedding_collection(
+        storage, "corpus", client, text, payload_indexes=indexes
+    )
+    assert reused == generation
+    assert await current_embedding_binding(storage, "corpus", embedder(model="A")) is None
+    assert writes == [] and ensured == [] and lock_entries == []
+
+    await ensure_embedding_collection(storage, "corpus", embedder(model="B"), text)
+    writes.clear()
+    assert await current_embedding_binding(storage, "corpus", client) is None
+    assert writes == []
+    client.resolve_identity.assert_not_awaited()
+    client.embed_single.assert_not_awaited()
+    client.embed_all.assert_not_awaited()
+
+
+async def test_publish_between_reads_keeps_the_first_then_fails_closed(storage, lock_entries):
+    await seed(storage)
+    client = embedder(model="A")
+    bound = await ensure_embedding_collection(storage, "corpus", client, text)
+    lock_entries.clear()
+    first = await ensure_embedding_collection(storage, "corpus", client, text)
+    assert first == bound
+    assert lock_entries == []
+    replacement = await ensure_embedding_collection(storage, "corpus", embedder(model="B"), text)
+    assert await active_embedding_collection(storage, "corpus") == replacement.physical_name
+    # Publication only moves the alias: the first read's generation stays readable.
+    assert set(await records(storage, first.physical_name)) == {0, 1, 2}
+    assert await current_embedding_binding(storage, "corpus", client) is None
+    lock_entries.clear()
+    with pytest.raises(EmbeddingMigrationError, match="superseded"):
+        await ensure_embedding_collection(storage, "corpus", client, text)
+    assert lock_entries == ["corpus"]
