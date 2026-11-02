@@ -9,6 +9,9 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+_POLL_INTERVAL = 0.05
+_INTERACTIVE_LOCK = "interactive.lock"
+
 _held_fds: set[int] = set()
 _held_fds_lock = threading.Lock()
 
@@ -39,7 +42,28 @@ os.register_at_fork(
 
 
 class GlobalRequestLimiter:
-    """Bound concurrent requests across processes using stable flock slot files."""
+    """Bound concurrent requests across processes using stable flock slot files.
+
+    Each endpoint/model scope directory holds ``capacity`` slot files. A request
+    holds an exclusive ``flock`` on one slot for the duration of one HTTP
+    attempt, and waiters poll without blocking the event loop.
+
+    Interactive (query) requests go ahead of document requests. A waiting
+    interactive request in any process holds a shared ``flock`` on the scope's
+    ``interactive.lock``; a document request tries for a slot only while it can
+    take that file exclusively, so a slot freed while a query waits goes to the
+    query. Requests already holding a slot are never interrupted and capacity
+    is never exceeded. Document requests can starve while interactive requests
+    keep arriving, and resume as soon as none is waiting.
+
+    Every lock lives on an open file description, which the kernel releases
+    when its last descriptor closes, so a process that exits or is killed while
+    waiting or holding leaves nothing behind. Linux and macOS both give
+    ``flock`` per-open-file-description semantics, so separate opens of one
+    file conflict even inside a single process. The lock directory must be on
+    a local filesystem: Linux emulates ``flock`` on NFS with per-process POSIX
+    record locks, which would not separate waiters within one process.
+    """
 
     def __init__(self, capacity: int, scope: str, lock_dir: Path) -> None:
         if capacity < 0:
@@ -84,47 +108,109 @@ class GlobalRequestLimiter:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
 
-    def _try_acquire(self) -> int | None:
+    def _open_lock_file(self, name: str) -> int:
+        return os.open(self._scope_dir / name, os.O_CREAT | os.O_RDWR, 0o600)
+
+    def _try_acquire(self, *, interactive: bool = False) -> int | None:
+        """Take a free slot without blocking; document requests yield to waiting queries."""
         self._scope_dir.mkdir(parents=True, exist_ok=True)
         with _held_fds_lock:
-            for slot in range(self.capacity):
-                path = self._scope_dir / f"slot-{slot:04d}.lock"
-                fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+            gate_fd: int | None = None
+            if not interactive:
+                # Keep the gate exclusive for the whole slot scan so this attempt
+                # is ordered entirely before or after any query's claim. The held
+                # descriptor lock defers os.fork() until the gate is closed again.
+                gate_fd = self._open_lock_file(_INTERACTIVE_LOCK)
                 try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    _held_fds.add(fd)
-                    return fd
+                    fcntl.flock(gate_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
-                    os.close(fd)
+                    os.close(gate_fd)
+                    return None
                 except BaseException:
-                    os.close(fd)
+                    os.close(gate_fd)
                     raise
+            try:
+                for slot in range(self.capacity):
+                    fd = self._open_lock_file(f"slot-{slot:04d}.lock")
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        _held_fds.add(fd)
+                        return fd
+                    except BlockingIOError:
+                        os.close(fd)
+                    except BaseException:
+                        os.close(fd)
+                        raise
+            finally:
+                if gate_fd is not None:
+                    os.close(gate_fd)
         return None
 
+    def _try_claim(self) -> int | None:
+        """Mark an interactive request as waiting; None while a document attempt holds the gate."""
+        with _held_fds_lock:
+            fd = self._open_lock_file(_INTERACTIVE_LOCK)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(fd)
+                return None
+            except BaseException:
+                os.close(fd)
+                raise
+            _held_fds.add(fd)
+            return fd
+
+    @staticmethod
+    def _release(fd: int) -> None:
+        with _held_fds_lock:
+            _held_fds.discard(fd)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
     @asynccontextmanager
-    async def acquire(self) -> AsyncIterator[None]:
-        """Wait without blocking the event loop, releasing a held slot on cancellation."""
+    async def acquire(self, *, interactive: bool = False) -> AsyncIterator[None]:
+        """Hold one slot for the block, waiting without blocking the event loop.
+
+        ``interactive`` marks a latency-sensitive query request: while it waits,
+        no document request for this scope takes a free slot. Every descriptor
+        is released on cancellation and on every other exit path.
+        """
         if self.capacity == 0:
             yield
             return
 
         fd: int | None = None
+        claim_fd: int | None = None
         owner_pid = os.getpid()
         try:
             while fd is None:
-                fd = self._try_acquire()
+                fd = self._try_acquire(interactive=interactive)
                 if fd is None:
-                    await asyncio.sleep(0.05)
+                    if interactive and claim_fd is None:
+                        claim_fd = self._try_claim()
+                    await asyncio.sleep(_POLL_INTERVAL)
+                    if os.getpid() != owner_pid:
+                        # Resumed in a child forked from this event loop: the
+                        # at-fork hook closed the inherited claim, so forget its
+                        # number and keep waiting as the child's own request.
+                        claim_fd = None
+                        owner_pid = os.getpid()
+            if claim_fd is not None:
+                claim, claim_fd = claim_fd, None
+                self._release(claim)
             yield
         finally:
             # The at-fork child hook already closes inherited descriptors. An
             # inherited context can still unwind normally in the child; never
-            # close its stale integer again because the number may have been
-            # reused for an unrelated resource by then.
-            if fd is not None and os.getpid() == owner_pid:
-                with _held_fds_lock:
-                    _held_fds.discard(fd)
-                    try:
-                        fcntl.flock(fd, fcntl.LOCK_UN)
-                    finally:
-                        os.close(fd)
+            # close its stale integers again because the numbers may have been
+            # reused for unrelated resources by then.
+            if os.getpid() == owner_pid:
+                try:
+                    if claim_fd is not None:
+                        self._release(claim_fd)
+                finally:
+                    if fd is not None:
+                        self._release(fd)

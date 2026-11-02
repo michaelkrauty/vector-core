@@ -93,7 +93,7 @@ All settings are configured via environment variables prefixed with `VECTOR_`. M
 | `VECTOR_EMBEDDING_RESERVED_TOKENS` | `0` | Additional backend token overhead not produced by the configured tokenizer |
 | `VECTOR_EMBEDDING_MAX_REQUEST_BYTES` | `None` | Optional serialized embedding HTTP body budget; batches are divided without shortening inputs |
 | `VECTOR_EMBEDDING_CACHE_NAMESPACE` | `None` | Stable model/deployment identity. Setting a non-empty value opts `embed_all()` into persistent reuse; leave unset to disable it |
-| `VECTOR_EMBEDDING_GLOBAL_CONCURRENCY` | `0` | Max embedding HTTP attempts across all local processes sharing an endpoint/model. `0` disables cross-process limiting |
+| `VECTOR_EMBEDDING_GLOBAL_CONCURRENCY` | `0` | Max embedding HTTP attempts across all local processes sharing an endpoint/model; waiting query requests are served before document requests. `0` disables cross-process limiting |
 
 All processes using the same endpoint, model, and cache directory must use the
 same nonzero `VECTOR_EMBEDDING_GLOBAL_CONCURRENCY` value. During a rolling
@@ -102,6 +102,16 @@ capacity any process can see; once an enabled scope has created its capacity
 manifest, later clients with a different nonzero value fail fast. A process set
 to `0` deliberately opts out and cannot be constrained by other clients. Stop every process
 using that backend and remove the scope's limiter directory before changing it.
+
+Within the limit, query requests go first. While any process waits on a request
+made with `role="query"` (or on the one-request embedding identity probe in
+`resolve_identity()`), no document request for that endpoint/model takes a free
+slot. A search therefore waits only for requests already in flight, not behind
+the queued batches of a bulk re-index in another process. In-flight requests are
+never interrupted and the limit is never exceeded. Document requests can be held
+back while queries keep arriving and resume as soon as none is waiting. The
+limiter uses `flock` lock files, so the cache directory must be on a local
+filesystem.
 
 ### Cache
 

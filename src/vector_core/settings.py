@@ -50,6 +50,7 @@ class VectorCoreSettings(BaseSettings):
     # Persistent reuse is opt-in: unset namespace means no cache is opened.
     embedding_cache_namespace: str | None = None
     # Cross-process backend request capacity. 0 disables global coordination.
+    # Waiting query requests are served before document requests.
     embedding_global_concurrency: int = 0
 
     # Cache (reconstructible data)

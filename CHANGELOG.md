@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.11.0] - 2026-11-01
+
+### Changed
+
+- Query embeddings go ahead of document embeddings at the cross-process concurrency limit (#60). With `VECTOR_EMBEDDING_GLOBAL_CONCURRENCY` set, every waiter had the same chance at a freed slot, so the many batch requests of a bulk re-index in one process won nearly every release and searches in other processes waited behind them, for minutes in one observed case. While any process is waiting on a request made with `role="query"`, or on the identity probe that gates the first search in a new process, document requests for the same endpoint and model no longer take a free slot. A search now waits only for requests already in flight. In-flight requests are never interrupted and the limit is never exceeded; document requests resume as soon as no query is waiting. A waiting query marks itself with a shared `flock` on a per-scope `interactive.lock`, which the kernel releases if its process exits, so nothing can be left behind. Processes still running an older release do not observe the mark, so restart every process sharing the backend to get the full effect.
+
 ## [1.10.2] - 2026-11-01
 
 ### Fixed

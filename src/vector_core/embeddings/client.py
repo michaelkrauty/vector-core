@@ -8,7 +8,9 @@ import math
 import threading
 import time
 from collections import Counter
-from collections.abc import Callable, Coroutine, Sequence
+from collections.abc import Callable, Coroutine, Iterator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
@@ -25,6 +27,27 @@ from vector_core.utils.retry import retry_operation
 logger = logging.getLogger(__name__)
 EmbeddingRole = Literal["query", "document"]
 T = TypeVar("T")
+
+# True while a search-facing call runs in this context. Every HTTP attempt reads
+# it so the cross-process limiter serves those requests before document batches.
+# A context variable keeps _embed_prepared_batch(texts) unchanged for callers and
+# test doubles, and carries over into the batch tasks that embed_all() starts.
+_query_priority: ContextVar[bool] = ContextVar(
+    "vector_core_embedding_query_priority", default=False
+)
+
+
+@contextmanager
+def _prioritize_queries(enabled: bool) -> Iterator[None]:
+    """Give requests made inside the block query priority; otherwise inherit it."""
+    if not enabled:
+        yield
+        return
+    token = _query_priority.set(True)
+    try:
+        yield
+    finally:
+        _query_priority.reset(token)
 
 
 @dataclass(frozen=True)
@@ -136,6 +159,7 @@ class EmbeddingClient:
             cache_namespace: Stable model/deployment identity enabling persistent reuse.
             cache_path: Persistent cache database path. Default under cache_dir.
             global_concurrency: Cross-process HTTP request capacity. 0 disables it.
+                Waiting query requests are served before document requests.
             limiter_dir: Directory containing stable request-slot lock files.
         """
         self.base_url = (base_url or settings.embedding_url).rstrip("/")
@@ -407,6 +431,8 @@ class EmbeddingClient:
 
         Args:
             texts: List of texts to embed
+            role: ``"query"`` requests are served before document requests at
+                the cross-process global concurrency limit.
 
         Returns:
             List of embedding vectors in same order as input
@@ -418,8 +444,9 @@ class EmbeddingClient:
         self._check_identity()
         prepared = self._prepare_texts(texts, role=role)
         results = []
-        for _, batch in self._request_batches(prepared, role=role):
-            results.extend(await self._embed_prepared_batch(batch))
+        with _prioritize_queries(role == "query"):
+            for _, batch in self._request_batches(prepared, role=role):
+                results.extend(await self._embed_prepared_batch(batch))
         return results
 
     def _request_payload(self, inputs: Sequence[str | list[int]]) -> dict[str, Any]:
@@ -504,10 +531,11 @@ class EmbeddingClient:
 
         # Transient errors worth retrying
         transient_exceptions = (httpx.ConnectError, httpx.TimeoutException, _TransientGatewayError)
+        interactive = _query_priority.get()
 
         async def make_request() -> httpx.Response:
             """Make the embedding request (can be retried on transient errors)."""
-            async with self._request_limiter.acquire():
+            async with self._request_limiter.acquire(interactive=interactive):
                 resp = await client.post(
                     f"{self.base_url}/v1/embeddings",
                     json=payload,
@@ -894,13 +922,16 @@ class EmbeddingClient:
         """Probe the backend once before binding an index to this client.
 
         The uncached request also validates an explicitly configured dimension.
-        Subsequent calls retain the same immutable identity and reject mutation.
+        It gates the first search in a process, so it takes query priority at
+        the global concurrency limit. Subsequent calls retain the same
+        immutable identity and reject mutation.
         """
         async with self._identity_lock:
             if self._identity is None:
                 # A diagnostic sentence can exceed an intentionally small input
                 # limit even when ordinary short documents are perfectly valid.
-                await self.embed_single("x")
+                with _prioritize_queries(True):
+                    await self.embed_single("x")
                 self._identity = self._configured_identity()
             self._check_identity()
             return self._identity
@@ -1035,6 +1066,8 @@ class EmbeddingClient:
                 texts. Batches complete in arbitrary order, so `completed`
                 counts texts done so far, not a prefix of the input. The final
                 invocation is always (total, total).
+            role: ``"query"`` requests are served before document requests at
+                the cross-process global concurrency limit.
 
         Returns:
             List of embedding vectors in same order as input texts
@@ -1044,6 +1077,17 @@ class EmbeddingClient:
 
         self._check_identity()
         effective_texts = self._prepare_texts(texts, role=role)
+        with _prioritize_queries(role == "query"):
+            return await self._embed_all_effective(effective_texts, progress_cb, role=role)
+
+    async def _embed_all_effective(
+        self,
+        effective_texts: list[str],
+        progress_cb: Callable[[int, int], None] | None,
+        *,
+        role: EmbeddingRole,
+    ) -> list[list[float]]:
+        """Embed prepared inputs, reusing the persistent cache when it is enabled."""
         cache = await self._get_embedding_cache()
         if cache is not None:
             if self.dim > 0:
