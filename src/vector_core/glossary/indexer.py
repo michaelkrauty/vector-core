@@ -21,6 +21,7 @@ from vector_core.storage.embedding_fragments import (
 from vector_core.storage.embedding_migration import (
     CollectionGeneration,
     active_embedding_collection,
+    current_embedding_binding,
     embedding_collection_lock,
     ensure_embedding_collection,
 )
@@ -132,6 +133,23 @@ class GlossaryIndexer:
             finalize_candidate=self._finalize_candidate,
             vectorize=self.global_vocab.vectorize_document,
         )
+
+    async def _read_generation(self) -> CollectionGeneration:
+        """Resolve a read target without waiting for the collection lock when possible.
+
+        A client already bound to the current generation reads it without the
+        lock (current_embedding_binding()), so a search does not wait for a
+        write in progress. Otherwise this binds under the lock and ensures the
+        glossary payload indexes, as every bind did before. Those indexes are
+        keyword indexes that speed up filtering; a read on a generation that
+        lacks one still filters correctly.
+        """
+        if self._generation is not None:
+            return self._generation
+        current = await current_embedding_binding(self.storage, self.logical_name, self.embedder)
+        if current is not None:
+            return current
+        return await self._ensure_generation()
 
     @asynccontextmanager
     async def collection_operation(self) -> AsyncIterator[CollectionGeneration]:
@@ -270,7 +288,7 @@ class GlossaryIndexer:
         Returns:
             List of matching entries with scores
         """
-        generation = await self._ensure_generation()
+        generation = await self._read_generation()
         # Generate query vectors
         dense_query = await self.embedder.embed_single_cached(query, role="query")
         sparse_query = self.global_vocab.vectorize_query(query)
