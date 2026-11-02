@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.12.0] - 2026-11-02
+
+### Added
+
+- `current_embedding_binding(storage, logical_name, embedder)` returns a client's existing binding without taking the collection lock when it is still current: the client's identity is already resolved and unchanged, the active alias still names the bound generation, and that generation still has the bound schema and manifest. Otherwise it returns `None`. It never probes identity, embeds, migrates or writes. `EmbeddingClient.resolved_identity()` returns the identity a client has already resolved, without contacting the backend.
+
+### Changed
+
+- Reads by an already-bound client no longer wait for the collection lock (#54). `ensure_embedding_collection(lock_held=False)` without `payload_indexes` returns a binding that `current_embedding_binding` confirms without locking. Before, every read entered the exclusive cross-process lock just to confirm its binding, so a search waited for any write holding it, such as a long indexing pass or a note update embedding its chunks. First binds, superseded or changed generations, identity changes, every call that requests payload indexes (which re-ensures them on each call, as before) and every `lock_held=True` call take the lock as before. A replacement published right after the check leaves that one read on the previous generation, which publication keeps; the client's next locked operation fails closed or rebinds, as a read bound just before the publish would.
+
 ## [1.11.0] - 2026-11-01
 
 ### Changed

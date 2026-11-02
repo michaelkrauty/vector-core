@@ -568,6 +568,55 @@ async def _copy_indexes(
         )
 
 
+async def current_embedding_binding(
+    storage: QdrantStorage, logical_name: str, embedder: EmbeddingClient
+) -> CollectionGeneration | None:
+    """Return this client's binding if it is still current, without the collection lock.
+
+    Returns the generation an earlier ensure_embedding_collection() call bound
+    for this client, logical name and storage scope only when the client's
+    identity is already resolved, unchanged and equal to the binding's, the
+    active alias still names the bound physical collection, and that collection
+    still has the bound dense schema and ready manifest. Otherwise it returns
+    None, and only the locked ensure_embedding_collection() path can bind,
+    rebind, migrate or fail closed. This check never probes identity, embeds,
+    creates, migrates, publishes, writes manifests or creates payload indexes.
+    It does not inspect payload indexes either, so ensure_embedding_collection()
+    uses it only for calls that request none. Qdrant read errors propagate.
+
+    Every call re-verifies the generation instead of trusting the alias. The
+    alias shows which collection name is active, not what that collection now
+    holds: a collection discovered under its logical name (an untouched legacy
+    collection, which has no alias) can be deleted and recreated under the same
+    name, and a writer outside this protocol can delete or overwrite the
+    manifest in point ID 0, which store_metadata() fences only on generation
+    collections. The locked path raises in both cases. Re-verifying keeps this
+    check a subset of the locked path's checks, so it returns only what that
+    path would, for one collection lookup and one point read and no lock.
+
+    A replacement published after this check leaves the caller on the previous
+    generation until its operation ends. That generation stays readable:
+    _publish() only moves the alias, in one atomic request, and nothing in this
+    module deletes a collection, failed candidates included. The client's next
+    check then returns None, and the locked path fails closed (or rebinds when
+    the new generation has the same identity) as it does today; a read that
+    bound under the lock just before the publish has the same window. Deleting
+    generations is left to operators: one deleted within that window fails the
+    caller's next request with Qdrant's not-found error, as it would for a read
+    bound under the lock.
+    """
+    bound = _bindings.get(embedder, {}).get((_storage_scope(storage.url), logical_name))
+    if bound is None or embedder.resolved_identity() != bound.identity:
+        return None
+    if await active_embedding_collection(storage, logical_name) != bound.physical_name:
+        return None
+    try:
+        await _verify_generation(storage, bound)
+    except EmbeddingMigrationError:
+        return None
+    return bound
+
+
 async def ensure_embedding_collection(
     storage: QdrantStorage,
     logical_name: str,
@@ -592,8 +641,20 @@ async def ensure_embedding_collection(
     A client already bound before another client publishes a replacement fails
     closed on its next operation. Construct a new client for an intentional
     configuration change. The discovery alias is never a vector I/O target.
+
+    With lock_held=False and no payload_indexes, a client whose binding
+    current_embedding_binding() confirms returns it without taking the
+    collection lock, so its reads never wait for a write or migration that
+    holds it. Every other call takes the lock; a payload index request is
+    ensured under it on every call, as Qdrant's index state is not part of the
+    lock-free check.
     """
     if not lock_held:
+        # Index state is not part of the lock-free check, so index requests lock.
+        if not payload_indexes and (
+            reused := await current_embedding_binding(storage, logical_name, embedder)
+        ):
+            return reused
         async with embedding_collection_lock(storage, logical_name):
             return await ensure_embedding_collection(
                 storage,
