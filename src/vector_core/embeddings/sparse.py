@@ -9,7 +9,7 @@ from vector_core.embeddings.tokenization import (
     CAMEL_CASE_PATTERN,
     DEFAULT_STOP_TOKENS,
     IDENTIFIER_PATTERN,
-    levenshtein_similarity,
+    FuzzyCandidateIndex,
 )
 
 
@@ -257,39 +257,28 @@ class SparseVectorizer:
         self,
         token: str,
         threshold: float = 0.75,
+        candidates: FuzzyCandidateIndex | None = None,
     ) -> tuple[str | None, float]:
         """
         Find closest vocabulary token using Levenshtein similarity.
 
+        Every vocabulary token within two characters of the token's length is
+        scored with levenshtein_similarity; the highest similarity that is at
+        least threshold wins, and ties go to the token that comes first in the
+        vocabulary's iteration order.
+
         Args:
             token: Token to match
             threshold: Minimum similarity threshold (0-1)
+            candidates: Index built from the current vocabulary, to reuse across
+                lookups. Built from the vocabulary when omitted.
 
         Returns:
             Tuple of (best_match, similarity) or (None, 0.0) if no match
         """
-        if not self._vocab:
-            return None, 0.0
-
-        target_len = len(token)
-        best_match = None
-        best_score = 0.0
-
-        # Score every token within a small length window. |len(a) - len(b)| is a
-        # lower bound on edit distance, so tokens far apart in length cannot be
-        # close matches; this window prunes most of the vocabulary cheaply. The
-        # survivors are NOT capped: any fixed cap can drop the genuinely closest
-        # match, e.g. an insertion/deletion typo whose length differs by one
-        # could be crowded out by unrelated same-length tokens.
-        for candidate in self._vocab:
-            if abs(len(candidate) - target_len) > 2:
-                continue
-            score = levenshtein_similarity(token, candidate)
-            if score > best_score and score >= threshold:
-                best_score = score
-                best_match = candidate
-
-        return best_match, best_score
+        if candidates is None:
+            candidates = FuzzyCandidateIndex(self._vocab)
+        return candidates.best_match(token, threshold)
 
     def vectorize_query(
         self,
@@ -320,6 +309,8 @@ class SparseVectorizer:
         seen_indices: set[int] = set()
         indices: list[int] = []
         values: list[float] = []
+        # Built on the first unknown token and reused for the rest of the query.
+        fuzzy_candidates: FuzzyCandidateIndex | None = None
 
         for token in tokens:
             if token in seen_tokens:
@@ -337,7 +328,9 @@ class SparseVectorizer:
                 values.append(weight)
             elif fuzzy:
                 # Try fuzzy match
-                match, similarity = self._find_fuzzy_match(token, fuzzy_threshold)
+                if fuzzy_candidates is None:
+                    fuzzy_candidates = FuzzyCandidateIndex(self._vocab)
+                match, similarity = self._find_fuzzy_match(token, fuzzy_threshold, fuzzy_candidates)
                 if match:
                     idx = self._vocab[match]
                     if idx in seen_indices:
