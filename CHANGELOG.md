@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.12.1] - 2026-11-02
+
+### Fixed
+
+- Glossary searches by an already-bound client no longer wait for the collection lock. `GlossaryIndexer.search` bound its target through `ensure_embedding_collection` with the glossary payload indexes, and 1.12.0 takes the lock for every call that requests payload indexes, so a glossary search still queued behind any write holding the lock. Searches now use `current_embedding_binding` first and fall back to the locked bind, which ensures the indexes, only when the client is unbound or its generation is no longer current. The glossary indexes are keyword indexes that only speed up filtering.
+
 ## [1.12.0] - 2026-11-02
 
 ### Added

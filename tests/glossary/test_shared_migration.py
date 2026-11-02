@@ -1,5 +1,6 @@
 """Shared indexers operate on isolated real Qdrant generations."""
 
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
@@ -18,6 +19,7 @@ from vector_core.storage.embedding_fragments import source_hash
 from vector_core.storage.embedding_migration import (
     EmbeddingMigrationError,
     active_embedding_collection,
+    embedding_collection_lock,
 )
 from vector_core.storage.qdrant import QdrantStorage, generate_point_id
 
@@ -224,3 +226,52 @@ async def test_glossary_tool_leaves_sqlite_unchanged_when_migration_fails(resour
     with pytest.raises(EmbeddingMigrationError, match="does not match"):
         await helper.delete_entry("API")
     assert glossary.read(entry.id) == entry
+
+
+async def test_bound_glossary_search_does_not_wait_for_the_collection_lock(resources):
+    storage, glossary, _, vocab = resources
+    await seed(storage, {"type": "document", "content": "retained text"})
+    client = embedder()
+    indexer = GlossaryIndexer("shared", glossary, storage, client, vocab)
+    indexer.hybrid_searcher.search = AsyncMock(return_value=[])
+    await indexer.search("interface")
+    target = indexer.hybrid_searcher.search.call_args.kwargs["collection"]
+    held, release = asyncio.Event(), asyncio.Event()
+
+    async def writer():
+        async with embedding_collection_lock(storage, "shared"):
+            held.set()
+            await release.wait()
+
+    task = asyncio.create_task(writer())
+    try:
+        await held.wait()
+        # Deadlock guard only: without the lock-free check this waits for release.
+        await asyncio.wait_for(indexer.search("interface"), timeout=10)
+        assert indexer.hybrid_searcher.search.call_args.kwargs["collection"] == target
+    finally:
+        release.set()
+        await task
+
+
+async def test_unbound_glossary_search_binds_under_the_lock(resources):
+    storage, glossary, _, vocab = resources
+    await seed(storage, {"type": "document", "content": "retained text"})
+    indexer = GlossaryIndexer("shared", glossary, storage, embedder(), vocab)
+    indexer.hybrid_searcher.search = AsyncMock(return_value=[])
+    held, release = asyncio.Event(), asyncio.Event()
+
+    async def writer():
+        async with embedding_collection_lock(storage, "shared"):
+            held.set()
+            await release.wait()
+
+    task = asyncio.create_task(writer())
+    await held.wait()
+    search = asyncio.create_task(indexer.search("interface"))
+    await asyncio.sleep(0.2)
+    assert not search.done()
+    release.set()
+    await task
+    await asyncio.wait_for(search, timeout=10)
+    indexer.hybrid_searcher.search.assert_awaited_once()
