@@ -580,7 +580,7 @@ async def test_unresolved_identity_takes_the_lock_without_probing(storage, lock_
     client.resolve_identity.assert_awaited_once()
 
 
-async def test_payload_index_request_not_yet_ensured_takes_the_lock(
+async def test_every_payload_index_request_takes_the_lock_and_reensures(
     storage, monkeypatch, lock_entries
 ):
     await seed(storage)
@@ -592,31 +592,22 @@ async def test_payload_index_request_not_yet_ensured_takes_the_lock(
     monkeypatch.setattr(storage, "ensure_payload_indexes", record)
     client = embedder()
     generation = await ensure_embedding_collection(storage, "corpus", client, text)
-    keyword = ("type", PayloadSchemaType.KEYWORD)
-    plain = ("content", TextIndexParams(type="text", tokenizer="word", lowercase=True))
-    phrase = (
-        "content",
-        TextIndexParams(type="text", tokenizer="word", lowercase=True, phrase_matching=True),
-    )
-    requests = [
-        ([keyword], True),
-        ([keyword], False),
-        ([], False),
-        ([plain], True),
-        ([plain, keyword], False),
-        ([phrase], True),
-        ([plain], True),
-        ([keyword, plain], False),
-    ]
-    for indexes, locked in requests:
+    params = TextIndexParams(type="text", tokenizer="word", lowercase=True)
+    keyword = [("type", PayloadSchemaType.KEYWORD)]
+    content = [("content", params)]
+    # Repeated requests, calls without indexes in between, and a caller that
+    # mutates its reused params: every request is ensured again under the lock.
+    for indexes in (keyword, keyword, content, None, content, keyword, None):
+        if indexes is content:
+            params.phrase_matching = not params.phrase_matching
         lock_entries.clear()
         ensured.clear()
         bound = await ensure_embedding_collection(
-            storage, "corpus", client, text, payload_indexes=indexes
+            storage, "corpus", client, text, payload_indexes=indexes or ()
         )
         assert bound == generation
-        assert lock_entries == (["corpus"] if locked else []), indexes
-        assert ensured == ([(generation.physical_name, indexes)] if locked else []), indexes
+        assert lock_entries == (["corpus"] if indexes else [])
+        assert ensured == ([(generation.physical_name, indexes)] if indexes else [])
 
 
 async def test_superseded_binding_takes_the_lock_and_fails_closed_or_rebinds(storage, lock_entries):
@@ -692,11 +683,9 @@ async def test_binding_check_never_embeds_or_writes(storage, monkeypatch, lock_e
         ensured.append(collection)
 
     monkeypatch.setattr(storage, "ensure_payload_indexes", record)
-    indexes = [("type", PayloadSchemaType.KEYWORD)]
     client = embedder(model="A")
     generation = await ensure_embedding_collection(storage, "corpus", client, text)
-    await ensure_embedding_collection(storage, "corpus", client, text, payload_indexes=indexes)
-    assert writes and ensured
+    assert writes
     monkeypatch.setattr(client, "resolve_identity", AsyncMock(side_effect=AssertionError))
     client.embed_single.reset_mock()
     client.embed_all.reset_mock()
@@ -705,10 +694,7 @@ async def test_binding_check_never_embeds_or_writes(storage, monkeypatch, lock_e
     lock_entries.clear()
 
     assert await current_embedding_binding(storage, "corpus", client) == generation
-    reused = await ensure_embedding_collection(
-        storage, "corpus", client, text, payload_indexes=indexes
-    )
-    assert reused == generation
+    assert await ensure_embedding_collection(storage, "corpus", client, text) == generation
     assert await current_embedding_binding(storage, "corpus", embedder(model="A")) is None
     assert writes == [] and ensured == [] and lock_entries == []
 
@@ -736,5 +722,70 @@ async def test_publish_between_reads_keeps_the_first_then_fails_closed(storage, 
     assert await current_embedding_binding(storage, "corpus", client) is None
     lock_entries.clear()
     with pytest.raises(EmbeddingMigrationError, match="superseded"):
+        await ensure_embedding_collection(storage, "corpus", client, text)
+    assert lock_entries == ["corpus"]
+
+
+def _manifest(identity, logical_name="corpus", state="ready"):
+    return {
+        "schema": 1,
+        "logical_name": logical_name,
+        "identity": identity.to_dict(),
+        "source": None,
+        "state": state,
+    }
+
+
+@pytest.mark.parametrize("damage", ["deleted", "not a manifest", "other identity", "building"])
+async def test_damaged_manifest_is_not_current_and_the_locked_path_raises(
+    storage, lock_entries, damage
+):
+    await seed(storage)
+    client = embedder()
+    generation = await ensure_embedding_collection(storage, "corpus", client, text)
+    raw = await storage.get_client()
+    if damage == "deleted":
+        await raw.delete(generation.physical_name, points_selector=[0], wait=True)
+    else:
+        manifest = {
+            "not a manifest": "corrupted",
+            "other identity": _manifest(await embedder(model="other").resolve_identity()),
+            "building": _manifest(generation.identity, state="building"),
+        }[damage]
+        await raw.upsert(
+            generation.physical_name,
+            [
+                PointStruct(
+                    id=0,
+                    vector={"dense": [0.0] * 3, "sparse": SparseVector(indices=[], values=[])},
+                    payload={"type": "__metadata__", "embedding_generation": manifest},
+                )
+            ],
+            wait=True,
+        )
+    assert await active_embedding_collection(storage, "corpus") == generation.physical_name
+    assert await current_embedding_binding(storage, "corpus", client) is None
+    lock_entries.clear()
+    with pytest.raises(EmbeddingMigrationError, match="incomplete or has invalid identity"):
+        await ensure_embedding_collection(storage, "corpus", client, text)
+    assert lock_entries == ["corpus"]
+
+
+async def test_legacy_name_recreated_with_another_dimension_is_not_current(storage, lock_entries):
+    client = embedder()
+    identity = await client.resolve_identity()
+    await storage.create_collection("corpus", dense_dim=3)
+    await storage.store_metadata("corpus", {"embedding_generation": _manifest(identity)})
+    generation = await ensure_embedding_collection(storage, "corpus", client, text)
+    assert generation == CollectionGeneration("corpus", "corpus", identity, False)
+    assert await current_embedding_binding(storage, "corpus", client) == generation
+    # Same legacy name, still discovered without an alias, but a 4-dimensional schema.
+    await storage.delete_collection("corpus")
+    await storage.create_collection("corpus", dense_dim=4)
+    await storage.store_metadata("corpus", {"embedding_generation": _manifest(identity)})
+    assert await active_embedding_collection(storage, "corpus") == "corpus"
+    assert await current_embedding_binding(storage, "corpus", client) is None
+    lock_entries.clear()
+    with pytest.raises(EmbeddingMigrationError, match="incompatible dense vector schema"):
         await ensure_embedding_collection(storage, "corpus", client, text)
     assert lock_entries == ["corpus"]

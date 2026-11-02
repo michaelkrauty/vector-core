@@ -79,11 +79,6 @@ class CollectionGeneration:
 _bindings: WeakKeyDictionary[EmbeddingClient, dict[tuple[str, str], CollectionGeneration]] = (
     WeakKeyDictionary()
 )
-# Per binding key: the physical generation and the payload indexes (field to
-# schema, last request wins) that this client's binds have ensured on it.
-_ensured_indexes: WeakKeyDictionary[
-    EmbeddingClient, dict[tuple[str, str], tuple[str, dict[str, PayloadIndexSchema]]]
-] = WeakKeyDictionary()
 _held_locks: ContextVar[tuple[tuple[object, str], ...]] = ContextVar("embedding_locks", default=())
 
 
@@ -573,37 +568,6 @@ async def _copy_indexes(
         )
 
 
-async def _ensure_indexes(
-    storage: QdrantStorage,
-    embedder: EmbeddingClient,
-    binding_key: tuple[str, str],
-    physical_name: str,
-    payload_indexes: Sequence[tuple[str, PayloadIndexSchema]],
-) -> None:
-    """Ensure requested indexes and record them for lock-free reuse of this generation."""
-    if payload_indexes:
-        await storage.ensure_payload_indexes(physical_name, list(payload_indexes))
-    records = _ensured_indexes.setdefault(embedder, {})
-    physical, ensured = records.get(binding_key, ("", {}))
-    if physical != physical_name:
-        ensured = {}
-    records[binding_key] = (physical_name, {**ensured, **dict(payload_indexes)})
-
-
-def _indexes_ensured(
-    embedder: EmbeddingClient,
-    binding_key: tuple[str, str],
-    physical_name: str,
-    payload_indexes: Sequence[tuple[str, PayloadIndexSchema]],
-) -> bool:
-    if not payload_indexes:
-        return True
-    physical, ensured = _ensured_indexes.get(embedder, {}).get(binding_key, ("", {}))
-    return physical == physical_name and all(
-        field in ensured and ensured[field] == schema for field, schema in payload_indexes
-    )
-
-
 async def current_embedding_binding(
     storage: QdrantStorage, logical_name: str, embedder: EmbeddingClient
 ) -> CollectionGeneration | None:
@@ -617,7 +581,8 @@ async def current_embedding_binding(
     None, and only the locked ensure_embedding_collection() path can bind,
     rebind, migrate or fail closed. This check never probes identity, embeds,
     creates, migrates, publishes, writes manifests or creates payload indexes.
-    Qdrant read errors propagate.
+    It does not inspect payload indexes either, so ensure_embedding_collection()
+    uses it only for calls that request none. Qdrant read errors propagate.
 
     Every call re-verifies the generation instead of trusting the alias. The
     alias shows which collection name is active, not what that collection now
@@ -652,23 +617,6 @@ async def current_embedding_binding(
     return bound
 
 
-async def _reuse_without_lock(
-    storage: QdrantStorage,
-    logical_name: str,
-    embedder: EmbeddingClient,
-    payload_indexes: Sequence[tuple[str, PayloadIndexSchema]],
-) -> CollectionGeneration | None:
-    binding_key = (_storage_scope(storage.url), logical_name)
-    bound = _bindings.get(embedder, {}).get(binding_key)
-    if bound is None or not _indexes_ensured(
-        embedder, binding_key, bound.physical_name, payload_indexes
-    ):
-        return None
-    current = await current_embedding_binding(storage, logical_name, embedder)
-    # A concurrent rebind replaced the generation the index check was made for.
-    return current if current == bound else None
-
-
 async def ensure_embedding_collection(
     storage: QdrantStorage,
     logical_name: str,
@@ -694,15 +642,18 @@ async def ensure_embedding_collection(
     closed on its next operation. Construct a new client for an intentional
     configuration change. The discovery alias is never a vector I/O target.
 
-    With lock_held=False, a client whose binding current_embedding_binding()
-    confirms returns it without taking the collection lock, so its reads never
-    wait for a write or migration that holds it. A payload index request that
-    this client's earlier binds have not ensured on that generation with the
-    same parameters takes the lock, as does every other case.
+    With lock_held=False and no payload_indexes, a client whose binding
+    current_embedding_binding() confirms returns it without taking the
+    collection lock, so its reads never wait for a write or migration that
+    holds it. Every other call takes the lock; a payload index request is
+    ensured under it on every call, as Qdrant's index state is not part of the
+    lock-free check.
     """
     if not lock_held:
-        reused = await _reuse_without_lock(storage, logical_name, embedder, payload_indexes)
-        if reused is not None:
+        # Index state is not part of the lock-free check, so index requests lock.
+        if not payload_indexes and (
+            reused := await current_embedding_binding(storage, logical_name, embedder)
+        ):
             return reused
         async with embedding_collection_lock(storage, logical_name):
             return await ensure_embedding_collection(
@@ -732,7 +683,8 @@ async def ensure_embedding_collection(
                 "Embedding collection was superseded; restart the client before further operations"
             )
         await _verify_generation(storage, bound)
-        await _ensure_indexes(storage, embedder, binding_key, bound.physical_name, payload_indexes)
+        if payload_indexes:
+            await storage.ensure_payload_indexes(bound.physical_name, list(payload_indexes))
         bindings[binding_key] = bound
         return bound
 
@@ -740,7 +692,8 @@ async def ensure_embedding_collection(
     if source and _manifest_identity(metadata) == identity:
         generation = CollectionGeneration(logical_name, source, identity, False)
         await _verify_generation(storage, generation)
-        await _ensure_indexes(storage, embedder, binding_key, source, payload_indexes)
+        if payload_indexes:
+            await storage.ensure_payload_indexes(source, list(payload_indexes))
         bindings[binding_key] = generation
         return generation
 
@@ -788,8 +741,6 @@ async def ensure_embedding_collection(
             f"candidate {target!r} requires an active-pointer check before reuse: "
             f"{_exception_description(error)}"
         ) from error
-    # Indexes built by _copy_indexes are not recorded: the first bind that
-    # requests them ensures them once under the lock.
     bindings[binding_key] = generation
     return generation
 
